@@ -1,0 +1,70 @@
+[package]
+name = "kira-bam"
+description = "High-performance BAM/SAM/CRAM toolkit written in Rust 2024. Drop-in samtools-compatible CLI (view/sort/index/merge/markdup/flagstat) plus a library API for embedding directly into aligners and variant callers."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/ARyaskov/kira-bam"
+keywords = [
+    "bioinformatics",
+    "genomics",
+    "bam",
+    "sam",
+    "samtools"
+]
+categories = [
+    "science",
+    "science::bioinformatics",
+    "science::bioinformatics::sequence-analysis",
+    "command-line-utilities",
+    "algorithms"
+]
+
+[lib]
+name = "kira_bam"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kira-bam"
+path = "src/bin/kira_bam.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+rustc-hash = "2"
+tempfile = "3"
+bstr = "1"
+# Total-RAM detection for `--memory auto` (dynamic sort buffer sized to a
+# fraction of available memory). Lightweight; just the system module is
+# needed.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+# mmap for SAM input — when the aligner→sort handoff goes through a tmp SAM
+# file, mmap'ing it is measurably faster than buffered reads. On gzip-
+# compressed BAM we still pay decompression, but the kernel I/O path is one
+# syscall instead of N read() calls.
+memmap2 = "0.9"
+
+# noodles ecosystem — pinned to the versions noodles-bam 0.84 wants, so we
+# don't get duplicate copies of sam/bgzf/csi/core in the graph. libdeflate
+# enabled on bgzf for fast deflate.
+noodles-bam = "0.89"
+noodles-sam = "0.85"
+noodles-bgzf = { version = "0.47", features = ["libdeflate"] }
+noodles-csi = "0.56"
+noodles-core = "0.20"
+noodles-fasta = "0.61"
+noodles-cram = "0.93"
+
+[features]
+default = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

@@ -3,10 +3,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use anyhow::{Context, Result};
+use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::cigar::Op;
 use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::record_buf::Cigar;
-use noodles_sam::alignment::RecordBuf;
 use rustc_hash::FxHasher;
 
 use crate::cli::AmpliconclipArgs;
@@ -127,7 +127,7 @@ fn clip_record(rec: &mut RecordBuf, ivs: &[Iv], hard: bool) {
 
 fn apply_clip(cigar: &Cigar, left: u32, right: u32, hard: bool) -> Cigar {
     let kind = if hard { Kind::HardClip } else { Kind::SoftClip };
-    let ops: Vec<Op> = cigar.as_ref().iter().copied().collect();
+    let ops: Vec<Op> = cigar.as_ref().to_vec();
     let mut out: Vec<Op> = Vec::new();
     if left > 0 {
         out.push(Op::new(kind, left as usize));

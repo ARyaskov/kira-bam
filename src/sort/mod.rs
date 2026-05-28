@@ -17,8 +17,10 @@ use rayon::prelude::*;
 use tempfile::TempDir;
 
 use crate::cli::SortArgs;
-use crate::io::{BamReader, BamWriter, OpenOptions, PgInfo, WriteOptions, append_pg,
-    install_thread_pool, resolve_memory_hint};
+use crate::io::{
+    BamReader, BamWriter, OpenOptions, PgInfo, WriteOptions, append_pg, install_thread_pool,
+    resolve_memory_hint,
+};
 use crate::markdup::{MarkdupOptions, mark_duplicates_in_memory};
 use crate::types::OutputFormat;
 
@@ -165,12 +167,9 @@ pub fn run(args: SortArgs) -> Result<()> {
     // aligner is). The kernel turns the parser's reads into trivial page
     // faults; on cold files we still benefit from larger readahead.
     let open_opts = OpenOptions { mmap: true };
-    let mut reader = BamReader::open_with_options(
-        &args.input,
-        args.reference.as_deref(),
-        open_opts,
-    )
-    .context("open input")?;
+    let mut reader =
+        BamReader::open_with_options(&args.input, args.reference.as_deref(), open_opts)
+            .context("open input")?;
     let mut header = reader.header().clone();
     set_header_sort_order(&mut header, kind);
     append_pg(&mut header, &PgInfo::new("sort", !args.no_pg))?;
@@ -225,8 +224,8 @@ pub fn run(args: SortArgs) -> Result<()> {
                 barcode_tag: args.markdup_barcode_tag.clone(),
                 ancient: args.markdup_mode_ancient,
             };
-            let _stats = mark_duplicates_in_memory(&mut current_chunk, &opts)
-                .context("mark duplicates")?;
+            let _stats =
+                mark_duplicates_in_memory(&mut current_chunk, &opts).context("mark duplicates")?;
             append_pg(&mut header, &PgInfo::new("markdup", !args.no_pg))?;
         }
         let fmt = pick_fmt(&args);
@@ -236,7 +235,7 @@ pub fn run(args: SortArgs) -> Result<()> {
         // the pipeline. Reserve 1 thread for the producer (the main one
         // issuing write_record_buf calls).
         let write_opts = WriteOptions {
-            compression_workers: args.threads.saturating_sub(1).min(8).max(1),
+            compression_workers: args.threads.saturating_sub(1).clamp(1, 8),
         };
         let mut writer = BamWriter::create_with_options(
             args.output.as_deref(),
@@ -285,14 +284,14 @@ pub fn run(args: SortArgs) -> Result<()> {
 }
 
 fn pick_fmt(args: &SortArgs) -> OutputFormat {
-    if let Some(p) = &args.output {
-        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-            if ext.eq_ignore_ascii_case("cram") {
-                return OutputFormat::Cram;
-            }
-            if ext.eq_ignore_ascii_case("sam") {
-                return OutputFormat::Sam;
-            }
+    if let Some(p) = &args.output
+        && let Some(ext) = p.extension().and_then(|e| e.to_str())
+    {
+        if ext.eq_ignore_ascii_case("cram") {
+            return OutputFormat::Cram;
+        }
+        if ext.eq_ignore_ascii_case("sam") {
+            return OutputFormat::Sam;
         }
     }
     if args.uncompressed {

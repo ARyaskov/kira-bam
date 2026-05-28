@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::data::field::Tag;
 use noodles_sam::alignment::record_buf::data::field::Value;
-use noodles_sam::alignment::RecordBuf;
 use rustc_hash::FxHasher;
 
 use crate::cli::SplitArgs;

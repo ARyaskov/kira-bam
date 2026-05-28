@@ -200,9 +200,7 @@ fn merge_headers(headers: Vec<&Header>) -> Result<Header> {
                 final_id = BString::from(format!("{}-{suffix}", rg_id.as_bstr()));
                 suffix += 1;
             }
-            merged
-                .read_groups_mut()
-                .insert(final_id, rg_map.clone());
+            merged.read_groups_mut().insert(final_id, rg_map.clone());
         }
 
         // @CO: append all comments.

@@ -57,12 +57,7 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
     Ok(())
 }
 
-fn write_base(
-    out: &mut Box<dyn Write>,
-    b: u8,
-    line_pos: &mut usize,
-    width: usize,
-) -> Result<()> {
+fn write_base(out: &mut Box<dyn Write>, b: u8, line_pos: &mut usize, width: usize) -> Result<()> {
     out.write_all(&[b])?;
     *line_pos += 1;
     if width > 0 && *line_pos >= width {

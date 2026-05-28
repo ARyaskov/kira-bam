@@ -29,7 +29,12 @@ use crate::types::OutputFormat;
 /// `frac_num`/`frac_den` express the auto fraction (e.g. 3/4 = 75 %). The
 /// minimum floor (`min_bytes`) protects against `auto` picking absurdly
 /// small numbers on memory-starved hosts.
-pub fn resolve_memory_hint(spec: &str, min_bytes: usize, frac_num: u32, frac_den: u32) -> Result<usize> {
+pub fn resolve_memory_hint(
+    spec: &str,
+    min_bytes: usize,
+    frac_num: u32,
+    frac_den: u32,
+) -> Result<usize> {
     let s = spec.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("auto") {
         return Ok(auto_memory_bytes(min_bytes, frac_num, frac_den));
@@ -134,12 +139,15 @@ fn detect_format<P: AsRef<Path>>(path: P) -> io::Result<InputFormat> {
     };
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_l = ext.to_ascii_lowercase();
-        let mismatch = match (detected, ext_l.as_str()) {
-            (InputFormat::Bam, "sam") | (InputFormat::Bam, "cram") => true,
-            (InputFormat::Sam, "bam") | (InputFormat::Sam, "cram") => true,
-            (InputFormat::Cram, "sam") | (InputFormat::Cram, "bam") => true,
-            _ => false,
-        };
+        let mismatch = matches!(
+            (detected, ext_l.as_str()),
+            (InputFormat::Bam, "sam")
+                | (InputFormat::Bam, "cram")
+                | (InputFormat::Sam, "bam")
+                | (InputFormat::Sam, "cram")
+                | (InputFormat::Cram, "sam")
+                | (InputFormat::Cram, "bam")
+        );
         if mismatch {
             eprintln!(
                 "[kira-bam] warning: file {} has .{ext_l} extension but content looks like {:?}",
@@ -232,9 +240,7 @@ impl AsRef<[u8]> for MmapView {
 impl MmapView {
     fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("open {} for mmap", path.display()))?;
-        let mmap = unsafe {
-            Mmap::map(&file).with_context(|| format!("mmap {}", path.display()))?
-        };
+        let mmap = unsafe { Mmap::map(&file).with_context(|| format!("mmap {}", path.display()))? };
         let bytes: &[u8] = mmap.as_ref();
         let ptr = bytes.as_ptr();
         let len = bytes.len();

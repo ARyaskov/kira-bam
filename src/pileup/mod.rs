@@ -5,10 +5,12 @@
 //! back at records already past their range.
 
 use anyhow::Result;
-use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::RecordBuf;
+use noodles_sam::alignment::record::cigar::op::Kind;
 
 use crate::io::BamReader;
+
+pub type PileupColumn = (usize, usize, Vec<(u8, u8)>);
 
 #[derive(Debug)]
 pub struct ActiveRead {
@@ -59,7 +61,7 @@ impl PileupIter {
     }
 
     /// Return the next pileup column. Returns Ok(None) at EOF.
-    pub fn next_column(&mut self) -> Result<Option<(usize, usize, Vec<(u8, u8)>)>> {
+    pub fn next_column(&mut self) -> Result<Option<PileupColumn>> {
         loop {
             // Pull in records that start at or before current_pos for current_tid.
             loop {
@@ -74,10 +76,10 @@ impl PileupIter {
                 if (flags & 0x4) != 0 {
                     continue;
                 }
-                if let Some(mq) = rec.mapping_quality() {
-                    if u8::from(mq) < self.min_mapq {
-                        continue;
-                    }
+                if let Some(mq) = rec.mapping_quality()
+                    && u8::from(mq) < self.min_mapq
+                {
+                    continue;
                 }
                 let tid = match rec.reference_sequence_id() {
                     Some(t) => t,
@@ -153,7 +155,7 @@ fn decode_active(rec: &RecordBuf, min_baseq: u8) -> Option<ActiveRead> {
     let mut read_idx = 0usize;
     let mut ref_idx = 0usize; // 0-based from `start`
     for op in rec.cigar().as_ref().iter() {
-        let len = op.len() as usize;
+        let len = op.len();
         match op.kind() {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 for _ in 0..len {

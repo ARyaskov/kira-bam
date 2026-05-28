@@ -30,10 +30,8 @@ pub fn run(args: FqidxArgs) -> Result<()> {
         return Ok(());
     }
 
-    let by_name: HashMap<String, &FqiEntry, std::hash::BuildHasherDefault<FxHasher>> = entries
-        .iter()
-        .map(|e| (e.name.clone(), e))
-        .collect();
+    let by_name: HashMap<String, &FqiEntry, std::hash::BuildHasherDefault<FxHasher>> =
+        entries.iter().map(|e| (e.name.clone(), e)).collect();
 
     let mut out: Box<dyn Write> = match &args.output {
         Some(p) => Box::new(BufWriter::new(File::create(p)?)),

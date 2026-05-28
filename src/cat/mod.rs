@@ -6,10 +6,7 @@ use crate::io::{BamReader, BamWriter, PgInfo, append_pg};
 use crate::types::OutputFormat;
 
 pub fn run(args: CatArgs) -> Result<()> {
-    let first_input = args
-        .header_from
-        .as_ref()
-        .unwrap_or_else(|| &args.inputs[0]);
+    let first_input = args.header_from.as_ref().unwrap_or_else(|| &args.inputs[0]);
     let header_reader = BamReader::open(first_input).context("open header source")?;
     let mut header = header_reader.header().clone();
     drop(header_reader);
@@ -25,7 +22,8 @@ pub fn run(args: CatArgs) -> Result<()> {
 
     let mut rec = RecordBuf::default();
     for input in &args.inputs {
-        let mut reader = BamReader::open(input).with_context(|| format!("open {}", input.display()))?;
+        let mut reader =
+            BamReader::open(input).with_context(|| format!("open {}", input.display()))?;
         let _ = reader.header();
         while reader.read_record_buf(&mut rec)? {
             let _ = writer.write_record_buf(&rec);

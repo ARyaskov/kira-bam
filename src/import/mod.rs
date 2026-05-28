@@ -4,10 +4,10 @@ use std::io::{BufRead, BufReader};
 use anyhow::{Context, Result};
 use bstr::BString;
 use noodles_sam::Header;
-use noodles_sam::alignment::record::data::field::Tag;
-use noodles_sam::alignment::record::Flags;
-use noodles_sam::alignment::record_buf::data::field::Value;
 use noodles_sam::alignment::RecordBuf;
+use noodles_sam::alignment::record::Flags;
+use noodles_sam::alignment::record::data::field::Tag;
+use noodles_sam::alignment::record_buf::data::field::Value;
 use noodles_sam::header::record::value::{Map, map::ReadGroup, map::read_group::tag as rg_tag};
 
 use crate::cli::ImportArgs;
@@ -44,13 +44,17 @@ pub fn run(args: ImportArgs) -> Result<()> {
 
     let rg_id = args.rg_id.clone();
     while let Some(rec1) = r1.next()? {
-        let flag_r1: u16 = if r2.is_some() { 0x1 | 0x40 | 0x4 | 0x8 } else { 0x4 };
+        let flag_r1: u16 = if r2.is_some() {
+            0x1 | 0x40 | 0x4 | 0x8
+        } else {
+            0x4
+        };
         emit(&mut writer, &rec1, flag_r1, &rg_id, args.casava, 1)?;
-        if let Some(r2) = r2.as_mut() {
-            if let Some(rec2) = r2.next()? {
-                let flag_r2 = 0x1 | 0x80 | 0x4 | 0x8;
-                emit(&mut writer, &rec2, flag_r2, &rg_id, args.casava, 2)?;
-            }
+        if let Some(r2) = r2.as_mut()
+            && let Some(rec2) = r2.next()?
+        {
+            let flag_r2 = 0x1 | 0x80 | 0x4 | 0x8;
+            emit(&mut writer, &rec2, flag_r2, &rg_id, args.casava, 2)?;
         }
     }
     writer.finish()?;
@@ -98,16 +102,22 @@ impl FastqIter {
         let mut parts = stripped.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("").to_string();
         // Strip /1 /2 suffix.
-        let name = name.trim_end_matches("/1").trim_end_matches("/2").to_string();
+        let name = name
+            .trim_end_matches("/1")
+            .trim_end_matches("/2")
+            .to_string();
         let rest = parts.next().unwrap_or("");
         // CASAVA: 1:N:0:BARCODE → pull BC.
         let mut barcode: Option<Vec<u8>> = None;
         if !rest.is_empty() {
             let segs: Vec<&str> = rest.split(':').collect();
-            if let Some(bc) = segs.last() {
-                if !bc.is_empty() && bc.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-') {
-                    barcode = Some(bc.as_bytes().to_vec());
-                }
+            if let Some(bc) = segs.last()
+                && !bc.is_empty()
+                && bc
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-')
+            {
+                barcode = Some(bc.as_bytes().to_vec());
             }
         }
         Ok(Some(FastqRec {
@@ -133,13 +143,15 @@ fn emit(
     *rb.sequence_mut() = rec.seq.clone().into();
     let q: Vec<u8> = rec.qual.iter().map(|&c| c.saturating_sub(33)).collect();
     *rb.quality_scores_mut() = q.into();
-    rb.data_mut()
-        .insert(Tag::READ_GROUP, Value::String(BString::from(rg_id.as_bytes())));
-    if casava {
-        if let Some(bc) = &rec.barcode {
-            rb.data_mut()
-                .insert(Tag::new(b'B', b'C'), Value::String(BString::from(bc.clone())));
-        }
+    rb.data_mut().insert(
+        Tag::READ_GROUP,
+        Value::String(BString::from(rg_id.as_bytes())),
+    );
+    if casava && let Some(bc) = &rec.barcode {
+        rb.data_mut().insert(
+            Tag::new(b'B', b'C'),
+            Value::String(BString::from(bc.clone())),
+        );
     }
     writer.write_record_buf(&rb)?;
     Ok(())

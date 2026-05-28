@@ -2,8 +2,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use anyhow::{Context, Result};
-use noodles_sam::alignment::io::Write as AlignmentWrite;
 use noodles_sam::alignment::RecordBuf;
+use noodles_sam::alignment::io::Write as AlignmentWrite;
 
 use crate::cli::HeadArgs;
 use crate::io::BamReader;
@@ -18,9 +18,10 @@ pub fn run(args: HeadArgs) -> Result<()> {
     };
 
     // Emit header.
-    let mut sam_writer = noodles_sam::io::Writer::new(&mut out);
-    sam_writer.write_header(&header)?;
-    drop(sam_writer);
+    {
+        let mut sam_writer = noodles_sam::io::Writer::new(&mut out);
+        sam_writer.write_header(&header)?;
+    }
 
     if args.n == 0 {
         return Ok(());

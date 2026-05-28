@@ -47,7 +47,7 @@ pub fn run(args: MpileupArgs) -> Result<()> {
         // Read bases column with ref-base style markup (. for match, ACGT for mismatch).
         write!(out, "\t")?;
         for &(b, _q) in &col {
-            let same = b.to_ascii_uppercase() == ref_base.to_ascii_uppercase();
+            let same = b.eq_ignore_ascii_case(&ref_base);
             if same {
                 out.write_all(b".")?;
             } else {

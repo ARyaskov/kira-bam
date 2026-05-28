@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use bstr::BString;
+use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::data::field::Tag;
 use noodles_sam::alignment::record_buf::data::field::Value;
-use noodles_sam::alignment::RecordBuf;
 use noodles_sam::header::record::value::{Map, map::ReadGroup, map::read_group::tag as rg_tag};
 
 use crate::cli::AddReplaceRgArgs;
@@ -15,9 +15,7 @@ pub fn run(args: AddReplaceRgArgs) -> Result<()> {
     let mut reader = BamReader::open(&args.input).context("open input")?;
     let mut header = reader.header().clone();
     let (rg_id, rg_map) = parse_rg_line(&args.rg_line)?;
-    header
-        .read_groups_mut()
-        .insert(rg_id.clone(), rg_map);
+    header.read_groups_mut().insert(rg_id.clone(), rg_map);
     append_pg(&mut header, &PgInfo::new("addreplacerg", !args.no_pg))?;
 
     let fmt = if args.uncompressed {

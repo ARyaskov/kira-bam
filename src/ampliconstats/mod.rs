@@ -86,10 +86,10 @@ fn count_in_region(input: &std::path::Path, amp: &Amp, min_mapq: u8) -> Result<u
     for r in q.records() {
         let r = r?;
         let buf = RecordBuf::try_from_alignment_record(&header, &r)?;
-        if let Some(mq) = buf.mapping_quality() {
-            if u8::from(mq) < min_mapq {
-                continue;
-            }
+        if let Some(mq) = buf.mapping_quality()
+            && u8::from(mq) < min_mapq
+        {
+            continue;
         }
         n += 1;
     }

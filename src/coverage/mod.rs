@@ -67,10 +67,10 @@ pub fn run(args: CoverageArgs) -> Result<()> {
         if (flags & 0x4) != 0 {
             continue;
         }
-        if let Some(mapq) = rec.mapping_quality() {
-            if u8::from(mapq) < args.min_mapq {
-                continue;
-            }
+        if let Some(mapq) = rec.mapping_quality()
+            && u8::from(mapq) < args.min_mapq
+        {
+            continue;
         }
         let tid = match rec.reference_sequence_id() {
             Some(t) => t,
@@ -99,11 +99,11 @@ pub fn run(args: CoverageArgs) -> Result<()> {
             }
             st.covered[pos - 1] = 1;
             st.sum_depth += 1;
-            if let Some(q) = q_iter.next() {
-                if q >= args.min_baseq {
-                    st.sum_baseq += q as u64;
-                    st.sum_baseq_n += 1;
-                }
+            if let Some(q) = q_iter.next()
+                && q >= args.min_baseq
+            {
+                st.sum_baseq += q as u64;
+                st.sum_baseq_n += 1;
             }
         }
     }

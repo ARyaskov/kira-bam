@@ -65,13 +65,7 @@ pub fn run(args: FastqArgs) -> Result<()> {
                             &args,
                         )?;
                     } else {
-                        emit_single(
-                            &p,
-                            &mut singletons,
-                            &mut r1,
-                            &mut stdout_sink,
-                            &args,
-                        )?;
+                        emit_single(&p, &mut singletons, &mut r1, &mut stdout_sink, &args)?;
                         prev = Some(rec.clone());
                     }
                 }
@@ -113,15 +107,9 @@ pub fn run(args: FastqArgs) -> Result<()> {
                     &args,
                 )?;
             } else {
-                for k in i..j {
-                    let rec = buf[k].clone();
-                    emit_single(
-                        &rec,
-                        &mut singletons,
-                        &mut r1,
-                        &mut stdout_sink,
-                        &args,
-                    )?;
+                for rec in buf.iter().take(j).skip(i) {
+                    let rec = rec.clone();
+                    emit_single(&rec, &mut singletons, &mut r1, &mut stdout_sink, &args)?;
                 }
             }
             i = j;
@@ -188,10 +176,7 @@ fn emit_single(
     } else {
         None
     };
-    let sink = singletons
-        .as_mut()
-        .or(r1.as_mut())
-        .unwrap_or(stdout_sink);
+    let sink = singletons.as_mut().or(r1.as_mut()).unwrap_or(stdout_sink);
     emit_record(rec, sink, args, mate_num)
 }
 
@@ -203,10 +188,10 @@ fn emit_record(
 ) -> Result<()> {
     let name: &[u8] = rec.name().map(AsRef::as_ref).unwrap_or(&[]);
     let mut suffix = String::new();
-    if args.casava {
-        if let Some(n) = mate_num {
-            suffix = format!("/{n}");
-        }
+    if args.casava
+        && let Some(n) = mate_num
+    {
+        suffix = format!("/{n}");
     }
     let flags = u16::from(rec.flags());
     if (flags & FLAG_UNMAP) == 0 && (flags & FLAG_REVERSE) != 0 {
@@ -227,7 +212,12 @@ fn emit_record(
         write_seq(out, name, &suffix, &seq, &qual, args.fasta)?;
     } else {
         let seq: Vec<u8> = rec.sequence().as_ref().to_vec();
-        let qual: Vec<u8> = rec.quality_scores().as_ref().iter().map(|&q| q + 33).collect();
+        let qual: Vec<u8> = rec
+            .quality_scores()
+            .as_ref()
+            .iter()
+            .map(|&q| q + 33)
+            .collect();
         write_seq(out, name, &suffix, &seq, &qual, args.fasta)?;
     }
     Ok(())

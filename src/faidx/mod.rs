@@ -47,7 +47,7 @@ pub fn run(args: FaidxArgs) -> Result<()> {
         let end = end.unwrap_or(entry.length);
         writeln!(out, ">{name}:{start}-{end}")?;
         let mut remaining = (end - start + 1) as usize;
-        let mut pos_in_seq = (start - 1) as u64;
+        let mut pos_in_seq = start - 1;
         while remaining > 0 {
             let line_idx = pos_in_seq / entry.line_blen;
             let in_line = pos_in_seq % entry.line_blen;
@@ -165,11 +165,7 @@ fn parse_region(s: &str) -> (String, Option<u64>, Option<u64>) {
         if let Some(dash) = rest.find('-') {
             let (a, b) = rest.split_at(dash);
             let b = &b[1..];
-            (
-                name.to_string(),
-                a.parse().ok(),
-                b.parse().ok(),
-            )
+            (name.to_string(), a.parse().ok(), b.parse().ok())
         } else {
             (name.to_string(), rest.parse().ok(), None)
         }

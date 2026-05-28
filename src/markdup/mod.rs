@@ -471,9 +471,9 @@ fn base_quality_sum_scalar(q: &[u8]) -> u32 {
 #[target_feature(enable = "avx2")]
 unsafe fn base_quality_sum_avx2(q: &[u8]) -> u32 {
     use std::arch::x86_64::{
-        __m256i, _mm256_add_epi64, _mm256_and_si256, _mm256_cmpgt_epi8,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_sad_epu8, _mm256_set1_epi8,
-        _mm256_setzero_si256, _mm_add_epi64, _mm_cvtsi128_si64, _mm_unpackhi_epi64,
+        __m256i, _mm_add_epi64, _mm_cvtsi128_si64, _mm_unpackhi_epi64, _mm256_add_epi64,
+        _mm256_and_si256, _mm256_cmpgt_epi8, _mm256_extracti128_si256, _mm256_loadu_si256,
+        _mm256_sad_epu8, _mm256_set1_epi8, _mm256_setzero_si256,
     };
 
     let n = q.len();
@@ -505,54 +505,6 @@ unsafe fn base_quality_sum_avx2(q: &[u8]) -> u32 {
         }
     }
     total
-}
-
-#[cfg(test)]
-mod base_quality_tests {
-    use super::*;
-
-    #[test]
-    fn empty() {
-        assert_eq!(base_quality_sum_bytes(&[]), 0);
-    }
-
-    #[test]
-    fn below_threshold_excluded() {
-        let q = vec![0, 5, 10, 14];
-        assert_eq!(base_quality_sum_bytes(&q), 0);
-    }
-
-    #[test]
-    fn threshold_inclusive() {
-        let q = vec![15];
-        assert_eq!(base_quality_sum_bytes(&q), 15);
-    }
-
-    #[test]
-    fn matches_scalar_for_realistic_qualities() {
-        // 150-byte read, typical Illumina quality range
-        let q: Vec<u8> = (0..150u8).map(|i| (i % 41) + 20).collect();
-        let scalar = base_quality_sum_scalar(&q);
-        let actual = base_quality_sum_bytes(&q);
-        assert_eq!(scalar, actual);
-    }
-
-    #[test]
-    fn matches_scalar_for_long_random_quality_strings() {
-        // Exercise tail handling. Length not a multiple of 32.
-        let q: Vec<u8> = (0..255u32)
-            .map(|i| ((i * 37 + 1) % 60) as u8)
-            .collect();
-        let scalar = base_quality_sum_scalar(&q);
-        let actual = base_quality_sum_bytes(&q);
-        assert_eq!(scalar, actual);
-    }
-
-    #[test]
-    fn tail_only() {
-        let q = vec![20u8; 10]; // < 32, tail-only path
-        assert_eq!(base_quality_sum_bytes(&q), 200);
-    }
 }
 
 fn write_stats(
@@ -626,5 +578,51 @@ impl BitSet {
             return false;
         }
         (self.bits[word] >> bit) & 1 == 1
+    }
+}
+
+#[cfg(test)]
+mod base_quality_tests {
+    use super::*;
+
+    #[test]
+    fn empty() {
+        assert_eq!(base_quality_sum_bytes(&[]), 0);
+    }
+
+    #[test]
+    fn below_threshold_excluded() {
+        let q = vec![0, 5, 10, 14];
+        assert_eq!(base_quality_sum_bytes(&q), 0);
+    }
+
+    #[test]
+    fn threshold_inclusive() {
+        let q = vec![15];
+        assert_eq!(base_quality_sum_bytes(&q), 15);
+    }
+
+    #[test]
+    fn matches_scalar_for_realistic_qualities() {
+        // 150-byte read, typical Illumina quality range
+        let q: Vec<u8> = (0..150u8).map(|i| (i % 41) + 20).collect();
+        let scalar = base_quality_sum_scalar(&q);
+        let actual = base_quality_sum_bytes(&q);
+        assert_eq!(scalar, actual);
+    }
+
+    #[test]
+    fn matches_scalar_for_long_random_quality_strings() {
+        // Exercise tail handling. Length not a multiple of 32.
+        let q: Vec<u8> = (0..255u32).map(|i| ((i * 37 + 1) % 60) as u8).collect();
+        let scalar = base_quality_sum_scalar(&q);
+        let actual = base_quality_sum_bytes(&q);
+        assert_eq!(scalar, actual);
+    }
+
+    #[test]
+    fn tail_only() {
+        let q = vec![20u8; 10]; // < 32, tail-only path
+        assert_eq!(base_quality_sum_bytes(&q), 200);
     }
 }

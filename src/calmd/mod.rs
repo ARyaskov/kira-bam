@@ -3,10 +3,10 @@ use std::fs::File;
 
 use anyhow::{Context, Result};
 use noodles_fasta as fasta;
+use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::record::data::field::Tag;
 use noodles_sam::alignment::record_buf::data::field::Value;
-use noodles_sam::alignment::RecordBuf;
 use rustc_hash::FxHasher;
 
 use crate::cli::CalmdArgs;
@@ -40,15 +40,17 @@ pub fn run(args: CalmdArgs) -> Result<()> {
                 .get_index(tid)
                 .map(|(n, _)| n.to_string())
                 .unwrap_or_default();
-            if let Some(seq) = refs.get(ref_name.as_bytes()) {
-                if let Some(start) = rec.alignment_start() {
-                    let start = usize::from(start);
-                    if let Some((md, nm)) = compute_md_nm(&rec, seq, start) {
-                        rec.data_mut()
-                            .insert(Tag::MISMATCHED_POSITIONS, Value::String(md.into()));
-                        rec.data_mut().insert(Tag::ALIGNMENT_HIT_COUNT, Value::Int32(nm as i32));
-                        rec.data_mut().insert(Tag::EDIT_DISTANCE, Value::Int32(nm as i32));
-                    }
+            if let Some(seq) = refs.get(ref_name.as_bytes())
+                && let Some(start) = rec.alignment_start()
+            {
+                let start = usize::from(start);
+                if let Some((md, nm)) = compute_md_nm(&rec, seq, start) {
+                    rec.data_mut()
+                        .insert(Tag::MISMATCHED_POSITIONS, Value::String(md.into()));
+                    rec.data_mut()
+                        .insert(Tag::ALIGNMENT_HIT_COUNT, Value::Int32(nm as i32));
+                    rec.data_mut()
+                        .insert(Tag::EDIT_DISTANCE, Value::Int32(nm as i32));
                 }
             }
         }
@@ -58,7 +60,9 @@ pub fn run(args: CalmdArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_reference(path: &std::path::Path) -> Result<HashMap<Vec<u8>, Vec<u8>, std::hash::BuildHasherDefault<FxHasher>>> {
+fn load_reference(
+    path: &std::path::Path,
+) -> Result<HashMap<Vec<u8>, Vec<u8>, std::hash::BuildHasherDefault<FxHasher>>> {
     let file = File::open(path).with_context(|| format!("open reference {}", path.display()))?;
     let mut reader = fasta::io::Reader::new(std::io::BufReader::with_capacity(1 << 20, file));
     let mut out: HashMap<Vec<u8>, Vec<u8>, std::hash::BuildHasherDefault<FxHasher>> =
@@ -84,7 +88,7 @@ fn compute_md_nm(rec: &RecordBuf, refseq: &[u8], ref_start_1: usize) -> Option<(
     let mut ref_idx: usize = ref_start_1.saturating_sub(1);
     let mut run_match: u32 = 0;
     for op in rec.cigar().as_ref().iter() {
-        let len = op.len() as usize;
+        let len = op.len();
         match op.kind() {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 for _ in 0..len {

@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use noodles_bam as bam;
 use noodles_core::Region;
 use noodles_fasta as fasta;
-use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::RecordBuf;
+use noodles_sam::alignment::record::cigar::op::Kind;
 use rustc_hash::FxHasher;
 
 use crate::cli::TviewArgs;
@@ -57,9 +57,9 @@ pub fn run(args: TviewArgs) -> Result<()> {
     writeln!(stdout, "{chrom}:{start_1}-{end_1}")?;
     for offset in 0..args.width {
         let pos = start_1 + offset as u64;
-        if pos % 10 == 0 && offset + 9 < args.width {
+        if pos.is_multiple_of(10) && offset + 9 < args.width {
             write!(stdout, "|")?;
-        } else if pos % 5 == 0 {
+        } else if pos.is_multiple_of(5) {
             write!(stdout, ":")?;
         } else {
             write!(stdout, " ")?;
@@ -154,7 +154,7 @@ fn render_read(rec: &RecordBuf, win_start_1: u64, win_width: usize) -> Option<(u
     let mut ref_pos = start_1;
     let win_end_1 = win_start_1 + win_width as u64 - 1;
     for op in rec.cigar().as_ref().iter() {
-        let len = op.len() as usize;
+        let len = op.len();
         match op.kind() {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 for _ in 0..len {

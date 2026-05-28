@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::Flags;
-use noodles_sam::alignment::record_buf::data::field::Value;
 use noodles_sam::alignment::record::data::field::Tag;
+use noodles_sam::alignment::record_buf::data::field::Value;
 
 use crate::cli::FixmateArgs;
 use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
@@ -151,10 +151,22 @@ fn fix_mate_pair(a: &mut RecordBuf, b: &mut RecordBuf, args: &FixmateArgs) {
 
     // TLEN: signed insert size.
     if a.reference_sequence_id() == b.reference_sequence_id() && !a_unmap && !b_unmap {
-        let a_start = a.alignment_start().map(|p| usize::from(p) as i64).unwrap_or(0);
-        let b_start = b.alignment_start().map(|p| usize::from(p) as i64).unwrap_or(0);
-        let a_end = a.alignment_end().map(|p| usize::from(p) as i64).unwrap_or(a_start);
-        let b_end = b.alignment_end().map(|p| usize::from(p) as i64).unwrap_or(b_start);
+        let a_start = a
+            .alignment_start()
+            .map(|p| usize::from(p) as i64)
+            .unwrap_or(0);
+        let b_start = b
+            .alignment_start()
+            .map(|p| usize::from(p) as i64)
+            .unwrap_or(0);
+        let a_end = a
+            .alignment_end()
+            .map(|p| usize::from(p) as i64)
+            .unwrap_or(a_start);
+        let b_end = b
+            .alignment_end()
+            .map(|p| usize::from(p) as i64)
+            .unwrap_or(b_start);
         let (left_start, right_end) = if a_start <= b_start {
             (a_start, b_end.max(a_end))
         } else {

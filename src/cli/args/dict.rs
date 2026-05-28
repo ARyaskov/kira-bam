@@ -9,7 +9,7 @@ pub struct DictArgs {
     #[arg(value_name = "FASTA")]
     pub fasta: PathBuf,
 
-    /// Output (default: <fasta>.dict on stdout if `-`).
+    /// Output (default: `<fasta>.dict` on stdout if `-`).
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 

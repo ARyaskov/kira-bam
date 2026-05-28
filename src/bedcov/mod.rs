@@ -71,10 +71,10 @@ fn count_coverage(bam_path: &std::path::Path, iv: &Interval, min_mapq: u8) -> Re
     for r in query.records() {
         let r = r?;
         let buf = RecordBuf::try_from_alignment_record(&header, &r)?;
-        if let Some(mapq) = buf.mapping_quality() {
-            if u8::from(mapq) < min_mapq {
-                continue;
-            }
+        if let Some(mapq) = buf.mapping_quality()
+            && u8::from(mapq) < min_mapq
+        {
+            continue;
         }
         if let (Some(s), Some(e)) = (buf.alignment_start(), buf.alignment_end()) {
             let s = usize::from(s) as u64;

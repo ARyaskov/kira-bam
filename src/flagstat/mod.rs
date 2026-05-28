@@ -142,7 +142,11 @@ fn print_flagstat_json(t: &FlagstatTotals) {
         line("secondary", p.secondary, f.secondary),
         line("supplementary", p.supplementary, f.supplementary),
         line("duplicates", p.duplicates, f.duplicates),
-        line("primary_duplicates", p.primary_duplicates, f.primary_duplicates),
+        line(
+            "primary_duplicates",
+            p.primary_duplicates,
+            f.primary_duplicates,
+        ),
         line("mapped", p.mapped, f.mapped),
         line("primary_mapped", p.primary_mapped, f.primary_mapped),
         line("paired", p.paired, f.paired),
@@ -156,7 +160,11 @@ fn print_flagstat_json(t: &FlagstatTotals) {
         ),
         line("singletons", p.singletons, f.singletons),
         line("mate_diff_chr", p.mate_diff_chr, f.mate_diff_chr),
-        line("mate_diff_chr_mq5", p.mate_diff_chr_mq5, f.mate_diff_chr_mq5),
+        line(
+            "mate_diff_chr_mq5",
+            p.mate_diff_chr_mq5,
+            f.mate_diff_chr_mq5,
+        ),
     ];
     println!("{{");
     println!("{}", entries.join(",\n"));

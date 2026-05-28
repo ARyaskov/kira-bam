@@ -236,14 +236,14 @@ fn pass_filters(rec: &crate::io::Record, args: &ViewArgs) -> bool {
     }
     // -v REGION exclusion (samtools PR #669). Naive impl: parse spec as
     // `chr` or `chr:start-end` and drop if record's [start,end] overlaps.
-    if !args.exclude_regions.is_empty() {
-        if let Some(_tid) = rec.reference_sequence_id() {
-            // We compare against the textual ref name. Slow per-record;
-            // acceptable for small exclude lists.
-            for spec in &args.exclude_regions {
-                if record_in_region_spec(rec, spec) {
-                    return false;
-                }
+    if !args.exclude_regions.is_empty()
+        && let Some(_tid) = rec.reference_sequence_id()
+    {
+        // We compare against the textual ref name. Slow per-record;
+        // acceptable for small exclude lists.
+        for spec in &args.exclude_regions {
+            if record_in_region_spec(rec, spec) {
+                return false;
             }
         }
     }
@@ -258,11 +258,7 @@ fn record_in_region_spec(rec: &crate::io::Record, spec: &str) -> bool {
         if let Some(dash) = rest.find('-') {
             let (a, b) = rest.split_at(dash);
             let b = &b[1..];
-            (
-                c.to_string(),
-                a.parse::<u64>().ok(),
-                b.parse::<u64>().ok(),
-            )
+            (c.to_string(), a.parse::<u64>().ok(), b.parse::<u64>().ok())
         } else {
             (c.to_string(), rest.parse::<u64>().ok(), None)
         }

@@ -34,12 +34,10 @@ fn load_bed(
         }
         let start: u64 = parts[1].parse().unwrap_or(0);
         let end: u64 = parts[2].parse().unwrap_or(0);
-        out.entry(parts[0].to_string())
-            .or_default()
-            .push(BedIv {
-                start: start + 1,
-                end,
-            });
+        out.entry(parts[0].to_string()).or_default().push(BedIv {
+            start: start + 1,
+            end,
+        });
     }
     Ok(out)
 }
@@ -114,9 +112,18 @@ pub fn run(args: StatsArgs) -> Result<()> {
                     .get_index(tid)
                     .map(|(n, _)| n.to_string())
                     .unwrap_or_default();
-                let s = rec.alignment_start().map(|p| usize::from(p) as u64).unwrap_or(0);
-                let e = rec.alignment_end().map(|p| usize::from(p) as u64).unwrap_or(s);
-                let pass = b.get(&ref_name).map(|ivs| in_any(ivs, s, e)).unwrap_or(false);
+                let s = rec
+                    .alignment_start()
+                    .map(|p| usize::from(p) as u64)
+                    .unwrap_or(0);
+                let e = rec
+                    .alignment_end()
+                    .map(|p| usize::from(p) as u64)
+                    .unwrap_or(s);
+                let pass = b
+                    .get(&ref_name)
+                    .map(|ivs| in_any(ivs, s, e))
+                    .unwrap_or(false);
                 if !pass {
                     st.filtered_out += 1;
                     continue;
@@ -128,7 +135,7 @@ pub fn run(args: StatsArgs) -> Result<()> {
         }
         if let Some(mapq) = rec.mapping_quality() {
             let mapq = u8::from(mapq);
-            if (mapq as u8) < args.min_mapq {
+            if mapq < args.min_mapq {
                 st.filtered_out += 1;
                 continue;
             }
@@ -164,7 +171,7 @@ pub fn run(args: StatsArgs) -> Result<()> {
             if (flags & FLAG_PROPER_PAIR) != 0 {
                 st.properly_paired += 1;
             }
-            let isize = rec.template_length().abs() as usize;
+            let isize = rec.template_length().unsigned_abs() as usize;
             if isize <= MAX_INSERT_SIZE {
                 st.insert_size_hist[isize] += 1;
             }
@@ -177,13 +184,12 @@ pub fn run(args: StatsArgs) -> Result<()> {
         }
         let n_count = seq.iter().filter(|&&b| b == b'N' || b == b'n').count();
         st.bases_n += n_count as u64;
-        if read_len > 0 {
-            let gc = seq
-                .iter()
-                .filter(|&&b| matches!(b, b'G' | b'C' | b'g' | b'c'))
-                .count();
-            let gc_pct = (100 * gc / read_len).min(100);
-            st.gc_hist[gc_pct] += 1;
+        let gc = seq
+            .iter()
+            .filter(|&&b| matches!(b, b'G' | b'C' | b'g' | b'c'))
+            .count();
+        if let Some(gc_pct) = (100 * gc).checked_div(read_len) {
+            st.gc_hist[gc_pct.min(100)] += 1;
         }
     }
 

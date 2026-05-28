@@ -45,6 +45,9 @@ pub fn run(args: CollateArgs) -> Result<()> {
         }
     }
     writer.finish()?;
-    eprintln!("[kira-bam collate] wrote {total} records to {}", out_path.display());
+    eprintln!(
+        "[kira-bam collate] wrote {total} records to {}",
+        out_path.display()
+    );
     Ok(())
 }

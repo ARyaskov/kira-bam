@@ -33,12 +33,10 @@ fn load_bed(
         }
         let start: u64 = parts[1].parse().unwrap_or(0);
         let end: u64 = parts[2].parse().unwrap_or(0);
-        out.entry(parts[0].to_string())
-            .or_default()
-            .push(DepthIv {
-                start: start + 1,
-                end,
-            });
+        out.entry(parts[0].to_string()).or_default().push(DepthIv {
+            start: start + 1,
+            end,
+        });
     }
     Ok(out)
 }
@@ -77,10 +75,10 @@ pub fn run(args: DepthArgs) -> Result<()> {
         if (flags & 0x4) != 0 {
             continue;
         }
-        if let Some(mapq) = rec.mapping_quality() {
-            if u8::from(mapq) < args.min_mapq {
-                continue;
-            }
+        if let Some(mapq) = rec.mapping_quality()
+            && u8::from(mapq) < args.min_mapq
+        {
+            continue;
         }
         let tid = match rec.reference_sequence_id() {
             Some(t) => t,
@@ -112,7 +110,13 @@ pub fn run(args: DepthArgs) -> Result<()> {
                     .map(|(n, _)| n.to_string())
                     .unwrap_or_default();
                 let bed_for_ref = bed.as_ref().and_then(|b| b.get(&ref_name));
-                state.drain_to(&ref_name, ref_len, args.all_positions, bed_for_ref, &mut out)?;
+                state.drain_to(
+                    &ref_name,
+                    ref_len,
+                    args.all_positions,
+                    bed_for_ref,
+                    &mut out,
+                )?;
             }
             state = SweepState {
                 current_tid: Some(tid),
@@ -142,7 +146,13 @@ pub fn run(args: DepthArgs) -> Result<()> {
             .map(|(_, sq)| usize::from(sq.length()))
             .unwrap_or(0);
         let bed_for_ref = bed.as_ref().and_then(|b| b.get(&ref_name));
-        state.drain_to(&ref_name, ref_len, args.all_positions, bed_for_ref, &mut out)?;
+        state.drain_to(
+            &ref_name,
+            ref_len,
+            args.all_positions,
+            bed_for_ref,
+            &mut out,
+        )?;
     }
     out.flush()?;
     Ok(())

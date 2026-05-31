@@ -179,6 +179,8 @@ pub enum InputFormat {
 pub struct WriteOptions {
     /// Number of parallel BGZF compression workers. 0/1 = single-threaded.
     pub compression_workers: usize,
+    /// BGZF compression level. `None` = noodles default (6, samtools-compatible).
+    pub compression_level: Option<bgzf::io::writer::CompressionLevel>,
 }
 
 /// Read-side IO options. Default = stream the file via buffered `read()`.
@@ -513,10 +515,19 @@ impl BamWriter {
                 if opts.compression_workers >= 2 {
                     let workers = std::num::NonZero::new(opts.compression_workers)
                         .unwrap_or(std::num::NonZero::<usize>::MIN);
-                    let bgz = bgzf::io::MultithreadedWriter::with_worker_count(workers, buf);
+                    let mut builder =
+                        bgzf::io::multithreaded_writer::Builder::default().set_worker_count(workers);
+                    if let Some(level) = opts.compression_level {
+                        builder = builder.set_compression_level(level);
+                    }
+                    let bgz = builder.build_from_writer(buf);
                     WriterImpl::BamMt(bam::io::Writer::from(bgz))
                 } else {
-                    let bgz = bgzf::io::Writer::new(buf);
+                    let mut builder = bgzf::io::writer::Builder::default();
+                    if let Some(level) = opts.compression_level {
+                        builder = builder.set_compression_level(level);
+                    }
+                    let bgz = builder.build_from_writer(buf);
                     WriterImpl::Bam(bam::io::Writer::from(bgz))
                 }
             }
@@ -590,6 +601,22 @@ impl BamWriter {
         &self.header
     }
 
+    /// Stream pre-encoded BAM record bytes (from [`encode_records_into`]) through BGZF. BAM only.
+    pub fn write_preencoded(&mut self, raw: &[u8]) -> Result<()> {
+        if !self.header_written {
+            self.write_header()?;
+        }
+        match &mut self.inner {
+            WriterImpl::Bam(w) => w.get_mut().write_all(raw).context("write pre-encoded BAM")?,
+            WriterImpl::BamMt(w) => w
+                .get_mut()
+                .write_all(raw)
+                .context("write pre-encoded BAM (mt)")?,
+            _ => anyhow::bail!("write_preencoded supports BAM output only"),
+        }
+        Ok(())
+    }
+
     pub fn finish(mut self) -> Result<()> {
         match &mut self.inner {
             WriterImpl::Bam(w) => {
@@ -607,6 +634,15 @@ impl BamWriter {
         }
         Ok(())
     }
+}
+
+/// Encode `records` into the raw BAM record stream consumed by [`BamWriter::write_preencoded`].
+pub fn encode_records_into(header: &Header, records: &[RecordBuf]) -> Vec<u8> {
+    let mut w = bam::io::Writer::from(Vec::<u8>::with_capacity(records.len() * 64));
+    for r in records {
+        let _ = w.write_alignment_record(header, r);
+    }
+    w.into_inner()
 }
 
 pub fn default_index_path(bam: &Path, csi: bool) -> PathBuf {

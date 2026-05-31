@@ -32,6 +32,10 @@ pub struct SortArgs {
     #[arg(short = 'u', long = "uncompressed")]
     pub uncompressed: bool,
 
+    /// BGZF compression level for BAM output (0-9). Default 6 (samtools-compatible).
+    #[arg(short = 'l', long = "compression-level", value_name = "INT")]
+    pub compression_level: Option<u8>,
+
     /// Reference FASTA — only needed when input or output is CRAM.
     #[arg(short = 'T', long = "reference")]
     pub reference: Option<PathBuf>,

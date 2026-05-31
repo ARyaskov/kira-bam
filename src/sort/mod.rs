@@ -120,6 +120,22 @@ fn sort_records_by_kind(records: &mut Vec<RecordBuf>, kind: SortKind) {
     records.extend(keyed.into_iter().map(|(_, r)| r));
 }
 
+/// Coordinate-sort and optionally mark duplicates in memory, returning the sorted records.
+pub fn sort_and_markdup_in_memory(
+    mut records: Vec<RecordBuf>,
+    markdup: bool,
+) -> Result<Vec<RecordBuf>> {
+    sort_records_by_kind(&mut records, SortKind::Coordinate);
+    if markdup {
+        let opts = crate::markdup::MarkdupOptions {
+            barcode_tag: None,
+            ancient: false,
+        };
+        let _ = mark_duplicates_in_memory(&mut records, &opts).context("mark duplicates")?;
+    }
+    Ok(records)
+}
+
 fn build_key(rec: &RecordBuf, kind: SortKind) -> SortKey {
     let tid = rec
         .reference_sequence_id()
@@ -236,6 +252,9 @@ pub fn run(args: SortArgs) -> Result<()> {
         // issuing write_record_buf calls).
         let write_opts = WriteOptions {
             compression_workers: args.threads.saturating_sub(1).clamp(1, 8),
+            compression_level: args
+                .compression_level
+                .and_then(bgzf::io::writer::CompressionLevel::new),
         };
         let mut writer = BamWriter::create_with_options(
             args.output.as_deref(),
@@ -245,17 +264,33 @@ pub fn run(args: SortArgs) -> Result<()> {
             write_opts,
         )?;
         writer.write_header()?;
-        let mut skipped: u64 = 0;
-        for r in current_chunk.iter() {
-            if let Err(e) = writer.write_record_buf(r) {
-                skipped += 1;
-                if skipped <= 5 {
-                    eprintln!("[kira-bam sort] skip record: {e:#}");
+        if matches!(fmt, OutputFormat::Bam | OutputFormat::UncompressedBam) {
+            // Encode records to raw BAM bytes in parallel chunks, then stream through BGZF.
+            let n_chunks = rayon::current_num_threads().max(1);
+            let chunk_len = current_chunk.len().div_ceil(n_chunks).max(1);
+            let encoded: Vec<Vec<u8>> = {
+                let hdr = writer.header();
+                current_chunk
+                    .par_chunks(chunk_len)
+                    .map(|recs| crate::io::encode_records_into(hdr, recs))
+                    .collect()
+            };
+            for buf in &encoded {
+                writer.write_preencoded(buf)?;
+            }
+        } else {
+            let mut skipped: u64 = 0;
+            for r in current_chunk.iter() {
+                if let Err(e) = writer.write_record_buf(r) {
+                    skipped += 1;
+                    if skipped <= 5 {
+                        eprintln!("[kira-bam sort] skip record: {e:#}");
+                    }
                 }
             }
-        }
-        if skipped > 0 {
-            eprintln!("[kira-bam sort] {skipped} records skipped due to write errors");
+            if skipped > 0 {
+                eprintln!("[kira-bam sort] {skipped} records skipped due to write errors");
+            }
         }
         writer.finish()?;
         return Ok(());

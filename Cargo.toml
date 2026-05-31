@@ -1,7 +1,7 @@
 [package]
 name = "kira-bam"
 description = "High-performance BAM/SAM/CRAM toolkit written in Rust 2024. Drop-in samtools-compatible CLI (view/sort/index/merge/markdup/flagstat) plus a library API for embedding directly into aligners and variant callers."
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"

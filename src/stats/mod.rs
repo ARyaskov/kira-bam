@@ -67,6 +67,9 @@ struct Stats {
     properly_paired: u64,
     qc_failed: u64,
     bases_total: u64,
+    /// "bases mapped": total read length summed over mapped reads.
+    bases_mapped_seq: u64,
+    /// "bases mapped (cigar)": only reference-and-read-consuming CIGAR ops.
     bases_mapped: u64,
     bases_n: u64,
     reads_unmapped: u64,
@@ -156,7 +159,9 @@ pub fn run(args: StatsArgs) -> Result<()> {
             st.reads_unmapped += 1;
         } else {
             st.mapped += 1;
-            // Count mapped bases via CIGAR.
+            // "bases mapped" = full read length of mapped reads.
+            st.bases_mapped_seq += rec.sequence().as_ref().len() as u64;
+            // "bases mapped (cigar)" = only ref-and-read-consuming ops.
             let mapped_bases: u64 = rec
                 .cigar()
                 .as_ref()
@@ -212,7 +217,7 @@ pub fn run(args: StatsArgs) -> Result<()> {
     writeln!(out, "SN\treads properly paired:\t{}", st.properly_paired)?;
     writeln!(out, "SN\treads MQ0:\t{}", st.reads_mq0)?;
     writeln!(out, "SN\ttotal bases:\t{}", st.bases_total)?;
-    writeln!(out, "SN\tbases mapped:\t{}", st.bases_mapped)?;
+    writeln!(out, "SN\tbases mapped:\t{}", st.bases_mapped_seq)?;
     writeln!(out, "SN\tbases mapped (cigar):\t{}", st.bases_mapped)?;
     writeln!(out, "SN\tbases N:\t{}", st.bases_n)?;
     writeln!(

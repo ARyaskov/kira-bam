@@ -88,146 +88,187 @@ pub fn run(args: DepthArgs) -> Result<()> {
             Some(p) => usize::from(p),
             None => continue,
         };
-        let end = match rec.alignment_end() {
-            Some(p) => usize::from(p),
-            None => continue,
-        };
-        if !overlapping_consumed_bases(&rec) {
+        // Reference positions this read actually *covers*: contiguous runs of
+        // M/=/X (optionally split where base quality < -Q). Deletions (D) and
+        // reference skips (N, e.g. RNA-seq introns) consume reference but place
+        // no base, so they are NOT covered — counting them, as the old
+        // [start,end] span did, over-reported depth across indels and inflated
+        // intronic coverage to read-through levels.
+        let intervals = covered_intervals(&rec, start, args.min_baseq);
+        if intervals.is_empty() {
             continue;
         }
 
         if state.current_tid != Some(tid) {
-            // Flush previous reference fully.
             if let Some(prev) = state.current_tid {
-                let ref_len = header
-                    .reference_sequences()
-                    .get_index(prev)
-                    .map(|(_, sq)| usize::from(sq.length()))
-                    .unwrap_or(0);
-                let ref_name = header
-                    .reference_sequences()
-                    .get_index(prev)
-                    .map(|(n, _)| n.to_string())
-                    .unwrap_or_default();
+                let (ref_name, ref_len) = ref_name_len(&header, prev);
                 let bed_for_ref = bed.as_ref().and_then(|b| b.get(&ref_name));
-                state.drain_to(
-                    &ref_name,
-                    ref_len,
-                    args.all_positions,
-                    bed_for_ref,
-                    &mut out,
-                )?;
+                state.drain(&ref_name, ref_len, args.all_positions, bed_for_ref, &mut out)?;
             }
             state = SweepState {
                 current_tid: Some(tid),
+                // Without -a we skip the leading run of zero-coverage positions.
+                current_pos: if args.all_positions { 0 } else { start },
                 ..Default::default()
             };
         }
 
-        let ref_name = header
-            .reference_sequences()
-            .get_index(tid)
-            .map(|(n, _)| n.to_string())
-            .unwrap_or_default();
+        let (ref_name, _) = ref_name_len(&header, tid);
         let bed_for_ref = bed.as_ref().and_then(|b| b.get(&ref_name));
-        state.advance_to(&ref_name, start, args.all_positions, bed_for_ref, &mut out)?;
-        state.add_read(end);
+        state.emit_until(start, &ref_name, args.all_positions, bed_for_ref, &mut out)?;
+        state.add_intervals(&intervals);
     }
 
     if let Some(prev) = state.current_tid {
-        let ref_name = header
-            .reference_sequences()
-            .get_index(prev)
-            .map(|(n, _)| n.to_string())
-            .unwrap_or_default();
-        let ref_len = header
-            .reference_sequences()
-            .get_index(prev)
-            .map(|(_, sq)| usize::from(sq.length()))
-            .unwrap_or(0);
+        let (ref_name, ref_len) = ref_name_len(&header, prev);
         let bed_for_ref = bed.as_ref().and_then(|b| b.get(&ref_name));
-        state.drain_to(
-            &ref_name,
-            ref_len,
-            args.all_positions,
-            bed_for_ref,
-            &mut out,
-        )?;
+        state.drain(&ref_name, ref_len, args.all_positions, bed_for_ref, &mut out)?;
     }
     out.flush()?;
     Ok(())
 }
 
-fn overlapping_consumed_bases(rec: &RecordBuf) -> bool {
-    rec.cigar()
-        .as_ref()
-        .iter()
-        .any(|op| op.kind().consumes_reference())
+fn ref_name_len(header: &noodles_sam::Header, tid: usize) -> (String, usize) {
+    let name = header
+        .reference_sequences()
+        .get_index(tid)
+        .map(|(n, _)| n.to_string())
+        .unwrap_or_default();
+    let len = header
+        .reference_sequences()
+        .get_index(tid)
+        .map(|(_, sq)| usize::from(sq.length()))
+        .unwrap_or(0);
+    (name, len)
 }
 
+/// Maximal runs of reference positions actually covered by aligned read bases.
+///
+/// Walks the CIGAR tracking the reference position (1-based) and the read index.
+/// A position is covered when the op consumes both reference and read (`M`/`=`/`X`)
+/// and the corresponding base quality passes `min_baseq`. `D`/`N` break a run
+/// (reference advances, no base); `I`/`S` advance only the read and are
+/// transparent to reference contiguity. Returns inclusive `(start, end)` runs.
+fn covered_intervals(rec: &RecordBuf, start: usize, min_baseq: u8) -> Vec<(usize, usize)> {
+    let quals = rec.quality_scores().as_ref();
+    let mut ref_pos = start;
+    let mut read_idx = 0usize;
+    let mut intervals: Vec<(usize, usize)> = Vec::new();
+    let mut cur: Option<(usize, usize)> = None;
+
+    for op in rec.cigar().as_ref().iter() {
+        let kind = op.kind();
+        let len = op.len();
+        let cons_ref = kind.consumes_reference();
+        let cons_read = kind.consumes_read();
+        if cons_ref && cons_read {
+            for _ in 0..len {
+                let q = quals.get(read_idx).copied().unwrap_or(0);
+                if min_baseq == 0 || q >= min_baseq {
+                    match cur {
+                        Some((a, b)) if b + 1 == ref_pos => cur = Some((a, ref_pos)),
+                        Some(iv) => {
+                            intervals.push(iv);
+                            cur = Some((ref_pos, ref_pos));
+                        }
+                        None => cur = Some((ref_pos, ref_pos)),
+                    }
+                } else if let Some(iv) = cur.take() {
+                    intervals.push(iv);
+                }
+                ref_pos += 1;
+                read_idx += 1;
+            }
+        } else if cons_ref {
+            // D / N: reference advances, base absent → close the current run.
+            if let Some(iv) = cur.take() {
+                intervals.push(iv);
+            }
+            ref_pos += len;
+        } else if cons_read {
+            // I / S: read advances, reference position unchanged (transparent).
+            read_idx += len;
+        }
+        // H / P: consume neither; nothing to do.
+    }
+    if let Some(iv) = cur {
+        intervals.push(iv);
+    }
+    intervals
+}
+
+/// Streaming per-position depth via a difference-array sweep over a min-heap of
+/// `(position, delta)` events. Each covered interval `[a, b]` contributes `+1`
+/// at `a` and `-1` at `b + 1`; the running sum is the depth at each position.
 #[derive(Default)]
 struct SweepState {
     current_tid: Option<usize>,
+    /// Next reference position to emit (1-based). 0 = nothing emitted yet.
     current_pos: usize,
-    ends: BinaryHeap<Reverse<usize>>,
+    cur_cov: i64,
+    events: BinaryHeap<Reverse<(usize, i32)>>,
+    /// Largest covered position seen, for draining without `-a`.
+    max_end: usize,
 }
 
 impl SweepState {
-    fn add_read(&mut self, end: usize) {
-        self.ends.push(Reverse(end));
+    fn add_intervals(&mut self, intervals: &[(usize, usize)]) {
+        for &(a, b) in intervals {
+            self.events.push(Reverse((a, 1)));
+            self.events.push(Reverse((b + 1, -1)));
+            if b > self.max_end {
+                self.max_end = b;
+            }
+        }
     }
 
-    fn advance_to(
+    fn apply_events_up_to(&mut self, pos: usize) {
+        while let Some(&Reverse((epos, _))) = self.events.peek() {
+            if epos <= pos {
+                let Reverse((_, delta)) = self.events.pop().unwrap();
+                self.cur_cov += delta as i64;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn emit_until(
         &mut self,
+        target: usize,
         ref_name: &str,
-        new_pos: usize,
         all_positions: bool,
         bed: Option<&Vec<DepthIv>>,
         out: &mut Box<dyn Write>,
     ) -> Result<()> {
-        if new_pos == 0 {
-            return Ok(());
+        if self.current_pos == 0 {
+            self.current_pos = 1; // positions are 1-based
         }
-        let from = self.current_pos.max(1);
-        for pos in from..new_pos {
-            // Pop ends < pos
-            while let Some(&Reverse(e)) = self.ends.peek() {
-                if e < pos {
-                    self.ends.pop();
-                } else {
-                    break;
-                }
+        while self.current_pos < target {
+            let p = self.current_pos;
+            self.apply_events_up_to(p);
+            let cov = self.cur_cov.max(0) as usize;
+            if pos_in_bed(bed, p as u64) && (cov > 0 || all_positions) {
+                writeln!(out, "{ref_name}\t{p}\t{cov}")?;
             }
-            let cov = self.ends.len();
-            if !pos_in_bed(bed, pos as u64) {
-                continue;
-            }
-            if cov > 0 || all_positions {
-                writeln!(out, "{ref_name}\t{pos}\t{cov}")?;
-            }
+            self.current_pos += 1;
         }
-        self.current_pos = new_pos;
         Ok(())
     }
 
-    fn drain_to(
+    fn drain(
         &mut self,
         ref_name: &str,
-        max_pos: usize,
+        ref_len: usize,
         all_positions: bool,
         bed: Option<&Vec<DepthIv>>,
         out: &mut Box<dyn Write>,
     ) -> Result<()> {
-        let limit = if all_positions {
-            max_pos
+        let target = if all_positions {
+            ref_len + 1
         } else {
-            // Drain until heap empty.
-            self.ends
-                .iter()
-                .map(|&Reverse(e)| e)
-                .max()
-                .unwrap_or(self.current_pos)
+            self.max_end + 1
         };
-        self.advance_to(ref_name, limit + 1, all_positions, bed, out)
+        self.emit_until(target, ref_name, all_positions, bed, out)
     }
 }

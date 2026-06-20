@@ -24,7 +24,13 @@ use crate::io::{
 use crate::markdup::{MarkdupOptions, mark_duplicates_in_memory};
 use crate::types::OutputFormat;
 
-const ESTIMATED_BYTES_PER_RECORD: usize = 256;
+// Conservative per-record heap estimate used to turn a memory budget into a
+// chunk size. A `RecordBuf` owns its name, sequence, quality scores, CIGAR and
+// the tag data map, so a typical 150 bp paired read costs ~400–600 B live, not
+// the 256 B assumed previously — which let `-m auto` (3/4 of RAM) overshoot peak
+// RSS by 2–4×. 512 keeps the in-memory chunk safely within the stated budget;
+// worst case we spill a little sooner.
+const ESTIMATED_BYTES_PER_RECORD: usize = 512;
 
 /// Minimum sort buffer when `-m auto` resolves below this. Picked so the
 /// 0.5 M-record short batches still get a useful in-memory chunk.
@@ -37,25 +43,22 @@ const AUTO_MEMORY_NUM: u32 = 3;
 const AUTO_MEMORY_DEN: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SortKind {
+pub(crate) enum SortKind {
     Coordinate,
     QueryName,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SortKey {
-    Coord {
-        tid: u32,
-        pos: u32,
-        flag: u16,
-        qname: Vec<u8>,
-    },
-    Name {
-        qname: Vec<u8>,
-        flag: u16,
-        tid: u32,
-        pos: u32,
-    },
+pub(crate) enum SortKey {
+    /// Coordinate order, matching `samtools sort`. htslib's key packs
+    /// `(tid, pos, reverse-strand-bit)` — i.e. at one position forward reads sort
+    /// before reverse reads — and then a *stable* sort keeps equal-key records in
+    /// input order. (We used to fold the whole flag + qname into the key, which
+    /// both diverged from samtools and allocated a qname per record for nothing.)
+    Coord { tid: u32, pos: u32, rev: u8 },
+    /// Name order, matching `samtools sort -n`: natural/`strnum` qname comparison,
+    /// then the READ1/READ2 bits (`flag & 0xc0`); a stable sort handles the rest.
+    Name { qname: Vec<u8>, read12: u8 },
 }
 
 impl Ord for SortKey {
@@ -65,30 +68,24 @@ impl Ord for SortKey {
                 SortKey::Coord {
                     tid: a_tid,
                     pos: a_pos,
-                    flag: a_f,
-                    qname: a_q,
+                    rev: a_rev,
                 },
                 SortKey::Coord {
                     tid: b_tid,
                     pos: b_pos,
-                    flag: b_f,
-                    qname: b_q,
+                    rev: b_rev,
                 },
-            ) => (a_tid, a_pos, a_f, a_q.as_slice()).cmp(&(b_tid, b_pos, b_f, b_q.as_slice())),
+            ) => (a_tid, a_pos, a_rev).cmp(&(b_tid, b_pos, b_rev)),
             (
                 SortKey::Name {
                     qname: a_q,
-                    flag: a_f,
-                    tid: a_tid,
-                    pos: a_pos,
+                    read12: a_r,
                 },
                 SortKey::Name {
                     qname: b_q,
-                    flag: b_f,
-                    tid: b_tid,
-                    pos: b_pos,
+                    read12: b_r,
                 },
-            ) => (a_q.as_slice(), a_f, a_tid, a_pos).cmp(&(b_q.as_slice(), b_f, b_tid, b_pos)),
+            ) => strnum_cmp(a_q, b_q).then_with(|| a_r.cmp(b_r)),
             _ => unreachable!("mixed sort kinds"),
         }
     }
@@ -97,6 +94,78 @@ impl Ord for SortKey {
 impl PartialOrd for SortKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// Natural "string + number" comparison, a faithful port of htslib's
+/// `strnum_cmp` (used by `samtools sort -n`): maximal digit runs compare as
+/// numbers (leading zeros ignored, then more-leading-zeros sorts greater),
+/// everything else byte-by-byte. This makes `r2` sort before `r10` exactly as
+/// samtools does.
+pub(crate) fn strnum_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    let (na, nb) = (a.len(), b.len());
+    let (mut ia, mut ib) = (0usize, 0usize);
+    while ia < na && ib < nb {
+        if a[ia].is_ascii_digit() && b[ib].is_ascii_digit() {
+            while ia < na && a[ia] == b'0' {
+                ia += 1;
+            }
+            while ib < nb && b[ib] == b'0' {
+                ib += 1;
+            }
+            // Walk the common run of identical digits.
+            while ia < na
+                && ib < nb
+                && a[ia].is_ascii_digit()
+                && b[ib].is_ascii_digit()
+                && a[ia] == b[ib]
+            {
+                ia += 1;
+                ib += 1;
+            }
+            let da = ia < na && a[ia].is_ascii_digit();
+            let db = ib < nb && b[ib].is_ascii_digit();
+            if da && db {
+                // First differing digit: whichever has the longer remaining digit
+                // run is the larger number.
+                let mut k = 0usize;
+                loop {
+                    let pa = ia + k < na && a[ia + k].is_ascii_digit();
+                    let pb = ib + k < nb && b[ib + k].is_ascii_digit();
+                    if pa && pb {
+                        k += 1;
+                        continue;
+                    }
+                    return if pa {
+                        Ordering::Greater
+                    } else if pb {
+                        Ordering::Less
+                    } else {
+                        a[ia].cmp(&b[ib])
+                    };
+                }
+            } else if da {
+                return Ordering::Greater;
+            } else if db {
+                return Ordering::Less;
+            } else if ia != ib {
+                // Equal value but a different number of leading zeros consumed.
+                return ia.cmp(&ib);
+            }
+            // Equal numbers, same offset — fall through and keep comparing.
+        } else if a[ia] != b[ib] {
+            return a[ia].cmp(&b[ib]);
+        } else {
+            ia += 1;
+            ib += 1;
+        }
+    }
+    if ia < na {
+        Ordering::Greater
+    } else if ib < nb {
+        Ordering::Less
+    } else {
+        Ordering::Equal
     }
 }
 
@@ -115,7 +184,8 @@ fn sort_records_by_kind(records: &mut Vec<RecordBuf>, kind: SortKind) {
         .into_par_iter()
         .map(|r| (build_key(&r, kind), r))
         .collect();
-    keyed.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    // STABLE sort: equal keys keep their input order, matching samtools' tie-break.
+    keyed.par_sort_by(|a, b| a.0.cmp(&b.0));
     records.reserve_exact(keyed.len());
     records.extend(keyed.into_iter().map(|(_, r)| r));
 }
@@ -136,30 +206,26 @@ pub fn sort_and_markdup_in_memory(
     Ok(records)
 }
 
-fn build_key(rec: &RecordBuf, kind: SortKind) -> SortKey {
-    let tid = rec
-        .reference_sequence_id()
-        .map(|i| i as u32)
-        .unwrap_or(u32::MAX);
-    let pos = rec
-        .alignment_start()
-        .map(|p| usize::from(p) as u32)
-        .unwrap_or(u32::MAX);
-    let flag = u16::from(rec.flags());
-    let qname = rec.name().map(|n| n.to_vec()).unwrap_or_default();
+pub(crate) fn build_key(rec: &RecordBuf, kind: SortKind) -> SortKey {
     match kind {
-        SortKind::Coordinate => SortKey::Coord {
-            tid,
-            pos,
-            flag,
-            qname,
-        },
-        SortKind::QueryName => SortKey::Name {
-            qname,
-            flag,
-            tid,
-            pos,
-        },
+        SortKind::Coordinate => {
+            let tid = rec
+                .reference_sequence_id()
+                .map(|i| i as u32)
+                .unwrap_or(u32::MAX);
+            let pos = rec
+                .alignment_start()
+                .map(|p| usize::from(p) as u32)
+                .unwrap_or(u32::MAX);
+            // FLAG_REVERSE (0x10): forward (0) sorts before reverse (1), as htslib does.
+            let rev = ((u16::from(rec.flags()) >> 4) & 1) as u8;
+            SortKey::Coord { tid, pos, rev }
+        }
+        SortKind::QueryName => {
+            let qname = rec.name().map(|n| n.to_vec()).unwrap_or_default();
+            let read12 = (u16::from(rec.flags()) & 0xc0) as u8;
+            SortKey::Name { qname, read12 }
+        }
     }
 }
 
@@ -360,7 +426,9 @@ fn spill_chunk(
     idx: usize,
     kind: SortKind,
 ) -> Result<PathBuf> {
-    chunk.par_sort_unstable_by(|a, b| build_key(a, kind).cmp(&build_key(b, kind)));
+    // STABLE within-chunk sort; the k-way merge then breaks equal-key ties by
+    // spill index, so the whole external sort preserves input order like samtools.
+    chunk.par_sort_by(|a, b| build_key(a, kind).cmp(&build_key(b, kind)));
     let path = dir.join(format!("kira-bam-spill-{idx:06}.bam"));
     let file = File::create(&path).context("create spill file")?;
     let buf = BufWriter::with_capacity(1 << 20, file);
@@ -465,4 +533,45 @@ fn merge_spills(
     }
     writer.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod strnum_tests {
+    use super::strnum_cmp;
+    use std::cmp::Ordering;
+
+    fn cmp(a: &str, b: &str) -> Ordering {
+        strnum_cmp(a.as_bytes(), b.as_bytes())
+    }
+
+    #[test]
+    fn numbers_compare_as_numbers() {
+        assert_eq!(cmp("r2", "r10"), Ordering::Less); // 2 < 10, not byte order
+        assert_eq!(cmp("r10", "r2"), Ordering::Greater);
+        assert_eq!(cmp("x9y", "x10y"), Ordering::Less);
+        assert_eq!(cmp("read100", "read99"), Ordering::Greater);
+    }
+
+    #[test]
+    fn plain_strings_byte_order() {
+        assert_eq!(cmp("alpha", "bravo"), Ordering::Less);
+        assert_eq!(cmp("ab", "abc"), Ordering::Less); // prefix is smaller
+        assert_eq!(cmp("abc", "abc"), Ordering::Equal);
+    }
+
+    #[test]
+    fn leading_zeros_value_then_offset_tiebreak() {
+        // Equal numeric value: htslib breaks the tie on how many leading zeros
+        // were consumed (the one that consumed more sorts greater).
+        assert_eq!(cmp("00042", "42"), Ordering::Greater);
+        assert_eq!(cmp("1", "01"), Ordering::Less);
+        assert_eq!(cmp("042", "042"), Ordering::Equal);
+    }
+
+    #[test]
+    fn mixed_segments() {
+        assert_eq!(cmp("a1b2", "a1b10"), Ordering::Less);
+        assert_eq!(cmp("chr1:100", "chr1:99"), Ordering::Greater);
+        assert_eq!(cmp("chr2:1", "chr10:1"), Ordering::Less); // 2 < 10
+    }
 }

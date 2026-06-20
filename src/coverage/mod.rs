@@ -80,30 +80,45 @@ pub fn run(args: CoverageArgs) -> Result<()> {
             Some(p) => usize::from(p),
             None => continue,
         };
-        let end = match rec.alignment_end() {
-            Some(p) => usize::from(p),
-            None => continue,
-        };
         let st = stats.get_mut(&tid).unwrap();
         st.numreads += 1;
         let mapq = rec.mapping_quality().map(u8::from).unwrap_or(0) as u64;
         st.sum_mapq += mapq;
         st.sum_mapq_n += 1;
 
-        // Per-base mark + baseq sum (approximate: just count bases by quality threshold).
-        let qs = rec.quality_scores().as_ref();
-        let mut q_iter = qs.iter().copied();
-        for pos in start..=end.min(st.length) {
-            if pos == 0 || pos > st.length {
-                continue;
-            }
-            st.covered[pos - 1] = 1;
-            st.sum_depth += 1;
-            if let Some(q) = q_iter.next()
-                && q >= args.min_baseq
-            {
-                st.sum_baseq += q as u64;
-                st.sum_baseq_n += 1;
+        // CIGAR-aware per-base accounting. Only M/=/X positions are covered, and
+        // each read base's quality is matched to the reference position it
+        // actually aligns to. The previous code iterated the [start,end] span and
+        // pulled qualities positionally, which (a) counted deletions and N-skips
+        // (introns) as covered and (b) mis-assigned base qualities across any
+        // indel. -Q now excludes low-quality bases from depth too, matching
+        // samtools coverage semantics.
+        let quals = rec.quality_scores().as_ref();
+        let mut ref_pos = start;
+        let mut read_idx = 0usize;
+        for op in rec.cigar().as_ref().iter() {
+            let kind = op.kind();
+            let len = op.len();
+            let cons_ref = kind.consumes_reference();
+            let cons_read = kind.consumes_read();
+            if cons_ref && cons_read {
+                for _ in 0..len {
+                    if ref_pos >= 1 && ref_pos <= st.length {
+                        let q = quals.get(read_idx).copied().unwrap_or(0);
+                        if q >= args.min_baseq {
+                            st.covered[ref_pos - 1] = 1;
+                            st.sum_depth += 1;
+                            st.sum_baseq += q as u64;
+                            st.sum_baseq_n += 1;
+                        }
+                    }
+                    ref_pos += 1;
+                    read_idx += 1;
+                }
+            } else if cons_ref {
+                ref_pos += len;
+            } else if cons_read {
+                read_idx += len;
             }
         }
     }

@@ -45,10 +45,13 @@ pub fn run(args: CalmdArgs) -> Result<()> {
             {
                 let start = usize::from(start);
                 if let Some((md, nm)) = compute_md_nm(&rec, seq, start) {
+                    // samtools calmd writes exactly two tags: MD (mismatch string)
+                    // and NM (edit distance). It must NOT touch NH — that tag is the
+                    // number of reported alignments for a multi-mapper and is owned by
+                    // the aligner. The previous code wrote NH = NM, silently corrupting
+                    // multi-mapper bookkeeping for any downstream RNA-seq tool.
                     rec.data_mut()
                         .insert(Tag::MISMATCHED_POSITIONS, Value::String(md.into()));
-                    rec.data_mut()
-                        .insert(Tag::ALIGNMENT_HIT_COUNT, Value::Int32(nm as i32));
                     rec.data_mut()
                         .insert(Tag::EDIT_DISTANCE, Value::Int32(nm as i32));
                 }

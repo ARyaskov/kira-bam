@@ -52,14 +52,28 @@ writer.finish()?;
 
 ## Tests
 
-`tests/golden.rs` does a per-file diff between `kira-bam` and `samtools` on a
-directory of BAM fixtures. Skipped by default; enable with:
+Unit tests (including a `proptest` that pins the AVX2 quality-sum to its scalar
+reference across the full byte domain) run with a plain `cargo test`.
+
+`tests/golden.rs` cross-checks `kira-bam` against a real `samtools`. Fixtures are
+embedded as SAM text and built to BAM with samtools at run time, so the suite is
+self-contained — just point it at a samtools binary:
 
 ```bash
-KIRA_BAM_SAMTOOLS=/path/to/samtools \
-KIRA_BAM_FIXTURES=/path/to/bams \
-cargo test --release
+KIRA_BAM_SAMTOOLS=/path/to/samtools cargo test --release
 ```
+
+It requires agreement on: `view`/`flagstat`/`idxstats` (byte-identical);
+`view -b`, `sort`, and `merge` (identical decoded body). Sort order is a
+byte-for-byte contract with samtools, ties included — coordinate sorts on
+`(tid, pos, reverse-strand)` with input-stable ties, and `-n` uses natural
+(`strnum`) qname order with a READ1/READ2 tie-break. `markdup` must flag the same
+duplicate set (via the standard `fixmate -m | sort` prep), `calmd` the same MD/NM
+values, and a CRAM round-trip must preserve the mandatory fields. Without
+`KIRA_BAM_SAMTOOLS` the golden tests skip, so `cargo test` stays green anywhere.
+
+An optional `KIRA_BAM_FIXTURES=/path/to/bams` folds a directory of real-world
+BAMs into the `view`/`flagstat` comparisons.
 
 ## License
 

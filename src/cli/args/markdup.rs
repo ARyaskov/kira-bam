@@ -16,7 +16,9 @@ pub struct MarkdupArgs {
     #[arg(short = 'r', long = "remove-dups")]
     pub remove: bool,
 
-    /// Treat optical duplicates separately (samtools `-d` distance).
+    /// Optical-duplicate pixel distance (samtools `-d`). When > 0, kira-bam
+    /// parses Illumina cluster coordinates (tile:x:y) from read names and reports
+    /// the optical subset of PCR duplicates in the `-s` stats file. 0 disables it.
     #[arg(short = 'd', long = "optical-distance", default_value_t = 0)]
     pub optical_distance: u32,
 

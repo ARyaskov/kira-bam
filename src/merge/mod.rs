@@ -8,56 +8,14 @@ use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::MergeArgs;
 use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
+// Reuse the sort module's samtools-compatible ordering so `merge` and `sort`
+// agree on tie-breaks (coordinate: tid/pos/reverse-strand; name: strnum qname +
+// READ1/READ2 bits), with equal-key records resolved by input/source order.
+use crate::sort::{SortKey, SortKind, build_key};
 use crate::types::OutputFormat;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SortKind {
-    Coordinate,
-    QueryName,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct MergeKey {
-    tid: u32,
-    pos: u32,
-    qname: Vec<u8>,
-    flag: u16,
-}
-
-fn build_key(rec: &RecordBuf, _kind: SortKind) -> MergeKey {
-    MergeKey {
-        tid: rec
-            .reference_sequence_id()
-            .map(|i| i as u32)
-            .unwrap_or(u32::MAX),
-        pos: rec
-            .alignment_start()
-            .map(|p| usize::from(p) as u32)
-            .unwrap_or(u32::MAX),
-        qname: rec.name().map(|n| n.to_vec()).unwrap_or_default(),
-        flag: u16::from(rec.flags()),
-    }
-}
-
-impl Ord for MergeKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.tid, self.pos, self.flag, self.qname.as_slice()).cmp(&(
-            other.tid,
-            other.pos,
-            other.flag,
-            other.qname.as_slice(),
-        ))
-    }
-}
-
-impl PartialOrd for MergeKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 struct HeapItem {
-    key: MergeKey,
+    key: SortKey,
     record: RecordBuf,
     src: usize,
 }
@@ -108,13 +66,40 @@ pub fn run(args: MergeArgs) -> Result<()> {
         })
         .collect::<Result<_>>()?;
 
-    let mut merged_header = merge_headers(readers.iter().map(|r| r.header()).collect::<Vec<_>>())?;
+    // Clone input headers up front: we need them to both build the merged header
+    // and compute per-input tid remaps, but the readers are borrowed mutably for
+    // the streaming merge below.
+    let input_headers: Vec<Header> = readers.iter().map(|r| r.header().clone()).collect();
+    let mut merged_header = merge_headers(input_headers.iter().collect::<Vec<_>>())?;
     append_pg(&mut merged_header, &PgInfo::new("merge", !args.no_pg))?;
+    // Per-input map: local reference id → merged reference id (matched by @SQ name).
+    let tid_maps = build_tid_maps(&input_headers, &merged_header);
+
+    // A streaming k-way coordinate merge is only valid if every input is already
+    // ordered consistently with the merged @SQ list — i.e. its local→merged tid
+    // map is monotonic. If an input's @SQ order is a genuine permutation of the
+    // merged order, remapping alone would emit records out of coordinate order, so
+    // we refuse loudly rather than write a mis-sorted BAM. (Name-sorted merges key
+    // on qname, so tid order is irrelevant there.)
+    if kind == SortKind::Coordinate {
+        for (i, map) in tid_maps.iter().enumerate() {
+            if !is_sorted_compatible(map) {
+                anyhow::bail!(
+                    "input {} ({}) has @SQ in an order incompatible with the merged header; \
+                     a coordinate merge needs all inputs ordered consistently. Re-sort it \
+                     against the target header (`kira-bam sort`) or reheader it first.",
+                    i,
+                    args.inputs[i].display()
+                );
+            }
+        }
+    }
 
     let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(readers.len());
     for (idx, r) in readers.iter_mut().enumerate() {
         let mut rec = RecordBuf::default();
         if r.read_record_buf(&mut rec)? {
+            remap_ids(&mut rec, &tid_maps[idx]);
             heap.push(HeapItem {
                 key: build_key(&rec, kind),
                 record: rec,
@@ -149,6 +134,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
         let src = item.src;
         let mut rec = RecordBuf::default();
         if readers[src].read_record_buf(&mut rec)? {
+            remap_ids(&mut rec, &tid_maps[src]);
             heap.push(HeapItem {
                 key: build_key(&rec, kind),
                 record: rec,
@@ -169,26 +155,35 @@ fn merge_headers(headers: Vec<&Header>) -> Result<Header> {
         .cloned()
         .context("no input headers")?;
     for (i, h) in headers.iter().enumerate().skip(1) {
-        // @SQ: must match by name + length. Reject mismatches loudly.
-        if h.reference_sequences().len() != merged.reference_sequences().len() {
-            anyhow::bail!(
-                "input {i} has {} reference sequences, expected {}",
-                h.reference_sequences().len(),
-                merged.reference_sequences().len()
-            );
-        }
+        // @SQ: build the UNION across inputs, preserving first-seen order. A name
+        // shared by several inputs must agree on length (hard error); names unique
+        // to a later input are appended. Records from every input are then remapped
+        // out of their local tid space into this merged space (see `build_tid_maps`
+        // / `remap_ids`), so inputs whose @SQ lists are reordered — or are proper
+        // subsets/supersets of each other — no longer silently mis-reference reads.
         for (name_h, sq_h) in h.reference_sequences() {
-            match merged.reference_sequences().get(name_h.as_bstr()) {
-                Some(sq_m) if sq_m.length() != sq_h.length() => {
-                    anyhow::bail!(
-                        "input {i}: @SQ {} has length {} vs expected {}",
-                        name_h.as_bstr(),
-                        usize::from(sq_h.length()),
-                        usize::from(sq_m.length())
-                    );
+            // Take the length out by value first so we don't hold an immutable
+            // borrow of `merged` across the `insert` in the `None` arm.
+            let existing_len = merged
+                .reference_sequences()
+                .get(name_h.as_bstr())
+                .map(|sq_m| sq_m.length());
+            match existing_len {
+                Some(len_m) => {
+                    if len_m != sq_h.length() {
+                        anyhow::bail!(
+                            "input {i}: @SQ {} has length {} vs expected {}",
+                            name_h.as_bstr(),
+                            usize::from(sq_h.length()),
+                            usize::from(len_m)
+                        );
+                    }
                 }
-                None => anyhow::bail!("input {i}: @SQ {} missing in base header", name_h.as_bstr()),
-                _ => {}
+                None => {
+                    merged
+                        .reference_sequences_mut()
+                        .insert(name_h.clone(), sq_h.clone());
+                }
             }
         }
 
@@ -224,4 +219,63 @@ fn merge_headers(headers: Vec<&Header>) -> Result<Header> {
         }
     }
     Ok(merged)
+}
+
+/// For each input header, map its local reference id (the integer tid stored in
+/// every record) to the corresponding id in the merged header, matched by @SQ
+/// name. `None` means the name is absent from the merged header — impossible
+/// when the merged header is the union of all inputs, but handled defensively.
+fn build_tid_maps(inputs: &[Header], merged: &Header) -> Vec<Vec<Option<usize>>> {
+    use std::collections::HashMap;
+    let merged_idx: HashMap<String, usize> = merged
+        .reference_sequences()
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (name.to_string(), i))
+        .collect();
+    inputs
+        .iter()
+        .map(|h| {
+            h.reference_sequences()
+                .iter()
+                .map(|(name, _)| merged_idx.get(&name.to_string()).copied())
+                .collect()
+        })
+        .collect()
+}
+
+/// True if remapping preserves coordinate order: the merged ids reached by
+/// visiting local tids 0,1,2,… (the order a coordinate-sorted input emits them)
+/// are non-decreasing. A `false` result means the input's @SQ order is a
+/// permutation of the merged order and cannot be stream-merged.
+fn is_sorted_compatible(map: &[Option<usize>]) -> bool {
+    let mut last: Option<usize> = None;
+    for &m in map {
+        if let Some(v) = m {
+            if let Some(l) = last
+                && v < l
+            {
+                return false;
+            }
+            last = Some(v);
+        }
+    }
+    true
+}
+
+/// Rewrite a record's reference id and mate reference id from one input's local
+/// tid space into the merged tid space. Unmapped ends (`None` id) are left
+/// alone; an id missing from the map is left unchanged (defensive — see
+/// [`build_tid_maps`]).
+fn remap_ids(rec: &mut RecordBuf, map: &[Option<usize>]) {
+    if let Some(id) = rec.reference_sequence_id()
+        && let Some(&Some(new)) = map.get(id)
+    {
+        *rec.reference_sequence_id_mut() = Some(new);
+    }
+    if let Some(mid) = rec.mate_reference_sequence_id()
+        && let Some(&Some(new)) = map.get(mid)
+    {
+        *rec.mate_reference_sequence_id_mut() = Some(new);
+    }
 }

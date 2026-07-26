@@ -19,18 +19,30 @@ use tempfile::TempDir;
 use crate::cli::SortArgs;
 use crate::io::{
     BamReader, BamWriter, OpenOptions, PgInfo, WriteOptions, append_pg, install_thread_pool,
-    resolve_memory_hint,
+    is_record_level_error, resolve_memory_hint,
 };
 use crate::markdup::{MarkdupOptions, mark_duplicates_in_memory};
 use crate::types::OutputFormat;
 
-// Conservative per-record heap estimate used to turn a memory budget into a
-// chunk size. A `RecordBuf` owns its name, sequence, quality scores, CIGAR and
-// the tag data map, so a typical 150 bp paired read costs ~400–600 B live, not
-// the 256 B assumed previously — which let `-m auto` (3/4 of RAM) overshoot peak
-// RSS by 2–4×. 512 keeps the in-memory chunk safely within the stated budget;
-// worst case we spill a little sooner.
+/// Presizes the chunk vector only; spilling is decided by measured bytes.
 const ESTIMATED_BYTES_PER_RECORD: usize = 512;
+
+/// Approximate live heap bytes of one decoded record. Budgeting in records
+/// instead would overshoot by two orders of magnitude on long reads, where a
+/// record costs ~200 kB rather than a few hundred bytes.
+fn approx_heap_size(rec: &RecordBuf) -> usize {
+    /// Struct, `Vec` headers and allocator round-up.
+    const FIXED: usize = 160;
+    /// Undercounts long tag values.
+    const PER_TAG: usize = 24;
+
+    FIXED
+        + rec.name().map(|n| n.len()).unwrap_or(0)
+        + rec.sequence().len()
+        + rec.quality_scores().as_ref().len()
+        + rec.cigar().as_ref().len() * 4
+        + rec.data().len() * PER_TAG
+}
 
 /// Minimum sort buffer when `-m auto` resolves below this. Picked so the
 /// 0.5 M-record short batches still get a useful in-memory chunk.
@@ -169,25 +181,108 @@ pub(crate) fn strnum_cmp(a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
-/// Sort the records in `records` by the requested key, in parallel.
+/// Sort `records` by the requested key, in parallel.
 ///
-/// The naïve `par_sort_unstable_by(|a, b| build_key(a, kind).cmp(&build_key(b, kind)))`
-/// allocates a qname `Vec<u8>` twice per comparison — for 12 M records sorted
-/// by coordinate that's ~480 M Vec allocations and dominates the sort itself.
+/// Sorting compact `(key, index)` pairs and permuting once keeps the ~200-byte
+/// `RecordBuf`s out of the `n log n` swaps, and avoids the qname allocation a
+/// key-rebuilding comparator would make per comparison.
 ///
-/// Pattern: extract `(SortKey, RecordBuf)` pairs once in parallel, sort them
-/// by key (which doesn't re-run `build_key`), then re-collect the records.
-/// Each `build_key` invocation runs exactly once per record.
+/// The record index is the last component of every key, so ties keep input order
+/// as samtools does and an unstable sort suffices.
 fn sort_records_by_kind(records: &mut Vec<RecordBuf>, kind: SortKind) {
-    let original = std::mem::take(records);
-    let mut keyed: Vec<(SortKey, RecordBuf)> = original
-        .into_par_iter()
-        .map(|r| (build_key(&r, kind), r))
-        .collect();
-    // STABLE sort: equal keys keep their input order, matching samtools' tie-break.
-    keyed.par_sort_by(|a, b| a.0.cmp(&b.0));
-    records.reserve_exact(keyed.len());
-    records.extend(keyed.into_iter().map(|(_, r)| r));
+    match kind {
+        SortKind::Coordinate => {
+            let mut keys: Vec<(u32, u32, u8, u32)> = records
+                .par_iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let (tid, pos, rev) = coord_key(r);
+                    (tid, pos, rev, i as u32)
+                })
+                .collect();
+            keys.par_sort_unstable();
+            let order: Vec<u32> = keys.iter().map(|k| k.3).collect();
+            apply_permutation(records, order);
+        }
+        SortKind::QueryName => {
+            // One arena, so a key is a slice range rather than an allocation.
+            let mut arena: Vec<u8> = Vec::with_capacity(records.len() * 32);
+            let mut keys: Vec<NameKey> = Vec::with_capacity(records.len());
+            for (i, r) in records.iter().enumerate() {
+                let name: &[u8] = r.name().map(|n| n.as_ref()).unwrap_or_default();
+                let start = arena.len() as u32;
+                arena.extend_from_slice(name);
+                keys.push(NameKey {
+                    start,
+                    len: name.len() as u32,
+                    read12: (u16::from(r.flags()) & 0xc0) as u8,
+                    index: i as u32,
+                });
+            }
+            keys.par_sort_unstable_by(|a, b| {
+                strnum_cmp(a.name(&arena), b.name(&arena))
+                    .then_with(|| a.read12.cmp(&b.read12))
+                    .then_with(|| a.index.cmp(&b.index))
+            });
+            let order: Vec<u32> = keys.iter().map(|k| k.index).collect();
+            apply_permutation(records, order);
+        }
+    }
+}
+
+/// Qname position in the arena, the READ1/READ2 bits, and the original index.
+#[derive(Clone, Copy)]
+struct NameKey {
+    start: u32,
+    len: u32,
+    read12: u8,
+    index: u32,
+}
+
+impl NameKey {
+    fn name<'a>(&self, arena: &'a [u8]) -> &'a [u8] {
+        let start = self.start as usize;
+        &arena[start..start + self.len as usize]
+    }
+}
+
+/// `(tid, pos, reverse-strand)` as htslib orders them; unplaced sorts last.
+fn coord_key(rec: &RecordBuf) -> (u32, u32, u8) {
+    let tid = rec
+        .reference_sequence_id()
+        .map(|i| i as u32)
+        .unwrap_or(u32::MAX);
+    let pos = rec
+        .alignment_start()
+        .map(|p| usize::from(p) as u32)
+        .unwrap_or(u32::MAX);
+    let rev = ((u16::from(rec.flags()) >> 4) & 1) as u8;
+    (tid, pos, rev)
+}
+
+/// Permute `records` so position `i` holds `records[order[i]]`, rotating each
+/// cycle in place. `order` is consumed: its entries double as visited marks.
+fn apply_permutation(records: &mut [RecordBuf], mut order: Vec<u32>) {
+    /// Marks a rotated slot; indices come from `records.len()` and never reach it.
+    const DONE: u32 = u32::MAX;
+    debug_assert_eq!(records.len(), order.len());
+    debug_assert!(records.len() < DONE as usize);
+
+    for start in 0..records.len() {
+        if order[start] == DONE {
+            continue;
+        }
+        let mut cur = start;
+        loop {
+            let src = order[cur] as usize;
+            order[cur] = DONE;
+            if src == start {
+                break;
+            }
+            records.swap(cur, src);
+            cur = src;
+        }
+    }
 }
 
 /// Coordinate-sort and optionally mark duplicates in memory, returning the sorted records.
@@ -197,10 +292,7 @@ pub fn sort_and_markdup_in_memory(
 ) -> Result<Vec<RecordBuf>> {
     sort_records_by_kind(&mut records, SortKind::Coordinate);
     if markdup {
-        let opts = crate::markdup::MarkdupOptions {
-            barcode_tag: None,
-            ancient: false,
-        };
+        let opts = crate::markdup::MarkdupOptions::default();
         let _ = mark_duplicates_in_memory(&mut records, &opts).context("mark duplicates")?;
     }
     Ok(records)
@@ -237,13 +329,14 @@ pub fn run(args: SortArgs) -> Result<()> {
     } else {
         SortKind::Coordinate
     };
-    let mem_per_thread = resolve_memory_hint(
+    // `-m` is the budget for the whole sort, not per thread as in samtools.
+    let mem_budget = resolve_memory_hint(
         &args.memory,
         AUTO_MIN_MEMORY_BYTES,
         AUTO_MEMORY_NUM,
         AUTO_MEMORY_DEN,
     )?;
-    let chunk_records = (mem_per_thread / ESTIMATED_BYTES_PER_RECORD).max(1024);
+    let chunk_capacity_hint = (mem_budget / ESTIMATED_BYTES_PER_RECORD).clamp(1024, 4 << 20);
 
     // mmap the input when it's on a regular file (tmp SAM from the
     // aligner is). The kernel turns the parser's reads into trivial page
@@ -256,7 +349,8 @@ pub fn run(args: SortArgs) -> Result<()> {
     set_header_sort_order(&mut header, kind);
     append_pg(&mut header, &PgInfo::new("sort", !args.no_pg))?;
 
-    let mut current_chunk: Vec<RecordBuf> = Vec::with_capacity(chunk_records);
+    let mut current_chunk: Vec<RecordBuf> = Vec::with_capacity(chunk_capacity_hint);
+    let mut chunk_bytes: usize = 0;
     let mut spilled: Vec<PathBuf> = Vec::new();
     let tmpdir = match &args.tmpdir {
         Some(p) => {
@@ -275,8 +369,11 @@ pub fn run(args: SortArgs) -> Result<()> {
         if args.filter_flags != 0 && (flags & args.filter_flags) != 0 {
             continue;
         }
-        current_chunk.push(rec.clone());
-        if current_chunk.len() >= chunk_records {
+        chunk_bytes += approx_heap_size(&rec);
+        // The reader reallocates the emptied buffers either way; cloning would
+        // only add a copy on top.
+        current_chunk.push(std::mem::take(&mut rec));
+        if chunk_bytes >= mem_budget {
             spilled.push(spill_chunk(
                 &mut current_chunk,
                 &header,
@@ -285,6 +382,7 @@ pub fn run(args: SortArgs) -> Result<()> {
                 kind,
             )?);
             spill_index += 1;
+            chunk_bytes = 0;
         }
     }
 
@@ -305,6 +403,7 @@ pub fn run(args: SortArgs) -> Result<()> {
             let opts = MarkdupOptions {
                 barcode_tag: args.markdup_barcode_tag.clone(),
                 ancient: args.markdup_mode_ancient,
+                supplementary: args.markdup_supplementary,
             };
             let _stats =
                 mark_duplicates_in_memory(&mut current_chunk, &opts).context("mark duplicates")?;
@@ -334,29 +433,32 @@ pub fn run(args: SortArgs) -> Result<()> {
             // Encode records to raw BAM bytes in parallel chunks, then stream through BGZF.
             let n_chunks = rayon::current_num_threads().max(1);
             let chunk_len = current_chunk.len().div_ceil(n_chunks).max(1);
-            let encoded: Vec<Vec<u8>> = {
+            let encoded: Vec<(Vec<u8>, u64)> = {
                 let hdr = writer.header();
                 current_chunk
                     .par_chunks(chunk_len)
                     .map(|recs| crate::io::encode_records_into(hdr, recs))
                     .collect()
             };
-            for buf in &encoded {
+            let skipped: u64 = encoded.iter().map(|(_, n)| n).sum();
+            for (buf, _) in &encoded {
                 writer.write_preencoded(buf)?;
             }
+            report_skipped(skipped);
         } else {
             let mut skipped: u64 = 0;
             for r in current_chunk.iter() {
                 if let Err(e) = writer.write_record_buf(r) {
+                    if !is_record_level_error(&e) {
+                        return Err(e);
+                    }
                     skipped += 1;
                     if skipped <= 5 {
                         eprintln!("[kira-bam sort] skip record: {e:#}");
                     }
                 }
             }
-            if skipped > 0 {
-                eprintln!("[kira-bam sort] {skipped} records skipped due to write errors");
-            }
+            report_skipped(skipped);
         }
         writer.finish()?;
         return Ok(());
@@ -382,6 +484,12 @@ pub fn run(args: SortArgs) -> Result<()> {
 
     merge_spills(spilled, header, &args, kind)?;
     Ok(())
+}
+
+fn report_skipped(skipped: u64) {
+    if skipped > 0 {
+        eprintln!("[kira-bam sort] {skipped} records skipped as invalid");
+    }
 }
 
 fn pick_fmt(args: &SortArgs) -> OutputFormat {
@@ -426,9 +534,9 @@ fn spill_chunk(
     idx: usize,
     kind: SortKind,
 ) -> Result<PathBuf> {
-    // STABLE within-chunk sort; the k-way merge then breaks equal-key ties by
-    // spill index, so the whole external sort preserves input order like samtools.
-    chunk.par_sort_by(|a, b| build_key(a, kind).cmp(&build_key(b, kind)));
+    // Stable within-chunk; the k-way merge breaks equal-key ties by spill index,
+    // so the external sort preserves input order as samtools does.
+    sort_records_by_kind(chunk, kind);
     let path = dir.join(format!("kira-bam-spill-{idx:06}.bam"));
     let file = File::create(&path).context("create spill file")?;
     let buf = BufWriter::with_capacity(1 << 20, file);
@@ -501,24 +609,35 @@ fn merge_spills(
     }
 
     let fmt = pick_fmt(args);
-    let mut writer = BamWriter::create_with_reference(
+    // Same multi-threaded BGZF compression the single-chunk path uses.
+    let write_opts = WriteOptions {
+        compression_workers: args.threads.saturating_sub(1).clamp(1, 8),
+        compression_level: args
+            .compression_level
+            .and_then(bgzf::io::writer::CompressionLevel::new),
+    };
+    let mut writer = BamWriter::create_with_options(
         args.output.as_deref(),
         header,
         fmt,
         args.reference.as_deref(),
+        write_opts,
     )?;
     writer.write_header()?;
 
     let mut skipped: u64 = 0;
     while let Some(item) = heap.pop() {
         if let Err(e) = writer.write_record_buf(&item.record) {
+            if !is_record_level_error(&e) {
+                return Err(e);
+            }
             skipped += 1;
             if skipped <= 5 {
                 eprintln!("[kira-bam sort] skip record: {e:#}");
             }
         }
         let src = item.src;
-        let mut rec = RecordBuf::default();
+        let mut rec = item.record;
         if readers[src].read_record_buf(&mut rec)? {
             let key = build_key(&rec, kind);
             heap.push(HeapItem {
@@ -528,11 +647,116 @@ fn merge_spills(
             });
         }
     }
-    if skipped > 0 {
-        eprintln!("[kira-bam sort] {skipped} records skipped due to write errors");
-    }
+    report_skipped(skipped);
     writer.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod sort_order_tests {
+    use super::*;
+    use noodles_sam::alignment::record::Flags;
+
+    fn rec(name: &str, tid: Option<usize>, pos: usize, flags: u16) -> RecordBuf {
+        let mut r = RecordBuf::default();
+        *r.name_mut() = Some(name.into());
+        *r.reference_sequence_id_mut() = tid;
+        *r.alignment_start_mut() = noodles_core::Position::new(pos);
+        *r.flags_mut() = Flags::from(flags);
+        r
+    }
+
+    fn names(records: &[RecordBuf]) -> Vec<String> {
+        records
+            .iter()
+            .map(|r| String::from_utf8_lossy(r.name().unwrap().as_ref()).into_owned())
+            .collect()
+    }
+
+    /// Reference the key-and-permute path must reproduce exactly.
+    fn naive(records: &[RecordBuf], kind: SortKind) -> Vec<String> {
+        let mut keyed: Vec<(SortKey, usize)> = records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (build_key(r, kind), i))
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed
+            .iter()
+            .map(|(_, i)| String::from_utf8_lossy(records[*i].name().unwrap().as_ref()).into_owned())
+            .collect()
+    }
+
+    fn corpus() -> Vec<RecordBuf> {
+        vec![
+            rec("r10", Some(1), 100, 0),
+            rec("r2", Some(0), 500, 16),
+            rec("r2", Some(0), 500, 0), // same coord, forward sorts before reverse
+            rec("unplaced", None, 1, 4),
+            rec("r1", Some(0), 500, 0), // ties with the two above on coordinate
+            rec("r100", Some(0), 1, 16),
+            rec("r3", Some(1), 100, 16),
+        ]
+    }
+
+    #[test]
+    fn coordinate_order_matches_the_reference() {
+        let mut records = corpus();
+        let want = naive(&records, SortKind::Coordinate);
+        sort_records_by_kind(&mut records, SortKind::Coordinate);
+        assert_eq!(names(&records), want);
+    }
+
+    #[test]
+    fn name_order_matches_the_reference() {
+        let mut records = corpus();
+        let want = naive(&records, SortKind::QueryName);
+        sort_records_by_kind(&mut records, SortKind::QueryName);
+        assert_eq!(names(&records), want);
+    }
+
+    /// Equal keys must keep input order.
+    #[test]
+    fn equal_coordinate_keys_keep_input_order() {
+        let mut records = corpus();
+        sort_records_by_kind(&mut records, SortKind::Coordinate);
+        let got = names(&records);
+        let tied: Vec<&String> = got.iter().filter(|n| *n == "r2" || *n == "r1").collect();
+        // Input order among the forward-strand ties at pos 500 was r2 then r1.
+        assert_eq!(tied, vec!["r2", "r1", "r2"]);
+    }
+
+    #[test]
+    fn permutation_reorders_and_preserves_every_record() {
+        for n in [0usize, 1, 2, 3, 5, 17, 64] {
+            let records: Vec<RecordBuf> = (0..n)
+                .map(|i| rec(&format!("r{i:03}"), Some(0), i + 1, 0))
+                .collect();
+            // Reverse order is a permutation with both 2-cycles and a fixed point.
+            let order: Vec<u32> = (0..n as u32).rev().collect();
+            let want: Vec<String> = names(&records).into_iter().rev().collect();
+            let mut got = records;
+            apply_permutation(&mut got, order);
+            assert_eq!(names(&got), want, "n={n}");
+        }
+    }
+
+    #[test]
+    fn permutation_handles_long_cycles() {
+        let n = 1000usize;
+        let records: Vec<RecordBuf> = (0..n)
+            .map(|i| rec(&format!("r{i:04}"), Some(0), i + 1, 0))
+            .collect();
+        // A single n-cycle: position i takes the record from (i + 7) % n.
+        let order: Vec<u32> = (0..n).map(|i| ((i + 7) % n) as u32).collect();
+        let want: Vec<String> = order
+            .iter()
+            .map(|&j| String::from_utf8_lossy(records[j as usize].name().unwrap().as_ref()).into_owned())
+            .collect();
+        let mut got = records;
+        apply_permutation(&mut got, order);
+        assert_eq!(names(&got), want);
+    }
 }
 
 #[cfg(test)]

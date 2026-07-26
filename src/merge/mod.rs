@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use bstr::{BStr, BString};
 use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
 
@@ -70,7 +71,8 @@ pub fn run(args: MergeArgs) -> Result<()> {
     // and compute per-input tid remaps, but the readers are borrowed mutably for
     // the streaming merge below.
     let input_headers: Vec<Header> = readers.iter().map(|r| r.header().clone()).collect();
-    let mut merged_header = merge_headers(input_headers.iter().collect::<Vec<_>>())?;
+    let (mut merged_header, rg_renames) =
+        merge_headers(input_headers.iter().collect::<Vec<_>>())?;
     append_pg(&mut merged_header, &PgInfo::new("merge", !args.no_pg))?;
     // Per-input map: local reference id → merged reference id (matched by @SQ name).
     let tid_maps = build_tid_maps(&input_headers, &merged_header);
@@ -100,6 +102,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
         let mut rec = RecordBuf::default();
         if r.read_record_buf(&mut rec)? {
             remap_ids(&mut rec, &tid_maps[idx]);
+            remap_read_group(&mut rec, &rg_renames[idx]);
             heap.push(HeapItem {
                 key: build_key(&rec, kind),
                 record: rec,
@@ -132,9 +135,10 @@ pub fn run(args: MergeArgs) -> Result<()> {
     while let Some(item) = heap.pop() {
         writer.write_record_buf(&item.record)?;
         let src = item.src;
-        let mut rec = RecordBuf::default();
+            let mut rec = item.record;
         if readers[src].read_record_buf(&mut rec)? {
             remap_ids(&mut rec, &tid_maps[src]);
+            remap_read_group(&mut rec, &rg_renames[src]);
             heap.push(HeapItem {
                 key: build_key(&rec, kind),
                 record: rec,
@@ -146,14 +150,20 @@ pub fn run(args: MergeArgs) -> Result<()> {
     Ok(())
 }
 
-fn merge_headers(headers: Vec<&Header>) -> Result<Header> {
-    use bstr::{BString, ByteSlice};
+/// Per-input map from a read-group ID as stored in that input's records to the
+/// one it was given in the merged header.
+type RgRenames = HashMap<BString, BString>;
+
+/// Build the merged header, plus the read-group renames it forced.
+fn merge_headers(headers: Vec<&Header>) -> Result<(Header, Vec<RgRenames>)> {
+    use bstr::ByteSlice;
 
     let mut merged = headers
         .first()
         .copied()
         .cloned()
         .context("no input headers")?;
+    let mut rg_renames: Vec<RgRenames> = vec![RgRenames::default(); headers.len()];
     for (i, h) in headers.iter().enumerate().skip(1) {
         // @SQ: build the UNION across inputs, preserving first-seen order. A name
         // shared by several inputs must agree on length (hard error); names unique
@@ -187,13 +197,21 @@ fn merge_headers(headers: Vec<&Header>) -> Result<Header> {
             }
         }
 
-        // @RG: dedup on ID, suffix duplicates with `-{idx}`.
+        // An ID shared by two inputs is the same read group when the records
+        // agree; otherwise the later one is suffixed and the rename recorded, or
+        // its records would rebind to the first input's read group.
         for (rg_id, rg_map) in h.read_groups() {
+            if merged.read_groups().get(rg_id.as_bstr()) == Some(rg_map) {
+                continue;
+            }
             let mut final_id: BString = rg_id.clone();
             let mut suffix = 1usize;
             while merged.read_groups().contains_key(final_id.as_bstr()) {
                 final_id = BString::from(format!("{}-{suffix}", rg_id.as_bstr()));
                 suffix += 1;
+            }
+            if final_id != *rg_id {
+                rg_renames[i].insert(rg_id.clone(), final_id.clone());
             }
             merged.read_groups_mut().insert(final_id, rg_map.clone());
         }
@@ -218,7 +236,7 @@ fn merge_headers(headers: Vec<&Header>) -> Result<Header> {
                 .insert(final_id, pg_map.clone());
         }
     }
-    Ok(merged)
+    Ok((merged, rg_renames))
 }
 
 /// For each input header, map its local reference id (the integer tid stored in
@@ -278,4 +296,22 @@ fn remap_ids(rec: &mut RecordBuf, map: &[Option<usize>]) {
     {
         *rec.mate_reference_sequence_id_mut() = Some(new);
     }
+}
+
+/// Point the record's `RG` tag at this input's read group under its merged name.
+fn remap_read_group(rec: &mut RecordBuf, renames: &RgRenames) {
+    use noodles_sam::alignment::record::data::field::Tag;
+    use noodles_sam::alignment::record_buf::data::field::Value;
+
+    if renames.is_empty() {
+        return;
+    }
+    let new = match rec.data().get(&Tag::READ_GROUP) {
+        Some(Value::String(id)) => match renames.get(id.as_ref() as &BStr) {
+            Some(new) => new.clone(),
+            None => return,
+        },
+        _ => return,
+    };
+    rec.data_mut().insert(Tag::READ_GROUP, Value::String(new));
 }

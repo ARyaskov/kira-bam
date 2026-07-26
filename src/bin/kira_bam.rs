@@ -60,9 +60,47 @@ enum Commands {
     Tview(TviewArgs),
 }
 
+/// Turn a library panic into a tool error. noodles reports some malformed-input
+/// cases with `expect` rather than an `io::Error` — a CRAM that cannot be
+/// resolved against its reference among them.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned());
+        match msg {
+            Some(msg) => {
+                eprintln!("[kira-bam] error: {msg}");
+                eprintln!(
+                    "[kira-bam] this came from a library assertion, which usually means \
+                     malformed input or a missing reference (`-T/--reference` for CRAM)."
+                );
+                if std::env::var_os("KIRA_BAM_BACKTRACE").is_some() {
+                    default_hook(info);
+                }
+            }
+            None => default_hook(info),
+        }
+        std::process::exit(2);
+    }));
+}
+
 fn main() -> Result<()> {
+    install_panic_hook();
     let cli = Cli::parse();
-    match cli.command {
+    let result = dispatch(cli.command);
+    // A closed downstream pipe is a normal end of work.
+    match result {
+        Err(e) if kira_bam::io::is_broken_pipe(&e) => Ok(()),
+        other => other,
+    }
+}
+
+fn dispatch(command: Commands) -> Result<()> {
+    match command {
         Commands::View(a) => cmd_view(a),
         Commands::Flagstat(a) => cmd_flagstat(a),
         Commands::Sort(a) => cmd_sort(a),
@@ -94,5 +132,15 @@ fn main() -> Result<()> {
         Commands::Ampliconstats(a) => cmd_ampliconstats(a),
         Commands::Import(a) => cmd_import(a),
         Commands::Tview(a) => cmd_tview(a),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        super::Cli::command().debug_assert();
     }
 }

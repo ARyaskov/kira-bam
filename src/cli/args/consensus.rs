@@ -31,4 +31,8 @@ pub struct ConsensusArgs {
     /// Line wrap width in FASTA output.
     #[arg(long = "line-width", default_value_t = 60)]
     pub line_width: usize,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
+    #[arg(short = 'T', long = "reference")]
+    pub reference: Option<PathBuf>,
 }

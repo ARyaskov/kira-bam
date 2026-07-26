@@ -42,7 +42,8 @@ pub fn run(args: FastqArgs) -> Result<()> {
     let mut orphans = args.orphans.as_deref().map(Out::new).transpose()?;
     let mut stdout_sink = Out::stdout();
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
 
     if !args.collate {
         let mut prev: Option<RecordBuf> = None;

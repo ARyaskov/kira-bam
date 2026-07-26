@@ -41,7 +41,8 @@ struct RefStats {
 pub fn run(args: CoverageArgs) -> Result<()> {
     install_thread_pool(args.threads);
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let header = reader.header().clone();
 
     let mut stats: HashMap<usize, RefStats, std::hash::BuildHasherDefault<FxHasher>> =

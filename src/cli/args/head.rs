@@ -20,4 +20,8 @@ pub struct HeadArgs {
     /// Output file (default stdout).
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
+    #[arg(short = 'T', long = "reference")]
+    pub reference: Option<PathBuf>,
 }

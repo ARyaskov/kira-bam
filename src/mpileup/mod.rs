@@ -15,7 +15,7 @@ pub fn run(args: MpileupArgs) -> Result<()> {
         eprintln!("[kira-bam mpileup] note: only the first BAM is processed in this version");
     }
     let input = &args.inputs[0];
-    let reader = BamReader::open(input).context("open input")?;
+    let reader = BamReader::open_with_reference(input, args.reference.as_deref()).context("open input")?;
     let header = reader.header().clone();
 
     let refs = match &args.reference {
@@ -29,7 +29,9 @@ pub fn run(args: MpileupArgs) -> Result<()> {
     };
 
     let mut pileup = PileupIter::new(reader, args.min_mapq, args.min_baseq);
-    while let Some((tid, pos, mut col)) = pileup.next_column()? {
+    // One column buffer for the whole scan.
+    let mut col: Vec<(u8, u8)> = Vec::new();
+    while let Some((tid, pos)) = pileup.next_column_into(&mut col)? {
         if col.len() > args.max_depth as usize {
             col.truncate(args.max_depth as usize);
         }

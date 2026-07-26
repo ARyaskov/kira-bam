@@ -20,7 +20,8 @@ pub fn run(args: SplitArgs) -> Result<()> {
     let tag_bytes = args.tag.as_bytes();
     let tag = Tag::from([tag_bytes[0], tag_bytes[1]]);
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let header = reader.header().clone();
     let input_stem = args
         .input

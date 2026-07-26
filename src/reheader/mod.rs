@@ -14,7 +14,8 @@ pub fn run(args: ReheaderArgs) -> Result<()> {
     let mut new_header: Header = sam_reader.read_header().context("parse SAM header")?;
     append_pg(&mut new_header, &PgInfo::new("reheader", !args.no_pg))?;
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     // Validate @SQ compatibility before replacing.
     let old_header = reader.header().clone();
     if old_header.reference_sequences().len() != new_header.reference_sequences().len() {

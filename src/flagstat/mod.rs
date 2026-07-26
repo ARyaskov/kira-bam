@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::cli::FlagstatArgs;
-use crate::io::{BamReader, install_thread_pool};
+use crate::io::{BamReader, RecordSummary, install_thread_pool};
 
 const FLAG_PAIRED: u16 = 0x1;
 const FLAG_PROPER_PAIR: u16 = 0x2;
@@ -110,18 +110,17 @@ fn update_counts(c: &mut Counts, flags: u16, mapq: u8, ref_id: i32, mate_ref_id:
 
 pub fn run(args: FlagstatArgs) -> Result<()> {
     install_thread_pool(args.threads);
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let mut totals = FlagstatTotals::default();
-    let mut rec = crate::io::Record::default();
-    while reader.read_record_buf(&mut rec)? {
-        let flags = u16::from(rec.flags());
-        let mapq = rec.mapping_quality().map(u8::from).unwrap_or(0);
-        let ref_id = rec.reference_sequence_id().map(|i| i as i32).unwrap_or(-1);
-        let mate_ref_id = rec
-            .mate_reference_sequence_id()
-            .map(|i| i as i32)
-            .unwrap_or(-1);
-        totals.update(flags, mapq, ref_id, mate_ref_id);
+    let mut rec = RecordSummary::default();
+    while reader.read_summary(&mut rec)? {
+        totals.update(
+            rec.flags,
+            rec.mapping_quality.unwrap_or(0),
+            rec.tid(),
+            rec.mate_tid(),
+        );
     }
     match args.output_fmt.as_str() {
         "json" => print_flagstat_json(&totals),

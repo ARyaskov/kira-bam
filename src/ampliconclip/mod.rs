@@ -24,7 +24,8 @@ pub fn run(args: AmpliconclipArgs) -> Result<()> {
 
     let intervals = read_bed(&args.bed)?;
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let mut header = reader.header().clone();
     append_pg(&mut header, &PgInfo::new("ampliconclip", !args.no_pg))?;
 

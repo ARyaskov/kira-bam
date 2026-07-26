@@ -24,4 +24,8 @@ pub struct CatArgs {
     /// Do not append a @PG record.
     #[arg(long = "no-PG")]
     pub no_pg: bool,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
+    #[arg(short = 'T', long = "reference")]
+    pub reference: Option<PathBuf>,
 }

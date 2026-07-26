@@ -1,8 +1,10 @@
 //! Streaming pileup over a coordinate-sorted BAM.
 //!
-//! Yields, in genomic order, `(tid, pos, depth, [(base, qual)])`. Maintains a
-//! sliding window of active reads keyed by their alignment end so we never look
-//! back at records already past their range.
+//! Yields `(tid, pos, [(base, qual)])` in genomic order, keeping a sliding window
+//! of active reads keyed by alignment end. Nothing allocates per position or per
+//! record in steady state: the column goes into a caller-owned buffer, decode
+//! buffers are recycled as reads leave the window, and one record buffer is
+//! reused throughout.
 
 use anyhow::Result;
 use noodles_sam::alignment::RecordBuf;
@@ -12,13 +14,11 @@ use crate::io::BamReader;
 
 pub type PileupColumn = (usize, usize, Vec<(u8, u8)>);
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ActiveRead {
     pub end: usize,
-    /// Pre-decoded per-reference-position (base, qual) for the window we have not yet emitted.
+    /// Per-reference-position `(base, qual)` from this read's alignment start.
     pub bases: Vec<(u8, u8)>,
-    /// Index into `bases` for the next ref position to consume.
-    pub cursor: usize,
     /// 1-based reference start.
     pub ref_start: usize,
 }
@@ -26,7 +26,12 @@ pub struct ActiveRead {
 pub struct PileupIter {
     reader: BamReader,
     active: Vec<ActiveRead>,
-    pending: Option<RecordBuf>,
+    /// Decode buffers of reads that left the window.
+    free: Vec<Vec<(u8, u8)>>,
+    /// The record buffer, reused for every read.
+    cur: RecordBuf,
+    /// `cur` belongs to a later position or contig and must not be read over.
+    held: bool,
     current_tid: Option<usize>,
     current_pos: usize,
     min_mapq: u8,
@@ -38,7 +43,9 @@ impl PileupIter {
         Self {
             reader,
             active: Vec::new(),
-            pending: None,
+            free: Vec::new(),
+            cur: RecordBuf::default(),
+            held: false,
             current_tid: None,
             current_pos: 0,
             min_mapq,
@@ -46,75 +53,76 @@ impl PileupIter {
         }
     }
 
-    /// Reads the next record from the BAM, or pops a pending one. Returns true if we
-    /// pulled in a record (so the caller knows there's more work).
-    fn fetch_next(&mut self) -> Result<Option<RecordBuf>> {
-        if let Some(r) = self.pending.take() {
-            return Ok(Some(r));
+    /// Make the next record available in `self.cur`. `false` at EOF.
+    fn fetch_next(&mut self) -> Result<bool> {
+        if self.held {
+            self.held = false;
+            return Ok(true);
         }
-        let mut rec = RecordBuf::default();
-        if self.reader.read_record_buf(&mut rec)? {
-            Ok(Some(rec))
-        } else {
-            Ok(None)
-        }
+        self.reader.read_record_buf(&mut self.cur)
     }
 
-    /// Return the next pileup column. Returns Ok(None) at EOF.
+    /// Next pileup column. [`Self::next_column_into`] avoids the allocation.
     pub fn next_column(&mut self) -> Result<Option<PileupColumn>> {
+        let mut col = Vec::new();
+        Ok(self
+            .next_column_into(&mut col)?
+            .map(|(tid, pos)| (tid, pos, col)))
+    }
+
+    /// Write the next column into `col` (cleared first), returning its position.
+    pub fn next_column_into(&mut self, col: &mut Vec<(u8, u8)>) -> Result<Option<(usize, usize)>> {
         loop {
             // Pull in records that start at or before current_pos for current_tid.
             loop {
-                let rec = self.fetch_next()?;
-                let Some(rec) = rec else {
+                if !self.fetch_next()? {
                     if self.active.is_empty() && self.current_tid.is_none() {
                         return Ok(None);
                     }
                     break;
-                };
-                let flags = u16::from(rec.flags());
+                }
+                let flags = u16::from(self.cur.flags());
                 if (flags & 0x4) != 0 {
                     continue;
                 }
-                if let Some(mq) = rec.mapping_quality()
+                if let Some(mq) = self.cur.mapping_quality()
                     && u8::from(mq) < self.min_mapq
                 {
                     continue;
                 }
-                let tid = match rec.reference_sequence_id() {
+                let tid = match self.cur.reference_sequence_id() {
                     Some(t) => t,
                     None => continue,
                 };
-                let start = match rec.alignment_start() {
+                let start = match self.cur.alignment_start() {
                     Some(p) => usize::from(p),
                     None => continue,
                 };
                 if self.current_tid != Some(tid) {
                     if self.current_tid.is_some() {
-                        // Reference change. Hold record, finish current ref first.
-                        self.pending = Some(rec);
+                        // Reference change: finish this one first.
+                        self.held = true;
                         break;
                     }
                     self.current_tid = Some(tid);
                     self.current_pos = start;
                 }
                 if start > self.current_pos {
-                    // Still ahead; save for later.
-                    self.pending = Some(rec);
+                    // Still ahead.
+                    self.held = true;
                     break;
                 }
-                // Eligible: decode bases and add to active.
-                if let Some(ar) = decode_active(&rec, self.min_baseq) {
-                    self.active.push(ar);
+                let buf = self.free.pop().unwrap_or_default();
+                match decode_active(&self.cur, self.min_baseq, buf) {
+                    Ok(ar) => self.active.push(ar),
+                    Err(buf) => self.free.push(buf),
                 }
             }
 
-            // Drop reads that have ended.
-            self.active.retain(|a| a.end >= self.current_pos);
+            self.retire_finished();
 
-            // Build column for current position.
-            let mut col: Vec<(u8, u8)> = Vec::new();
-            for a in &mut self.active {
+            col.clear();
+            for a in &self.active {
                 let offset = self.current_pos as i64 - a.ref_start as i64;
                 if offset >= 0 && (offset as usize) < a.bases.len() {
                     let (b, q) = a.bases[offset as usize];
@@ -132,26 +140,52 @@ impl PileupIter {
             self.current_pos += 1;
 
             if !col.is_empty() {
-                return Ok(Some((tid, pos, col)));
+                return Ok(Some((tid, pos)));
             }
-            // No coverage: advance until we find something or EOF.
-            if self.active.is_empty() && self.pending.is_none() {
-                // Try to load next batch.
-                if self.fetch_next()?.is_none() {
+            // No coverage: advance until something appears or EOF.
+            if self.active.is_empty() && !self.held {
+                if !self.fetch_next()? {
                     self.current_tid = None;
                     self.current_pos = 0;
                     continue;
                 }
+                self.held = true;
             }
+        }
+    }
+
+    /// Drop reads that ended before the current position, keeping the survivors
+    /// in order and reclaiming their buffers.
+    fn retire_finished(&mut self) {
+        let pos = self.current_pos;
+        let mut keep = 0;
+        for i in 0..self.active.len() {
+            if self.active[i].end >= pos {
+                self.active.swap(keep, i);
+                keep += 1;
+            }
+        }
+        for mut dead in self.active.drain(keep..) {
+            dead.bases.clear();
+            self.free.push(std::mem::take(&mut dead.bases));
         }
     }
 }
 
-fn decode_active(rec: &RecordBuf, min_baseq: u8) -> Option<ActiveRead> {
-    let start = usize::from(rec.alignment_start()?);
+/// Expand a record into per-reference-position `(base, qual)`, reusing `buf`.
+/// Returns the buffer in `Err` when the record has no start.
+fn decode_active(
+    rec: &RecordBuf,
+    min_baseq: u8,
+    mut buf: Vec<(u8, u8)>,
+) -> std::result::Result<ActiveRead, Vec<(u8, u8)>> {
+    let Some(start) = rec.alignment_start() else {
+        return Err(buf);
+    };
+    let start = usize::from(start);
     let seq = rec.sequence().as_ref();
     let quals = rec.quality_scores().as_ref();
-    let mut bases: Vec<(u8, u8)> = Vec::new();
+    buf.clear();
     let mut read_idx = 0usize;
     let mut ref_idx = 0usize; // 0-based from `start`
     for op in rec.cigar().as_ref().iter() {
@@ -169,9 +203,9 @@ fn decode_active(rec: &RecordBuf, min_baseq: u8) -> Option<ActiveRead> {
                         0
                     };
                     if q >= min_baseq {
-                        bases.push((b, q));
+                        buf.push((b, q));
                     } else {
-                        bases.push((b'N', 0));
+                        buf.push((b'N', 0));
                     }
                     read_idx += 1;
                     ref_idx += 1;
@@ -182,7 +216,7 @@ fn decode_active(rec: &RecordBuf, min_baseq: u8) -> Option<ActiveRead> {
             }
             Kind::Deletion | Kind::Skip => {
                 for _ in 0..len {
-                    bases.push((b'*', 0));
+                    buf.push((b'*', 0));
                     ref_idx += 1;
                 }
             }
@@ -190,10 +224,9 @@ fn decode_active(rec: &RecordBuf, min_baseq: u8) -> Option<ActiveRead> {
         }
     }
     let end = start + ref_idx.saturating_sub(1);
-    Some(ActiveRead {
+    Ok(ActiveRead {
         end,
-        bases,
-        cursor: 0,
+        bases: buf,
         ref_start: start,
     })
 }

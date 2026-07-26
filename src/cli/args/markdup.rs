@@ -46,6 +46,14 @@ pub struct MarkdupArgs {
     #[arg(long = "mode-ancient")]
     pub mode_ancient: bool,
 
+    /// Also flag the supplementary and secondary alignments of a duplicate
+    /// template (samtools `-S`). Off by default, as in samtools; it costs one
+    /// read-name entry per duplicate template. Without it those records keep a
+    /// clear 0x400 while their primary is marked, so `-F 0x400` still lets them
+    /// through.
+    #[arg(short = 'S', long = "supplementary")]
+    pub supplementary: bool,
+
     /// Do not append a @PG record to the output header.
     #[arg(long = "no-PG")]
     pub no_pg: bool,

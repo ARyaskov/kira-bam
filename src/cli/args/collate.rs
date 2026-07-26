@@ -32,4 +32,9 @@ pub struct CollateArgs {
     /// Tmp dir.
     #[arg(short = 'T', long = "tmpdir")]
     pub tmpdir: Option<PathBuf>,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist
+    /// alongside). Long-only: `-T` is the tmp dir here, as in samtools collate.
+    #[arg(long = "reference")]
+    pub reference: Option<PathBuf>,
 }

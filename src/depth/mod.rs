@@ -16,11 +16,43 @@ struct DepthIv {
     end: u64,
 }
 
+/// One contig's BED intervals plus a cursor. The sweep visits positions in
+/// increasing order, so membership only needs the cursor advanced; testing every
+/// interval per position costs `positions × intervals`.
+#[derive(Debug, Default)]
+struct BedCursor {
+    ivs: Vec<DepthIv>,
+    at: usize,
+}
+
+impl BedCursor {
+    /// Sort and merge so the intervals are disjoint and ascending.
+    fn new(mut ivs: Vec<DepthIv>) -> Self {
+        ivs.sort_unstable_by_key(|iv| (iv.start, iv.end));
+        let mut merged: Vec<DepthIv> = Vec::with_capacity(ivs.len());
+        for iv in ivs {
+            match merged.last_mut() {
+                Some(last) if iv.start <= last.end + 1 => last.end = last.end.max(iv.end),
+                _ => merged.push(iv),
+            }
+        }
+        Self { ivs: merged, at: 0 }
+    }
+
+    /// Is `pos` covered? Positions must be non-decreasing between calls.
+    fn contains(&mut self, pos: u64) -> bool {
+        while self.at < self.ivs.len() && self.ivs[self.at].end < pos {
+            self.at += 1;
+        }
+        matches!(self.ivs.get(self.at), Some(iv) if pos >= iv.start)
+    }
+}
+
 fn load_bed(
     path: &std::path::Path,
-) -> Result<HashMap<String, Vec<DepthIv>, std::hash::BuildHasherDefault<FxHasher>>> {
+) -> Result<HashMap<String, BedCursor, std::hash::BuildHasherDefault<FxHasher>>> {
     let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut out: HashMap<String, Vec<DepthIv>, std::hash::BuildHasherDefault<FxHasher>> =
+    let mut raw: HashMap<String, Vec<DepthIv>, std::hash::BuildHasherDefault<FxHasher>> =
         HashMap::default();
     for line in BufReader::new(f).lines() {
         let line = line?;
@@ -33,17 +65,20 @@ fn load_bed(
         }
         let start: u64 = parts[1].parse().unwrap_or(0);
         let end: u64 = parts[2].parse().unwrap_or(0);
-        out.entry(parts[0].to_string()).or_default().push(DepthIv {
+        raw.entry(parts[0].to_string()).or_default().push(DepthIv {
             start: start + 1,
             end,
         });
     }
-    Ok(out)
+    Ok(raw
+        .into_iter()
+        .map(|(name, ivs)| (name, BedCursor::new(ivs)))
+        .collect())
 }
 
-fn pos_in_bed(ivs: Option<&Vec<DepthIv>>, pos: u64) -> bool {
-    match ivs {
-        Some(ivs) => ivs.iter().any(|iv| pos >= iv.start && pos <= iv.end),
+fn pos_in_bed(bed: Option<&mut BedCursor>, pos: u64) -> bool {
+    match bed {
+        Some(cursor) => cursor.contains(pos),
         None => true,
     }
 }
@@ -51,13 +86,20 @@ fn pos_in_bed(ivs: Option<&Vec<DepthIv>>, pos: u64) -> bool {
 pub fn run(args: DepthArgs) -> Result<()> {
     install_thread_pool(args.threads);
 
-    let bed = match &args.bed {
+    let mut bed = match &args.bed {
         Some(p) => Some(load_bed(p)?),
         None => None,
     };
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let header = reader.header().clone();
+    // Resolved once rather than per record.
+    let refs: Vec<(String, usize)> = header
+        .reference_sequences()
+        .iter()
+        .map(|(name, sq)| (name.to_string(), usize::from(sq.length())))
+        .collect();
 
     let mut out: Box<dyn Write> = match &args.output {
         Some(p) => Box::new(BufWriter::with_capacity(
@@ -101,9 +143,9 @@ pub fn run(args: DepthArgs) -> Result<()> {
 
         if state.current_tid != Some(tid) {
             if let Some(prev) = state.current_tid {
-                let (ref_name, ref_len) = ref_name_len(&header, prev);
-                let bed_for_ref = bed.as_ref().and_then(|b| b.get(&ref_name));
-                state.drain(&ref_name, ref_len, args.all_positions, bed_for_ref, &mut out)?;
+                let (ref_name, ref_len) = ref_entry(&refs, prev);
+                let bed_for_ref = bed.as_mut().and_then(|b| b.get_mut(ref_name));
+                state.drain(ref_name, ref_len, args.all_positions, bed_for_ref, &mut out)?;
             }
             state = SweepState {
                 current_tid: Some(tid),
@@ -113,33 +155,26 @@ pub fn run(args: DepthArgs) -> Result<()> {
             };
         }
 
-        let (ref_name, _) = ref_name_len(&header, tid);
-        let bed_for_ref = bed.as_ref().and_then(|b| b.get(&ref_name));
-        state.emit_until(start, &ref_name, args.all_positions, bed_for_ref, &mut out)?;
+        let (ref_name, _) = ref_entry(&refs, tid);
+        let bed_for_ref = bed.as_mut().and_then(|b| b.get_mut(ref_name));
+        state.emit_until(start, ref_name, args.all_positions, bed_for_ref, &mut out)?;
         state.add_intervals(&intervals);
     }
 
     if let Some(prev) = state.current_tid {
-        let (ref_name, ref_len) = ref_name_len(&header, prev);
-        let bed_for_ref = bed.as_ref().and_then(|b| b.get(&ref_name));
-        state.drain(&ref_name, ref_len, args.all_positions, bed_for_ref, &mut out)?;
+        let (ref_name, ref_len) = ref_entry(&refs, prev);
+        let bed_for_ref = bed.as_mut().and_then(|b| b.get_mut(ref_name));
+        state.drain(ref_name, ref_len, args.all_positions, bed_for_ref, &mut out)?;
     }
     out.flush()?;
     Ok(())
 }
 
-fn ref_name_len(header: &noodles_sam::Header, tid: usize) -> (String, usize) {
-    let name = header
-        .reference_sequences()
-        .get_index(tid)
-        .map(|(n, _)| n.to_string())
-        .unwrap_or_default();
-    let len = header
-        .reference_sequences()
-        .get_index(tid)
-        .map(|(_, sq)| usize::from(sq.length()))
-        .unwrap_or(0);
-    (name, len)
+fn ref_entry(refs: &[(String, usize)], tid: usize) -> (&str, usize) {
+    match refs.get(tid) {
+        Some((name, len)) => (name.as_str(), *len),
+        None => ("", 0),
+    }
 }
 
 /// Maximal runs of reference positions actually covered by aligned read bases.
@@ -238,7 +273,7 @@ impl SweepState {
         target: usize,
         ref_name: &str,
         all_positions: bool,
-        bed: Option<&Vec<DepthIv>>,
+        mut bed: Option<&mut BedCursor>,
         out: &mut Box<dyn Write>,
     ) -> Result<()> {
         if self.current_pos == 0 {
@@ -248,7 +283,7 @@ impl SweepState {
             let p = self.current_pos;
             self.apply_events_up_to(p);
             let cov = self.cur_cov.max(0) as usize;
-            if pos_in_bed(bed, p as u64) && (cov > 0 || all_positions) {
+            if pos_in_bed(bed.as_deref_mut(), p as u64) && (cov > 0 || all_positions) {
                 writeln!(out, "{ref_name}\t{p}\t{cov}")?;
             }
             self.current_pos += 1;
@@ -261,7 +296,7 @@ impl SweepState {
         ref_name: &str,
         ref_len: usize,
         all_positions: bool,
-        bed: Option<&Vec<DepthIv>>,
+        bed: Option<&mut BedCursor>,
         out: &mut Box<dyn Write>,
     ) -> Result<()> {
         let target = if all_positions {

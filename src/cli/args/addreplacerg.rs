@@ -32,4 +32,8 @@ pub struct AddReplaceRgArgs {
     /// Write uncompressed BAM.
     #[arg(short = 'u', long = "uncompressed")]
     pub uncompressed: bool,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
+    #[arg(short = 'T', long = "reference")]
+    pub reference: Option<PathBuf>,
 }

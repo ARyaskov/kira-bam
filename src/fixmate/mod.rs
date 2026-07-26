@@ -5,7 +5,9 @@ use noodles_sam::alignment::record::data::field::Tag;
 use noodles_sam::alignment::record_buf::data::field::Value;
 
 use crate::cli::FixmateArgs;
-use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
+use crate::io::{
+    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, is_record_level_error,
+};
 use crate::types::OutputFormat;
 
 const FLAG_PAIRED: u16 = 0x1;
@@ -17,11 +19,49 @@ const FLAG_MATE_REVERSE: u16 = 0x20;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
+/// Reject input whose mates are not adjacent.
+///
+/// Grouping below is positional. On a coordinate-sorted file every run is one
+/// record, so every read takes the singleton branch — `MUNMAP` set,
+/// `PROPER_PAIR` cleared — and the output is quietly wrecked.
+fn check_query_grouped(header: &noodles_sam::Header, force: bool) -> Result<()> {
+    use noodles_sam::header::record::value::map::header::{group_order, sort_order, tag};
+
+    let hd = header.header();
+    let field = |t| hd.and_then(|h| h.other_fields().get(&t)).map(|v| v.to_vec());
+    let so = field(tag::SORT_ORDER);
+    let go = field(tag::GROUP_ORDER);
+    if so.as_deref() == Some(sort_order::QUERY_NAME)
+        || go.as_deref() == Some(group_order::QUERY)
+    {
+        return Ok(());
+    }
+    let found = so
+        .as_deref()
+        .or(go.as_deref())
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .unwrap_or_else(|| "unspecified".to_string());
+    if force {
+        eprintln!(
+            "[kira-bam fixmate] warning: header says {found}, not queryname/query-grouped; \
+             proceeding because --assume-query-grouped was given"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "fixmate needs the two mates of a template adjacent, but the header says {found}.\n\
+         Run `kira-bam collate` or `kira-bam sort -n` first, or pass \
+         --assume-query-grouped if the file is grouped but unlabelled."
+    )
+}
+
 pub fn run(args: FixmateArgs) -> Result<()> {
     install_thread_pool(args.threads);
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let mut header = reader.header().clone();
+    check_query_grouped(&header, args.assume_query_grouped)?;
     append_pg(&mut header, &PgInfo::new("fixmate", !args.no_pg))?;
 
     let fmt = if args.uncompressed {
@@ -91,7 +131,12 @@ fn flush_group(
                 continue;
             }
         }
-        let _ = writer.write_record_buf(&r);
+        if let Err(e) = writer.write_record_buf(&r) {
+            if !is_record_level_error(&e) {
+                return Err(e);
+            }
+            eprintln!("[kira-bam fixmate] skip record: {e:#}");
+        }
     }
     Ok(())
 }

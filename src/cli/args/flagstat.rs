@@ -15,4 +15,8 @@ pub struct FlagstatArgs {
     /// Output format: `text` (default) or `json`.
     #[arg(short = 'O', long = "output-fmt", default_value = "text")]
     pub output_fmt: String,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
+    #[arg(short = 'T', long = "reference")]
+    pub reference: Option<PathBuf>,
 }

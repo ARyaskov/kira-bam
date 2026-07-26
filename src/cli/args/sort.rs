@@ -70,6 +70,11 @@ pub struct SortArgs {
     /// "Ancient DNA" mode — ignore strand in dup key. Only with `--markdup`.
     #[arg(long = "markdup-mode-ancient")]
     pub markdup_mode_ancient: bool,
+
+    /// Also flag supplementary/secondary alignments of duplicate templates
+    /// (`markdup -S`). Only with `--markdup`.
+    #[arg(long = "markdup-supplementary")]
+    pub markdup_supplementary: bool,
 }
 
 fn parse_flags(s: &str) -> Result<u16, String> {

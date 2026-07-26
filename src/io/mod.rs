@@ -125,6 +125,13 @@ pub fn append_pg(header: &mut Header, pg: &PgInfo) -> Result<()> {
 const BGZF_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const CRAM_MAGIC: [u8; 4] = *b"CRAM";
 
+/// BGZF end-of-file marker: an empty deflate block, the last 28 bytes of a
+/// well-formed BGZF file.
+pub const BGZF_EOF: [u8; 28] = [
+    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 fn detect_format<P: AsRef<Path>>(path: P) -> io::Result<InputFormat> {
     let path = path.as_ref();
     let mut f = File::open(path)?;
@@ -205,6 +212,54 @@ pub struct OpenOptions {
 pub struct BamReader {
     inner: ReaderImpl,
     header: Header,
+    /// Reused by [`BamReader::read_summary`] on BAM input.
+    raw: bam::Record,
+    /// Reused by `read_summary` on SAM/CRAM.
+    summary_fallback: RecordBuf,
+}
+
+/// The fixed-position record fields. See [`BamReader::read_summary`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RecordSummary {
+    pub flags: u16,
+    /// `None` when MAPQ is the 255 "unavailable" sentinel.
+    pub mapping_quality: Option<u8>,
+    pub reference_sequence_id: Option<usize>,
+    pub mate_reference_sequence_id: Option<usize>,
+    pub alignment_start: Option<usize>,
+    pub template_length: i32,
+}
+
+impl RecordSummary {
+    fn fill_from_raw(&mut self, rec: &bam::Record) -> Result<()> {
+        self.flags = u16::from(rec.flags());
+        self.mapping_quality = rec.mapping_quality().map(u8::from);
+        self.reference_sequence_id = rec.reference_sequence_id().transpose()?;
+        self.mate_reference_sequence_id = rec.mate_reference_sequence_id().transpose()?;
+        self.alignment_start = rec.alignment_start().transpose()?.map(usize::from);
+        self.template_length = rec.template_length();
+        Ok(())
+    }
+
+    fn fill_from_buf(&mut self, rec: &RecordBuf) {
+        self.flags = u16::from(rec.flags());
+        self.mapping_quality = rec.mapping_quality().map(u8::from);
+        self.reference_sequence_id = rec.reference_sequence_id();
+        self.mate_reference_sequence_id = rec.mate_reference_sequence_id();
+        self.alignment_start = rec.alignment_start().map(usize::from);
+        self.template_length = rec.template_length();
+    }
+
+    /// Reference id as samtools prints it: `-1` for unplaced.
+    pub fn tid(&self) -> i32 {
+        self.reference_sequence_id.map(|i| i as i32).unwrap_or(-1)
+    }
+
+    pub fn mate_tid(&self) -> i32 {
+        self.mate_reference_sequence_id
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    }
 }
 
 enum ReaderImpl {
@@ -216,7 +271,75 @@ enum ReaderImpl {
     /// calls. Wins ~10-15 % on the aligner→sort handoff (tmp SAM is on
     /// disk, but the kernel already has it warm in page cache).
     SamMmap(sam::io::Reader<Cursor<MmapView>>),
-    Cram(cram::io::Reader<BufReader<File>>),
+    Cram(CramSource),
+}
+
+/// Container-at-a-time CRAM decoding. The smallest readable unit is a container
+/// of thousands of records, and `Reader::records()` buffers one internally — so
+/// the iterator must outlive each record. It borrows the reader, which a struct
+/// cannot also hold, so this drives `read_container` directly.
+struct CramSource {
+    reader: cram::io::Reader<BufReader<File>>,
+    container: cram::io::reader::Container,
+    /// Empty by default, which only decodes CRAMs storing bases verbatim.
+    repository: fasta::Repository,
+    decoded: Vec<RecordBuf>,
+    cursor: usize,
+}
+
+impl CramSource {
+    fn read_record_buf(&mut self, header: &Header, out: &mut RecordBuf) -> Result<bool> {
+        while self.cursor >= self.decoded.len() {
+            if !self.fill(header)? {
+                return Ok(false);
+            }
+        }
+        *out = std::mem::take(&mut self.decoded[self.cursor]);
+        self.cursor += 1;
+        Ok(true)
+    }
+
+    /// Decode containers into `decoded` until one yields records. `false` at EOF.
+    fn fill(&mut self, header: &Header) -> Result<bool> {
+        self.decoded.clear();
+        self.cursor = 0;
+        loop {
+            let n = self
+                .reader
+                .read_container(&mut self.container)
+                .context("read CRAM container")?;
+            if n == 0 {
+                return Ok(false);
+            }
+            let compression_header = self
+                .container
+                .compression_header()
+                .context("read CRAM compression header")?;
+            for slice in self.container.slices() {
+                let slice = slice.context("read CRAM slice")?;
+                let (core_data_src, external_data_srcs) =
+                    slice.decode_blocks().context("decode CRAM slice blocks")?;
+                let records = slice
+                    .records(
+                        self.repository.clone(),
+                        header,
+                        &compression_header,
+                        &core_data_src,
+                        &external_data_srcs,
+                    )
+                    .context("decode CRAM slice records")?;
+                for record in &records {
+                    self.decoded.push(
+                        RecordBuf::try_from_alignment_record(header, record)
+                            .context("convert CRAM record")?,
+                    );
+                }
+            }
+            if !self.decoded.is_empty() {
+                return Ok(true);
+            }
+        }
+    }
 }
 
 /// `Mmap` newtype that exposes a `&[u8]` view via `Cursor`. Holds the mapping
@@ -296,6 +419,8 @@ impl BamReader {
                     return Ok(Self {
                         inner: ReaderImpl::BamMmap(reader),
                         header,
+                        raw: bam::Record::default(),
+                        summary_fallback: RecordBuf::default(),
                     });
                 }
                 let file = File::open(path).context("open BAM")?;
@@ -304,6 +429,8 @@ impl BamReader {
                 Ok(Self {
                     inner: ReaderImpl::Bam(reader),
                     header,
+                    raw: bam::Record::default(),
+                    summary_fallback: RecordBuf::default(),
                 })
             }
             InputFormat::Sam => {
@@ -315,6 +442,8 @@ impl BamReader {
                     return Ok(Self {
                         inner: ReaderImpl::SamMmap(reader),
                         header,
+                        raw: bam::Record::default(),
+                        summary_fallback: RecordBuf::default(),
                     });
                 }
                 let file = File::open(path).context("open SAM")?;
@@ -323,23 +452,34 @@ impl BamReader {
                 Ok(Self {
                     inner: ReaderImpl::Sam(reader),
                     header,
+                    raw: bam::Record::default(),
+                    summary_fallback: RecordBuf::default(),
                 })
             }
             InputFormat::Cram => {
                 let file = File::open(path).context("open CRAM")?;
                 let buf_file = BufReader::with_capacity(1 << 20, file);
                 let mut builder = cram::io::reader::Builder::default();
-                if let Some(refpath) = reference {
-                    let repo = build_fasta_repo(refpath.as_ref())?;
-                    builder = builder.set_reference_sequence_repository(repo);
-                }
+                let repository = match reference {
+                    Some(refpath) => build_fasta_repo(refpath.as_ref())?,
+                    None => fasta::Repository::default(),
+                };
+                builder = builder.set_reference_sequence_repository(repository.clone());
                 let mut reader = builder.build_from_reader(buf_file);
                 // CRAM read_header() validates the magic, parses the file
                 // definition, and returns the SAM header in one go.
                 let header = reader.read_header().context("read CRAM header")?;
                 Ok(Self {
-                    inner: ReaderImpl::Cram(reader),
+                    inner: ReaderImpl::Cram(CramSource {
+                        reader,
+                        container: cram::io::reader::Container::default(),
+                        repository,
+                        decoded: Vec::new(),
+                        cursor: 0,
+                    }),
                     header,
+                    raw: bam::Record::default(),
+                    summary_fallback: RecordBuf::default(),
                 })
             }
         }
@@ -375,18 +515,44 @@ impl BamReader {
                     .context("read SAM record (mmap)")?;
                 Ok(n > 0)
             }
-            ReaderImpl::Cram(r) => {
-                // CRAM doesn't have an in-place read_record_buf; use the iterator and try_from.
-                let mut iter = r.records(&self.header);
-                match iter.next() {
-                    None => Ok(false),
-                    Some(result) => {
-                        let rec = result.context("read CRAM record")?;
-                        *buf = RecordBuf::try_from_alignment_record(&self.header, &rec)
-                            .context("convert CRAM record")?;
-                        Ok(true)
-                    }
+            ReaderImpl::Cram(r) => r.read_record_buf(&self.header, buf),
+        }
+    }
+
+    /// Read only the fixed-position fields of the next record, skipping the
+    /// name, CIGAR, sequence, qualities and tags that [`Self::read_record_buf`]
+    /// would decode. Allocation-free for BAM; SAM and CRAM fall back to a full
+    /// decode, having no lazy form.
+    pub fn read_summary(&mut self, out: &mut RecordSummary) -> Result<bool> {
+        match &mut self.inner {
+            ReaderImpl::Bam(r) => {
+                let n = r
+                    .read_record(&mut self.raw)
+                    .context("read BAM record header")?;
+                if n == 0 {
+                    return Ok(false);
                 }
+                out.fill_from_raw(&self.raw)?;
+                Ok(true)
+            }
+            ReaderImpl::BamMmap(r) => {
+                let n = r
+                    .read_record(&mut self.raw)
+                    .context("read BAM record header (mmap)")?;
+                if n == 0 {
+                    return Ok(false);
+                }
+                out.fill_from_raw(&self.raw)?;
+                Ok(true)
+            }
+            _ => {
+                let mut buf = std::mem::take(&mut self.summary_fallback);
+                let more = self.read_record_buf(&mut buf)?;
+                if more {
+                    out.fill_from_buf(&buf);
+                }
+                self.summary_fallback = buf;
+                Ok(more)
             }
         }
     }
@@ -617,32 +783,73 @@ impl BamWriter {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<()> {
-        match &mut self.inner {
+    /// Finalise the output: EOF marker, then flush to the sink.
+    ///
+    /// `AlignmentWrite::finish` is a no-op for BAM and SAM in noodles; the EOF
+    /// block and the flushes otherwise happen in `Drop`, which discards their
+    /// errors and turns a full disk into a truncated file with exit status 0.
+    pub fn finish(self) -> Result<()> {
+        let Self { inner, header, .. } = self;
+        match inner {
             WriterImpl::Bam(w) => {
-                let _ = AlignmentWrite::finish(w, &self.header);
+                let mut sink = w
+                    .into_inner()
+                    .finish()
+                    .context("write BGZF EOF block to BAM output")?;
+                sink.flush().context("flush BAM output")?;
             }
             WriterImpl::BamMt(w) => {
-                let _ = AlignmentWrite::finish(w, &self.header);
+                let mut mt = w.into_inner();
+                let mut sink = mt.finish().context("write BGZF EOF block to BAM output")?;
+                sink.flush().context("flush BAM output")?;
             }
             WriterImpl::Sam(w) => {
-                let _ = AlignmentWrite::finish(w, &self.header);
+                w.into_inner().flush().context("flush SAM output")?;
             }
-            WriterImpl::Cram(w) => {
-                let _ = AlignmentWrite::finish(w, &self.header);
+            WriterImpl::Cram(mut w) => {
+                AlignmentWrite::finish(&mut w, &header).context("write CRAM EOF container")?;
+                w.into_inner().flush().context("flush CRAM output")?;
             }
         }
         Ok(())
     }
 }
 
-/// Encode `records` into the raw BAM record stream consumed by [`BamWriter::write_preencoded`].
-pub fn encode_records_into(header: &Header, records: &[RecordBuf]) -> Vec<u8> {
+/// Does this write failure concern the single record rather than the stream?
+/// Callers skip invalid records but must abort on a failing sink, so anything
+/// that is not explicitly record validity counts as fatal.
+pub fn is_record_level_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<io::Error>())
+        .any(|e| {
+            matches!(
+                e.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData
+            )
+        })
+}
+
+/// Is this a closed downstream pipe (`… | head`)? Callers exit successfully.
+pub fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<io::Error>())
+        .any(|e| e.kind() == io::ErrorKind::BrokenPipe)
+}
+
+/// Encode `records` into the raw BAM record stream consumed by
+/// [`BamWriter::write_preencoded`], returning how many records noodles rejected.
+///
+/// Encoding targets a `Vec`, so a failure here is always record validity, never
+/// I/O — the same tolerance the record-at-a-time paths apply.
+pub fn encode_records_into(header: &Header, records: &[RecordBuf]) -> (Vec<u8>, u64) {
     let mut w = bam::io::Writer::from(Vec::<u8>::with_capacity(records.len() * 64));
+    let mut skipped = 0u64;
     for r in records {
-        let _ = w.write_alignment_record(header, r);
+        if w.write_alignment_record(header, r).is_err() {
+            skipped += 1;
+        }
     }
-    w.into_inner()
+    (w.into_inner(), skipped)
 }
 
 pub fn default_index_path(bam: &Path, csi: bool) -> PathBuf {
@@ -658,3 +865,64 @@ pub fn install_thread_pool(threads: usize) {
 }
 
 pub use noodles_sam::alignment::RecordBuf as Record;
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    /// Refuses every write, as a full disk would.
+    struct FailingSink;
+
+    impl Write for FailingSink {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("no space left on device"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("no space left on device"))
+        }
+    }
+
+    fn header() -> Header {
+        Header::default()
+    }
+
+    /// Output is buffered, so nothing reaches the sink until finalisation —
+    /// which is why discarding `finish`'s result truncated files silently.
+    #[test]
+    fn finish_reports_a_failing_sink() {
+        for fmt in [
+            OutputFormat::Bam,
+            OutputFormat::UncompressedBam,
+            OutputFormat::Sam,
+        ] {
+            let mut w =
+                BamWriter::from_writer(Box::new(FailingSink), header(), fmt).unwrap();
+            // Header writes land in the 1 MiB BufWriter, not on the sink.
+            let _ = w.write_header();
+            assert!(
+                w.finish().is_err(),
+                "finish() reported success for {fmt:?} despite a failing sink"
+            );
+        }
+    }
+
+    #[test]
+    fn sink_failures_are_not_classified_as_record_level() {
+        let stream = anyhow::Error::new(io::Error::other("no space left on device"))
+            .context("write BAM record");
+        assert!(!is_record_level_error(&stream));
+
+        let broken = anyhow::Error::new(io::Error::new(io::ErrorKind::BrokenPipe, "pipe"))
+            .context("write BAM record");
+        assert!(!is_record_level_error(&broken));
+        assert!(is_broken_pipe(&broken));
+
+        let record = anyhow::Error::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid CIGAR",
+        ))
+        .context("write BAM record");
+        assert!(is_record_level_error(&record));
+        assert!(!is_broken_pipe(&record));
+    }
+}

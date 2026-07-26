@@ -16,4 +16,8 @@ pub struct SamplesArgs {
     /// Output file.
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
+    #[arg(short = 'T', long = "reference")]
+    pub reference: Option<PathBuf>,
 }

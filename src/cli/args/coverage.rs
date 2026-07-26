@@ -36,4 +36,8 @@ pub struct CoverageArgs {
     /// Number of threads.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
+    #[arg(short = 'T', long = "reference")]
+    pub reference: Option<PathBuf>,
 }

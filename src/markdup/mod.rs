@@ -19,15 +19,17 @@ const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_DUP: u16 = 0x400;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// One end of a duplicate key. The barcode is hashed rather than stored: it only
+/// takes part in equality, and the winner map holds one entry per distinct key.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ReadKey {
     tid: i32,
     pos5: i32,
     strand: u8,
-    barcode: Vec<u8>,
+    barcode: u64,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct PairKey {
     a: ReadKey,
     b: ReadKey,
@@ -35,9 +37,7 @@ struct PairKey {
 
 impl PairKey {
     fn new(a: ReadKey, b: ReadKey) -> Self {
-        if (a.tid, a.pos5, a.strand, a.barcode.as_slice())
-            <= (b.tid, b.pos5, b.strand, b.barcode.as_slice())
-        {
+        if (a.tid, a.pos5, a.strand, a.barcode) <= (b.tid, b.pos5, b.strand, b.barcode) {
             PairKey { a, b }
         } else {
             PairKey { a: b, b: a }
@@ -45,7 +45,7 @@ impl PairKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum DupKey {
     Single(ReadKey),
     Pair(PairKey),
@@ -75,7 +75,38 @@ impl DupStats {
 #[derive(Clone, Debug)]
 struct TemplateWinner {
     score: u32,
-    qname: Vec<u8>,
+    qname: InlineName,
+}
+
+/// A read name stored without a heap allocation when it fits — one per distinct
+/// duplicate key. Kept verbatim rather than hashed because the score tie-break
+/// compares names lexicographically.
+#[derive(Clone, Debug)]
+enum InlineName {
+    Inline { len: u8, buf: [u8; 47] },
+    Heap(Box<[u8]>),
+}
+
+impl InlineName {
+    fn new(name: &[u8]) -> Self {
+        if name.len() <= 47 {
+            let mut buf = [0u8; 47];
+            buf[..name.len()].copy_from_slice(name);
+            Self::Inline {
+                len: name.len() as u8,
+                buf,
+            }
+        } else {
+            Self::Heap(name.into())
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, buf } => &buf[..*len as usize],
+            Self::Heap(b) => b,
+        }
+    }
 }
 
 /// Per-record dedup facts extracted once and reused in both passes.
@@ -84,6 +115,64 @@ struct Examined {
     is_pair: bool,
     qname: Vec<u8>,
     score: u32,
+}
+
+/// How many distinct duplicate keys to size the winner map for.
+///
+/// Each doubling of the map has both tables live at once, and that transient sets
+/// peak memory; one counting scan of the fixed-position fields avoids it. Whether
+/// mates share a key depends on `MC`: without it the mate's end comes from
+/// `PNEXT`, so a reverse-strand mate keys differently from itself and the input
+/// yields twice as many keys.
+fn estimate_key_count(args: &MarkdupArgs) -> Result<usize> {
+    use crate::io::RecordSummary;
+
+    let mates_share_keys = probe_mate_cigar(args)?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input (record count)")?;
+    let mut examinable: u64 = 0;
+    let mut paired: u64 = 0;
+    let mut rec = RecordSummary::default();
+    while reader.read_summary(&mut rec)? {
+        if rec.flags & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY | FLAG_UNMAP) != 0 {
+            continue;
+        }
+        examinable += 1;
+        if rec.flags & FLAG_PAIRED != 0 {
+            paired += 1;
+        }
+    }
+    let paired_input = paired * 2 > examinable;
+    let keys = if paired_input && mates_share_keys {
+        examinable / 2
+    } else {
+        examinable
+    };
+    Ok(keys as usize)
+}
+
+/// Do paired records carry `MC`? Sampled from the head of the file.
+fn probe_mate_cigar(args: &MarkdupArgs) -> Result<bool> {
+    const SAMPLE: usize = 1000;
+
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input (MC probe)")?;
+    let mut rec = RecordBuf::default();
+    let mut seen = 0usize;
+    while seen < SAMPLE && reader.read_record_buf(&mut rec)? {
+        let flags = u16::from(rec.flags());
+        if flags & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY | FLAG_UNMAP) != 0 {
+            continue;
+        }
+        if flags & FLAG_PAIRED == 0 || flags & FLAG_MUNMAP != 0 {
+            continue;
+        }
+        seen += 1;
+        if rec.data().get(&Tag::MATE_CIGAR).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn run(args: MarkdupArgs) -> Result<()> {
@@ -98,8 +187,8 @@ pub fn run(args: MarkdupArgs) -> Result<()> {
     append_pg(&mut header, &PgInfo::new("markdup", !args.no_pg))?;
 
     let barcode_tag = parse_barcode_tag(args.barcode_tag.as_deref())?;
-    let mut winners: HashMap<DupKey, TemplateWinner, std::hash::BuildHasherDefault<FxHasher>> =
-        HashMap::default();
+    let mut winners: WinnerMap =
+        HashMap::with_capacity_and_hasher(estimate_key_count(&args)?, Default::default());
     // Optical-duplicate accounting is opt-in (`-d > 0`): only then do we retain
     // per-group flow-cell coordinates, so the default path stays lean on memory.
     let mut optical: Option<HashMap<DupKey, OpticalGroup, std::hash::BuildHasherDefault<FxHasher>>> =
@@ -133,6 +222,25 @@ pub fn run(args: MarkdupArgs) -> Result<()> {
             .sum();
     }
 
+    // Supplementary and secondary records can precede their primary, so with -S
+    // the losing names must all be known before anything is written.
+    let dup_names: Option<DupNames> = if args.supplementary {
+        let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+            .context("open input (duplicate-name scan)")?;
+        let mut names = DupNames::default();
+        let mut rec = RecordBuf::default();
+        while reader.read_record_buf(&mut rec)? {
+            if let Some(ex) = examine(&rec, barcode_tag, args.mode_ancient)
+                && template_lost(&winners, &ex)
+            {
+                names.insert(ex.qname);
+            }
+        }
+        Some(names)
+    } else {
+        None
+    };
+
     // Pass 2: stream, mark every read of a losing template, write.
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input (pass 2)")?;
@@ -164,7 +272,12 @@ pub fn run(args: MarkdupArgs) -> Result<()> {
         read_total += 1;
         let dup = match examine(&rec, barcode_tag, args.mode_ancient) {
             Some(ex) => is_template_dup(&winners, &ex, &mut stats),
-            None => false,
+            None => match &dup_names {
+                Some(names) if is_supplementary_or_secondary(&rec) => {
+                    names.contains(&record_name(&rec))
+                }
+                _ => false,
+            },
         };
         if dup {
             let flags = u16::from(rec.flags()) | FLAG_DUP;
@@ -199,6 +312,9 @@ pub struct MarkdupOptions {
     /// "Ancient DNA" mode: ignore strand in the dup key (matches samtools
     /// `--mode s`). Off by default; on, more aggressive dedup.
     pub ancient: bool,
+    /// Also flag the supplementary and secondary alignments of a losing template
+    /// (`markdup -S`). Costs one read name per duplicate template.
+    pub supplementary: bool,
 }
 
 /// Mark PCR/library duplicates on `records` in place, returning stats.
@@ -234,8 +350,7 @@ pub fn mark_duplicates_in_memory(
     let barcode_tag = parse_barcode_tag(options.barcode_tag.as_deref())?;
     let ancient = options.ancient;
 
-    let mut winners: HashMap<DupKey, TemplateWinner, std::hash::BuildHasherDefault<FxHasher>> =
-        HashMap::default();
+    let mut winners: WinnerMap = HashMap::default();
     let mut stats = DupStats::default();
 
     // Pass A — pick the winning template per key.
@@ -252,15 +367,34 @@ pub fn mark_duplicates_in_memory(
     }
 
     // Pass B — flag every read whose template lost (both mates of a losing pair,
-    // never a mate of the winner).
+    // never a mate of the winner), collecting the losing names if `-S` asked for
+    // their supplementary and secondary alignments too.
+    let mut dup_names: Option<DupNames> = options.supplementary.then(DupNames::default);
     for rec in records.iter_mut() {
         let dup = match examine(rec, barcode_tag, ancient) {
-            Some(ex) => is_template_dup(&winners, &ex, &mut stats),
+            Some(ex) => {
+                let dup = is_template_dup(&winners, &ex, &mut stats);
+                if dup && let Some(names) = dup_names.as_mut() {
+                    names.insert(ex.qname);
+                }
+                dup
+            }
             None => false,
         };
         if dup {
             let cur = u16::from(rec.flags());
             *rec.flags_mut() = Flags::from(cur | FLAG_DUP);
+        }
+    }
+
+    // Pass C — the supplementary and secondary records, which pass B skipped
+    // because their own coordinates give them a different key than their primary.
+    if let Some(names) = &dup_names {
+        for rec in records.iter_mut() {
+            if is_supplementary_or_secondary(rec) && names.contains(&record_name(rec)) {
+                let cur = u16::from(rec.flags());
+                *rec.flags_mut() = Flags::from(cur | FLAG_DUP);
+            }
         }
     }
     Ok(stats)
@@ -297,47 +431,62 @@ fn examine(rec: &RecordBuf, barcode_tag: Option<Tag>, ancient: bool) -> Option<E
 /// qname breaks ties deterministically). Seeing the winner's own mate again is a
 /// no-op.
 fn update_winner(
-    winners: &mut HashMap<DupKey, TemplateWinner, std::hash::BuildHasherDefault<FxHasher>>,
+    winners: &mut WinnerMap,
     ex: Examined,
 ) {
     match winners.entry(ex.key) {
         Entry::Vacant(v) => {
             v.insert(TemplateWinner {
                 score: ex.score,
-                qname: ex.qname,
+                qname: InlineName::new(&ex.qname),
             });
         }
         Entry::Occupied(mut o) => {
             let w = o.get_mut();
-            if ex.qname == w.qname {
+            if ex.qname == w.qname.as_bytes() {
                 return; // same template (the other mate) — not a competitor
             }
-            if ex.score > w.score || (ex.score == w.score && ex.qname < w.qname) {
+            if ex.score > w.score
+                || (ex.score == w.score && ex.qname.as_slice() < w.qname.as_bytes())
+            {
                 w.score = ex.score;
-                w.qname = ex.qname;
+                w.qname = InlineName::new(&ex.qname);
             }
         }
     }
 }
 
 /// Is this record's template a duplicate (i.e. not the winner for its key)?
-/// Updates the duplicate counters on the way.
-fn is_template_dup(
-    winners: &HashMap<DupKey, TemplateWinner, std::hash::BuildHasherDefault<FxHasher>>,
-    ex: &Examined,
-    stats: &mut DupStats,
-) -> bool {
-    match winners.get(&ex.key) {
-        Some(w) if w.qname != ex.qname => {
-            if ex.is_pair {
-                stats.duplicate_pair += 1;
-            } else {
-                stats.duplicate_single += 1;
-            }
-            true
+fn template_lost(winners: &WinnerMap, ex: &Examined) -> bool {
+    matches!(winners.get(&ex.key), Some(w) if w.qname.as_bytes() != ex.qname)
+}
+
+/// [`template_lost`], also updating the duplicate counters. Call once per record.
+fn is_template_dup(winners: &WinnerMap, ex: &Examined, stats: &mut DupStats) -> bool {
+    let dup = template_lost(winners, ex);
+    if dup {
+        if ex.is_pair {
+            stats.duplicate_pair += 1;
+        } else {
+            stats.duplicate_single += 1;
         }
-        _ => false,
     }
+    dup
+}
+
+type WinnerMap = HashMap<DupKey, TemplateWinner, std::hash::BuildHasherDefault<FxHasher>>;
+
+/// Read names of the losing templates, for `-S`. Supplementary and secondary
+/// records have their own position, so their `DupKey` is not their primary's and
+/// the name is the only handle they share.
+type DupNames = std::collections::HashSet<Vec<u8>, std::hash::BuildHasherDefault<FxHasher>>;
+
+fn is_supplementary_or_secondary(rec: &RecordBuf) -> bool {
+    u16::from(rec.flags()) & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY) != 0
+}
+
+fn record_name(rec: &RecordBuf) -> Vec<u8> {
+    rec.name().map(|n| n.to_vec()).unwrap_or_default()
 }
 
 /// Mate score (`ms` tag, written by `fixmate -m`): the sum of the mate's base
@@ -376,8 +525,8 @@ struct OpticalLoc {
 /// Per-`DupKey` optical bookkeeping (only populated when `-d > 0`).
 struct OpticalGroup {
     is_pair: bool,
-    /// qname hashes already recorded, so the two mates of one template count once.
-    seen: Vec<u64>,
+    /// qname hashes already recorded, so the two mates of a template count once.
+    seen: std::collections::HashSet<u64, std::hash::BuildHasherDefault<FxHasher>>,
     locs: Vec<OpticalLoc>,
 }
 
@@ -436,54 +585,66 @@ fn optical_collect(
     loc: OpticalLoc,
 ) {
     let h = fxhash_bytes(&ex.qname);
-    let g = groups.entry(ex.key.clone()).or_insert_with(|| OpticalGroup {
+    let g = groups.entry(ex.key).or_insert_with(|| OpticalGroup {
         is_pair: ex.is_pair,
-        seen: Vec::new(),
+        seen: Default::default(),
         locs: Vec::new(),
     });
-    if !g.seen.contains(&h) {
-        g.seen.push(h);
+    if g.seen.insert(h) {
         g.locs.push(loc);
     }
 }
 
-/// Number of optical duplicates among a duplicate group: `size - cluster_count`,
-/// where two members cluster when they share a tile and are within `d` pixels in
-/// both axes (union-find).
+/// Optical duplicates in a group: `size - cluster_count`, where two members
+/// cluster when they share a tile and are within `d` pixels in both axes.
+///
+/// Sorted by `(tile, x)` so the inner loop stops once it leaves the tile or
+/// passes `x + d`; a full pairwise scan is quadratic in the group size.
 fn count_optical(locs: &[OpticalLoc], d: u32) -> u64 {
     let n = locs.len();
     if n < 2 {
         return 0;
     }
-    let mut parent: Vec<usize> = (0..n).collect();
-    fn find(parent: &mut [usize], i: usize) -> usize {
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    idx.sort_unstable_by_key(|&i| {
+        let l = &locs[i as usize];
+        (l.tile, l.x)
+    });
+
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    fn find(parent: &mut [u32], i: u32) -> u32 {
         let mut root = i;
-        while parent[root] != root {
-            root = parent[root];
+        while parent[root as usize] != root {
+            root = parent[root as usize];
         }
         let mut cur = i;
-        while parent[cur] != root {
-            let next = parent[cur];
-            parent[cur] = root;
+        while parent[cur as usize] != root {
+            let next = parent[cur as usize];
+            parent[cur as usize] = root;
             cur = next;
         }
         root
     }
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if locs[i].tile == locs[j].tile
-                && (locs[i].x - locs[j].x).unsigned_abs() <= d
-                && (locs[i].y - locs[j].y).unsigned_abs() <= d
-            {
+
+    let d = d as i64;
+    for a in 0..n {
+        let i = idx[a];
+        let li = locs[i as usize];
+        for &j in &idx[a + 1..] {
+            let lj = &locs[j as usize];
+            if lj.tile != li.tile || (lj.x as i64 - li.x as i64) > d {
+                break;
+            }
+            if (lj.y as i64 - li.y as i64).abs() <= d {
                 let ri = find(&mut parent, i);
                 let rj = find(&mut parent, j);
                 if ri != rj {
-                    parent[ri] = rj;
+                    parent[ri as usize] = rj;
                 }
             }
         }
     }
-    let clusters = (0..n).filter(|&i| find(&mut parent, i) == i).count();
+    let clusters = (0..n as u32).filter(|&i| find(&mut parent, i) == i).count();
     (n - clusters) as u64
 }
 
@@ -496,13 +657,14 @@ fn parse_barcode_tag(s: Option<&str>) -> Result<Option<Tag>> {
     Ok(Some(Tag::from([bytes[0], bytes[1]])))
 }
 
-fn extract_barcode(rec: &RecordBuf, tag: Option<Tag>) -> Vec<u8> {
+/// Barcode identity as a hash; 0 means "no barcode".
+fn extract_barcode(rec: &RecordBuf, tag: Option<Tag>) -> u64 {
     use noodles_sam::alignment::record_buf::data::field::Value;
-    let Some(t) = tag else { return Vec::new() };
+    let Some(t) = tag else { return 0 };
     match rec.data().get(&t) {
-        Some(Value::String(s)) => s.to_vec(),
-        Some(Value::Hex(s)) => s.to_vec(),
-        _ => Vec::new(),
+        Some(Value::String(s)) => fxhash_bytes(s),
+        Some(Value::Hex(s)) => fxhash_bytes(s),
+        _ => 0,
     }
 }
 
@@ -898,6 +1060,64 @@ mod optical_tests {
         assert_eq!(count_optical(&[a, b], 5), 1);
         assert_eq!(count_optical(&[a, c], 5), 0); // 2 locs - 2 clusters
         assert_eq!(count_optical(&[a], 5), 0);
+    }
+
+    /// Full pairwise reference for the pruned [`count_optical`].
+    fn count_optical_naive(locs: &[OpticalLoc], d: u32) -> u64 {
+        let n = locs.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn root(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                i = parent[i];
+            }
+            i
+        }
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if locs[i].tile == locs[j].tile
+                    && (locs[i].x - locs[j].x).unsigned_abs() <= d
+                    && (locs[i].y - locs[j].y).unsigned_abs() <= d
+                {
+                    let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                }
+            }
+        }
+        let clusters = (0..n).filter(|&i| root(&mut parent, i) == i).count();
+        (n - clusters) as u64
+    }
+
+    #[test]
+    fn pruned_clustering_matches_full_pairwise_scan() {
+        let mut state = 0x5EED_1234_ABCD_0001u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..3000 {
+            let n = (next() % 40) as usize;
+            // Tight ranges and few tiles, so transitive chains actually form.
+            let spread = 1 + (case % 30);
+            let tiles = 1 + (case % 3) as u64;
+            let locs: Vec<OpticalLoc> = (0..n)
+                .map(|_| OpticalLoc {
+                    tile: next() % tiles,
+                    x: (next() % (spread as u64 * 4)) as i32,
+                    y: (next() % (spread as u64 * 4)) as i32,
+                })
+                .collect();
+            for d in [0u32, 1, 3, spread as u32, spread as u32 * 4] {
+                assert_eq!(
+                    count_optical(&locs, d),
+                    count_optical_naive(&locs, d),
+                    "n={n} d={d} spread={spread} locs={locs:?}"
+                );
+            }
+        }
     }
 
     #[test]

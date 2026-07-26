@@ -9,7 +9,8 @@ use crate::cli::HeadArgs;
 use crate::io::BamReader;
 
 pub fn run(args: HeadArgs) -> Result<()> {
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let header = reader.header().clone();
 
     let mut out: Box<dyn Write> = match &args.output {

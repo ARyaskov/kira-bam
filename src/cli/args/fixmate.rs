@@ -37,4 +37,14 @@ pub struct FixmateArgs {
     /// Do not append a @PG record to the output header.
     #[arg(long = "no-PG")]
     pub no_pg: bool,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
+    #[arg(short = 'T', long = "reference")]
+    pub reference: Option<PathBuf>,
+
+    /// Proceed even though the header does not declare queryname sort / query
+    /// grouping. Only correct if the mates really are adjacent — otherwise every
+    /// read is treated as a singleton and the mate fields are destroyed.
+    #[arg(long = "assume-query-grouped")]
+    pub assume_query_grouped: bool,
 }

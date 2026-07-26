@@ -40,4 +40,8 @@ pub struct FastqArgs {
     /// Collate reads by name (assume input is not name-sorted).
     #[arg(long = "collate")]
     pub collate: bool,
+
+    /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
+    #[arg(short = 'T', long = "reference")]
+    pub reference: Option<PathBuf>,
 }

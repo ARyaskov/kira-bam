@@ -16,7 +16,8 @@ pub fn run(args: SamplesArgs) -> Result<()> {
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for input in &args.inputs {
-        let reader = BamReader::open(input).with_context(|| format!("open {}", input.display()))?;
+        let reader = BamReader::open_with_reference(input, args.reference.as_deref())
+                .with_context(|| format!("open {}", input.display()))?;
         let header = reader.header();
         for (rg_id, rg_map) in header.read_groups() {
             let sm = rg_map

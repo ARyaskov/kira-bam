@@ -13,7 +13,8 @@ pub fn run(args: CollateArgs) -> Result<()> {
     // Simple in-memory implementation: group by qname hash.
     // For huge files we'd spill — but this fits the README's "early development" disclaimer.
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let mut header = reader.header().clone();
     append_pg(&mut header, &PgInfo::new("collate", !args.no_pg))?;
 

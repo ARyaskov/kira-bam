@@ -12,7 +12,8 @@ use crate::types::OutputFormat;
 pub fn run(args: AddReplaceRgArgs) -> Result<()> {
     install_thread_pool(args.threads);
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let mut header = reader.header().clone();
     let (rg_id, rg_map) = parse_rg_line(&args.rg_line)?;
     header.read_groups_mut().insert(rg_id.clone(), rg_map);

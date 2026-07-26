@@ -8,7 +8,8 @@ use crate::io::BamReader;
 use crate::pileup::PileupIter;
 
 pub fn run(args: ConsensusArgs) -> Result<()> {
-    let reader = BamReader::open(&args.input).context("open input")?;
+    let reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let header = reader.header().clone();
 
     let mut out: Box<dyn Write> = match &args.output {
@@ -22,7 +23,8 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
     let mut last_pos: usize = 0;
     let mut line_pos: usize = 0;
 
-    while let Some((tid, pos, col)) = pileup.next_column()? {
+    let mut col: Vec<(u8, u8)> = Vec::new();
+    while let Some((tid, pos)) = pileup.next_column_into(&mut col)? {
         if current_tid != Some(tid) {
             if current_tid.is_some() {
                 writeln!(out)?;

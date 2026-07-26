@@ -90,7 +90,8 @@ pub fn run(args: StatsArgs) -> Result<()> {
         None => None,
     };
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+        .context("open input")?;
     let header = reader.header().clone();
     let mut st = Stats {
         insert_size_hist: vec![0; MAX_INSERT_SIZE + 1],

@@ -18,7 +18,8 @@ pub fn run(args: CalmdArgs) -> Result<()> {
 
     let refs = load_reference(&args.reference)?;
 
-    let mut reader = BamReader::open(&args.input).context("open input")?;
+    let mut reader = BamReader::open_with_reference(&args.input, Some(&args.reference))
+        .context("open input")?;
     let mut header = reader.header().clone();
     append_pg(&mut header, &PgInfo::new("calmd", !args.no_pg))?;
 

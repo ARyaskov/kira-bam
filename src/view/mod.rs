@@ -4,7 +4,10 @@ use noodles_core::Region;
 use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::ViewArgs;
-use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
+use crate::io::{
+    BamReader, BamWriter, PgInfo, RecordSummary, append_pg, install_thread_pool,
+    is_record_level_error,
+};
 use crate::types::OutputFormat;
 
 pub fn run(args: ViewArgs) -> Result<()> {
@@ -39,10 +42,11 @@ fn run_streaming(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let mut header = reader.header().clone();
+    let exclude = resolve_exclude_regions(&args.exclude_regions, &header)?;
     append_pg(&mut header, &PgInfo::new("view", !args.no_pg))?;
 
     if args.count {
-        return count_only_stream(&mut reader, &args);
+        return count_only_stream(&mut reader, &args, &exclude);
     }
 
     let mut writer = BamWriter::create_with_reference(
@@ -69,14 +73,18 @@ fn run_streaming(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
     let mut rec = crate::io::Record::default();
     let mut skipped: u64 = 0;
     while reader.read_record_buf(&mut rec)? {
-        if !pass_filters(&rec, &args) {
+        if !pass_filters(&rec, &args, &exclude) {
             continue;
         }
         if args.drop_tags {
             rec.data_mut().clear();
         }
-        // noodles is stricter than samtools on per-record validity; soft-skip to stay tolerant.
+        // noodles is stricter than samtools on record validity; skip those, but
+        // let a failing output stream through.
         if let Err(e) = writer.write_record_buf(&rec) {
+            if !is_record_level_error(&e) {
+                return Err(e);
+            }
             skipped += 1;
             if skipped <= 5 {
                 eprintln!("[kira-bam] skip record: {e:#}");
@@ -86,10 +94,14 @@ fn run_streaming(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
         }
     }
     writer.finish()?;
-    if skipped > 0 {
-        eprintln!("[kira-bam] {skipped} records skipped due to write errors");
-    }
+    report_skipped(skipped);
     Ok(())
+}
+
+fn report_skipped(skipped: u64) {
+    if skipped > 0 {
+        eprintln!("[kira-bam] {skipped} records skipped as invalid");
+    }
 }
 
 fn run_regions(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
@@ -97,12 +109,13 @@ fn run_regions(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
         .build_from_path(&args.input)
         .context("open indexed BAM (region query needs .bai or .csi)")?;
     let mut header = idx_reader.read_header().context("read indexed header")?;
+    let exclude = resolve_exclude_regions(&args.exclude_regions, &header)?;
     append_pg(&mut header, &PgInfo::new("view", !args.no_pg))?;
 
     if args.count {
         let mut n: u64 = 0;
         for spec in &args.regions {
-            n += count_region(&mut idx_reader, &header, spec, &args)?;
+            n += count_region(&mut idx_reader, &header, spec, &args, &exclude)?;
         }
         println!("{n}");
         return Ok(());
@@ -129,20 +142,27 @@ fn run_regions(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
     }
 
     let mut skipped: u64 = 0;
+    let mut emit = |buf: &mut RecordBuf, skipped: &mut u64| -> Result<()> {
+        if !pass_filters(buf, &args, &exclude) {
+            return Ok(());
+        }
+        if args.drop_tags {
+            buf.data_mut().clear();
+        }
+        if let Err(e) = writer.write_record_buf(buf) {
+            if !is_record_level_error(&e) {
+                return Err(e);
+            }
+            *skipped += 1;
+        }
+        Ok(())
+    };
     for spec in &args.regions {
         if spec == "*" {
             for rec_result in idx_reader.query_unmapped().context("query unmapped")? {
                 let rec = rec_result.context("read unmapped record")?;
                 let mut buf = RecordBuf::try_from_alignment_record(&header, &rec)?;
-                if !pass_filters(&buf, &args) {
-                    continue;
-                }
-                if args.drop_tags {
-                    buf.data_mut().clear();
-                }
-                if writer.write_record_buf(&buf).is_err() {
-                    skipped += 1;
-                }
+                emit(&mut buf, &mut skipped)?;
             }
         } else {
             let region: Region = spec
@@ -154,35 +174,55 @@ fn run_regions(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
             for rec_result in query.records() {
                 let rec = rec_result.context("read region record")?;
                 let mut buf = RecordBuf::try_from_alignment_record(&header, &rec)?;
-                if !pass_filters(&buf, &args) {
-                    continue;
-                }
-                if args.drop_tags {
-                    buf.data_mut().clear();
-                }
-                if writer.write_record_buf(&buf).is_err() {
-                    skipped += 1;
-                }
+                emit(&mut buf, &mut skipped)?;
             }
         }
     }
     writer.finish()?;
-    if skipped > 0 {
-        eprintln!("[kira-bam] {skipped} records skipped due to write errors");
-    }
+    report_skipped(skipped);
     Ok(())
 }
 
-fn count_only_stream(reader: &mut BamReader, args: &ViewArgs) -> Result<()> {
+fn count_only_stream(
+    reader: &mut BamReader,
+    args: &ViewArgs,
+    exclude: &[ExcludeRegion],
+) -> Result<()> {
     let mut n: u64 = 0;
-    let mut rec = crate::io::Record::default();
-    while reader.read_record_buf(&mut rec)? {
-        if pass_filters(&rec, args) {
-            n += 1;
+    if !exclude.is_empty() {
+        // `-v` needs the alignment end, hence the CIGAR.
+        let mut rec = crate::io::Record::default();
+        while reader.read_record_buf(&mut rec)? {
+            if pass_filters(&rec, args, exclude) {
+                n += 1;
+            }
+        }
+    } else {
+        let mut rec = RecordSummary::default();
+        while reader.read_summary(&mut rec)? {
+            if summary_passes(&rec, args) {
+                n += 1;
+            }
         }
     }
     println!("{n}");
     Ok(())
+}
+
+/// The flag and MAPQ half of [`pass_filters`]. Region exclusion is excluded: it
+/// needs an alignment end, which the summary does not carry.
+fn summary_passes(rec: &RecordSummary, args: &ViewArgs) -> bool {
+    if args.require_flags != 0 && (rec.flags & args.require_flags) != args.require_flags {
+        return false;
+    }
+    if args.filter_flags != 0 && (rec.flags & args.filter_flags) != 0 {
+        return false;
+    }
+    match rec.mapping_quality {
+        Some(mapq) if mapq < args.min_mapq => false,
+        None if args.min_mapq > 0 => false,
+        _ => true,
+    }
 }
 
 fn count_region<R>(
@@ -190,6 +230,7 @@ fn count_region<R>(
     header: &noodles_sam::Header,
     spec: &str,
     args: &ViewArgs,
+    exclude: &[ExcludeRegion],
 ) -> Result<u64>
 where
     R: noodles_bgzf::io::BufRead + noodles_bgzf::io::Seek,
@@ -199,7 +240,7 @@ where
         for rec_result in reader.query_unmapped()? {
             let rec = rec_result?;
             let buf = RecordBuf::try_from_alignment_record(header, &rec)?;
-            if pass_filters(&buf, args) {
+            if pass_filters(&buf, args, exclude) {
                 n += 1;
             }
         }
@@ -211,7 +252,7 @@ where
         for rec_result in query.records() {
             let rec = rec_result?;
             let buf = RecordBuf::try_from_alignment_record(header, &rec)?;
-            if pass_filters(&buf, args) {
+            if pass_filters(&buf, args, exclude) {
                 n += 1;
             }
         }
@@ -219,7 +260,54 @@ where
     Ok(n)
 }
 
-fn pass_filters(rec: &crate::io::Record, args: &ViewArgs) -> bool {
+/// A `-v` exclusion resolved against the header: reference id plus a 1-based
+/// inclusive span.
+#[derive(Clone, Copy, Debug)]
+struct ExcludeRegion {
+    tid: usize,
+    start: u64,
+    end: u64,
+}
+
+/// Parse `chr`, `chr:start` or `chr:start-end` against `header`. An unknown name
+/// is an error, not a filter that silently matches nothing.
+fn resolve_exclude_regions(
+    specs: &[String],
+    header: &noodles_sam::Header,
+) -> Result<Vec<ExcludeRegion>> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (name, range) = match spec.rsplit_once(':') {
+            Some((name, range)) => (name, Some(range)),
+            None => (spec.as_str(), None),
+        };
+        let tid = header
+            .reference_sequences()
+            .get_index_of(name.as_bytes())
+            .with_context(|| format!("-v {spec}: no reference sequence named {name:?}"))?;
+        let (start, end) = match range {
+            None => (1, u64::MAX),
+            Some(range) => {
+                let parse = |s: &str, what: &str| -> Result<u64> {
+                    s.replace(',', "")
+                        .parse::<u64>()
+                        .with_context(|| format!("-v {spec}: bad {what}"))
+                };
+                match range.split_once('-') {
+                    Some((a, b)) if !b.is_empty() => {
+                        (parse(a, "start")?, parse(b, "end")?)
+                    }
+                    Some((a, _)) => (parse(a, "start")?, u64::MAX),
+                    None => (parse(range, "start")?, u64::MAX),
+                }
+            }
+        };
+        out.push(ExcludeRegion { tid, start, end });
+    }
+    Ok(out)
+}
+
+fn pass_filters(rec: &crate::io::Record, args: &ViewArgs, exclude: &[ExcludeRegion]) -> bool {
     let flags = u16::from(rec.flags());
     if args.require_flags != 0 && (flags & args.require_flags) != args.require_flags {
         return false;
@@ -234,50 +322,26 @@ fn pass_filters(rec: &crate::io::Record, args: &ViewArgs) -> bool {
     } else if args.min_mapq > 0 {
         return false;
     }
-    // -v REGION exclusion (samtools PR #669). Naive impl: parse spec as
-    // `chr` or `chr:start-end` and drop if record's [start,end] overlaps.
-    if !args.exclude_regions.is_empty()
-        && let Some(_tid) = rec.reference_sequence_id()
-    {
-        // We compare against the textual ref name. Slow per-record;
-        // acceptable for small exclude lists.
-        for spec in &args.exclude_regions {
-            if record_in_region_spec(rec, spec) {
-                return false;
-            }
-        }
+    if !exclude.is_empty() && record_excluded(rec, exclude) {
+        return false;
     }
     true
 }
 
-fn record_in_region_spec(rec: &crate::io::Record, spec: &str) -> bool {
-    // Parse `chr` or `chr:start-end` (1-based inclusive).
-    let (chr, start, end) = if let Some(colon) = spec.find(':') {
-        let (c, rest) = spec.split_at(colon);
-        let rest = &rest[1..];
-        if let Some(dash) = rest.find('-') {
-            let (a, b) = rest.split_at(dash);
-            let b = &b[1..];
-            (c.to_string(), a.parse::<u64>().ok(), b.parse::<u64>().ok())
-        } else {
-            (c.to_string(), rest.parse::<u64>().ok(), None)
-        }
-    } else {
-        (spec.to_string(), None, None)
+/// Does the record overlap any `-v` region? Unplaced records never do.
+fn record_excluded(rec: &crate::io::Record, exclude: &[ExcludeRegion]) -> bool {
+    let Some(tid) = rec.reference_sequence_id() else {
+        return false;
     };
-    // Without header context here we can't validate chr names; rely on caller
-    // to feed sensible specs. Compare by position only.
-    let r_start = match rec.alignment_start() {
-        Some(p) => usize::from(p) as u64,
-        None => return false,
+    let Some(start) = rec.alignment_start() else {
+        return false;
     };
+    let r_start = usize::from(start) as u64;
     let r_end = rec
         .alignment_end()
         .map(|p| usize::from(p) as u64)
         .unwrap_or(r_start);
-    let s = start.unwrap_or(0);
-    let e = end.unwrap_or(u64::MAX);
-    let overlaps = r_end >= s && r_start <= e;
-    let _ = chr; // chr validation is left for indexed path; here we accept overlap-by-position.
-    overlaps
+    exclude
+        .iter()
+        .any(|r| r.tid == tid && r_end >= r.start && r_start <= r.end)
 }

@@ -44,4 +44,14 @@ pub struct FastqArgs {
     /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
     #[arg(short = 'T', long = "reference")]
     pub reference: Option<PathBuf>,
+
+    /// Directory for the temporary files `--collate` groups reads through.
+    /// Long-only: `-T` already names the reference here.
+    #[arg(long = "tmpdir")]
+    pub tmpdir: Option<PathBuf>,
+
+    /// Number of temporary files `--collate` hashes read names across. More
+    /// files means less memory per file, at the cost of open descriptors.
+    #[arg(long = "buckets", default_value_t = 64)]
+    pub buckets: usize,
 }

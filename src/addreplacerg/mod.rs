@@ -6,7 +6,10 @@ use noodles_sam::alignment::record_buf::data::field::Value;
 use noodles_sam::header::record::value::{Map, map::ReadGroup, map::read_group::tag as rg_tag};
 
 use crate::cli::AddReplaceRgArgs;
-use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
+use crate::io::{
+    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, report_skipped,
+    write_record_tolerant,
+};
 use crate::types::OutputFormat;
 
 pub fn run(args: AddReplaceRgArgs) -> Result<()> {
@@ -29,6 +32,7 @@ pub fn run(args: AddReplaceRgArgs) -> Result<()> {
 
     let mode = args.mode.as_str();
     let mut rec = RecordBuf::default();
+    let mut skipped = 0u64;
     while reader.read_record_buf(&mut rec)? {
         let has_rg = rec.data().get(&Tag::READ_GROUP).is_some();
         let should_set = match mode {
@@ -41,9 +45,10 @@ pub fn run(args: AddReplaceRgArgs) -> Result<()> {
             rec.data_mut()
                 .insert(Tag::READ_GROUP, Value::String(rg_id.clone()));
         }
-        let _ = writer.write_record_buf(&rec);
+        write_record_tolerant(&mut writer, &rec, "addreplacerg", &mut skipped)?;
     }
     writer.finish()?;
+    report_skipped("addreplacerg", skipped);
     Ok(())
 }
 

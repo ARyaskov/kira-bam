@@ -124,55 +124,74 @@ struct Examined {
 /// mates share a key depends on `MC`: without it the mate's end comes from
 /// `PNEXT`, so a reverse-strand mate keys differently from itself and the input
 /// yields twice as many keys.
+/// Extrapolated from a sample at the head of the file rather than counted by a
+/// full pass.
+///
+/// The exact count cost a complete extra decompression of the input purely to
+/// size a hash map. A sample plus the compressed file size lands within a
+/// factor of two on real data, which is all presizing needs: it exists to avoid
+/// repeated doubling from empty, not to be exact. The estimate is clamped so a
+/// pathological sample cannot ask for an absurd allocation.
 fn estimate_key_count(args: &MarkdupArgs) -> Result<usize> {
-    use crate::io::RecordSummary;
+    const SAMPLE: usize = 1000;
+    const MIN_CAPACITY: usize = 1 << 12;
+    const MAX_CAPACITY: usize = 1 << 28;
+    const FALLBACK_CAPACITY: usize = 1 << 20;
 
-    let mates_share_keys = probe_mate_cigar(args)?;
+    let file_size = std::fs::metadata(&args.input).map(|m| m.len()).unwrap_or(0);
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
-        .context("open input (record count)")?;
+        .context("open input (probe)")?;
+    let header_end = reader.compressed_position();
+
+    let mut rec = RecordBuf::default();
+    let mut seen: u64 = 0;
     let mut examinable: u64 = 0;
     let mut paired: u64 = 0;
-    let mut rec = RecordSummary::default();
-    while reader.read_summary(&mut rec)? {
-        if rec.flags & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY | FLAG_UNMAP) != 0 {
-            continue;
-        }
-        examinable += 1;
-        if rec.flags & FLAG_PAIRED != 0 {
-            paired += 1;
-        }
-    }
-    let paired_input = paired * 2 > examinable;
-    let keys = if paired_input && mates_share_keys {
-        examinable / 2
-    } else {
-        examinable
-    };
-    Ok(keys as usize)
-}
+    let mut mates_share_keys = false;
 
-/// Do paired records carry `MC`? Sampled from the head of the file.
-fn probe_mate_cigar(args: &MarkdupArgs) -> Result<bool> {
-    const SAMPLE: usize = 1000;
-
-    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
-        .context("open input (MC probe)")?;
-    let mut rec = RecordBuf::default();
-    let mut seen = 0usize;
-    while seen < SAMPLE && reader.read_record_buf(&mut rec)? {
+    while seen < SAMPLE as u64 && reader.read_record_buf(&mut rec)? {
+        seen += 1;
         let flags = u16::from(rec.flags());
         if flags & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY | FLAG_UNMAP) != 0 {
             continue;
         }
-        if flags & FLAG_PAIRED == 0 || flags & FLAG_MUNMAP != 0 {
-            continue;
-        }
-        seen += 1;
-        if rec.data().get(&Tag::MATE_CIGAR).is_some() {
-            return Ok(true);
+        examinable += 1;
+        if flags & FLAG_PAIRED != 0 {
+            paired += 1;
+            // Whether mates share a key depends on `MC`: without it the mate's
+            // end comes from `PNEXT`, so a reverse-strand mate keys differently
+            // from itself and the input yields twice as many keys.
+            if flags & FLAG_MUNMAP == 0 && rec.data().get(&Tag::MATE_CIGAR).is_some() {
+                mates_share_keys = true;
+            }
         }
     }
-    Ok(false)
+
+    if seen == 0 {
+        return Ok(MIN_CAPACITY);
+    }
+
+    // Scale the sample up by how much of the compressed file it covered.
+    let sampled_bytes = match (header_end, reader.compressed_position()) {
+        (Some(start), Some(end)) => end.saturating_sub(start),
+        // SAM and CRAM have no compressed offset to measure against.
+        _ => 0,
+    };
+    let total_records = if sampled_bytes > 0 && file_size > 0 {
+        let body = file_size.saturating_sub(header_end.unwrap_or(0));
+        seen.saturating_mul(body) / sampled_bytes
+    } else {
+        return Ok(FALLBACK_CAPACITY);
+    };
+
+    let examinable_total = total_records.saturating_mul(examinable) / seen;
+    let paired_input = paired * 2 > examinable;
+    let keys = if paired_input && mates_share_keys {
+        examinable_total / 2
+    } else {
+        examinable_total
+    };
+    Ok((keys as usize).clamp(MIN_CAPACITY, MAX_CAPACITY))
 }
 
 pub fn run(args: MarkdupArgs) -> Result<()> {
@@ -191,8 +210,9 @@ pub fn run(args: MarkdupArgs) -> Result<()> {
         HashMap::with_capacity_and_hasher(estimate_key_count(&args)?, Default::default());
     // Optical-duplicate accounting is opt-in (`-d > 0`): only then do we retain
     // per-group flow-cell coordinates, so the default path stays lean on memory.
-    let mut optical: Option<HashMap<DupKey, OpticalGroup, std::hash::BuildHasherDefault<FxHasher>>> =
-        (optical_distance > 0).then(HashMap::default);
+    let mut optical: Option<
+        HashMap<DupKey, OpticalGroup, std::hash::BuildHasherDefault<FxHasher>>,
+    > = (optical_distance > 0).then(HashMap::default);
     let mut stats = DupStats::default();
 
     let mut rec = RecordBuf::default();
@@ -417,8 +437,12 @@ fn examine(rec: &RecordBuf, barcode_tag: Option<Tag>, ancient: bool) -> Option<E
     // tag from `fixmate -m`), so BOTH mates compute the same value and we rank
     // whole templates. Without `ms` we use the read's own quality — still
     // template-consistent for marking, just a coarser tiebreak.
-    let score =
-        base_quality_sum(rec) + if is_pair { mate_score(rec).unwrap_or(0) } else { 0 };
+    let score = base_quality_sum(rec)
+        + if is_pair {
+            mate_score(rec).unwrap_or(0)
+        } else {
+            0
+        };
     Some(Examined {
         key,
         is_pair,
@@ -430,10 +454,7 @@ fn examine(rec: &RecordBuf, barcode_tag: Option<Tag>, ancient: bool) -> Option<E
 /// Fold one examined record into the per-key winner map (higher score wins;
 /// qname breaks ties deterministically). Seeing the winner's own mate again is a
 /// no-op.
-fn update_winner(
-    winners: &mut WinnerMap,
-    ex: Examined,
-) {
+fn update_winner(winners: &mut WinnerMap, ex: Examined) {
     match winners.entry(ex.key) {
         Entry::Vacant(v) => {
             v.insert(TemplateWinner {
@@ -830,7 +851,11 @@ fn parse_mate_cigar_clips(mc: &[u8]) -> Option<(i32, i32, i32)> {
             }
         }
     }
-    if !saw_op { None } else { Some((leading, trailing, ref_span)) }
+    if !saw_op {
+        None
+    } else {
+        Some((leading, trailing, ref_span))
+    }
 }
 
 fn base_quality_sum(rec: &RecordBuf) -> u32 {

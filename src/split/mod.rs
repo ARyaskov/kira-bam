@@ -8,7 +8,10 @@ use noodles_sam::alignment::record_buf::data::field::Value;
 use rustc_hash::FxHasher;
 
 use crate::cli::SplitArgs;
-use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
+use crate::io::{
+    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, report_skipped,
+    write_record_tolerant,
+};
 use crate::types::OutputFormat;
 
 pub fn run(args: SplitArgs) -> Result<()> {
@@ -33,12 +36,27 @@ pub fn run(args: SplitArgs) -> Result<()> {
         HashMap::default();
 
     let mut rec = RecordBuf::default();
+    let mut skipped = 0u64;
     while reader.read_record_buf(&mut rec)? {
         let key = extract_tag_string(&rec, tag).unwrap_or_else(|| b"unknown".to_vec());
         let key_str = String::from_utf8_lossy(&key).into_owned();
         let writer = if let Some(w) = writers.get_mut(&key_str) {
             w
         } else {
+            // A BAM writer cannot be reopened once its BGZF EOF block is out, so
+            // every distinct value has to stay open for the whole pass. Refuse
+            // loudly at the cap rather than let the OS report a bare
+            // "too many open files" halfway through.
+            if writers.len() >= args.max_outputs {
+                anyhow::bail!(
+                    "tag {} has more than {} distinct values (at {:?}); each needs its own \
+                     open output file. Raise --max-outputs if your fd limit allows, or split \
+                     on a lower-cardinality tag.",
+                    args.tag,
+                    args.max_outputs,
+                    key_str
+                );
+            }
             let out = expand_format(&args.format, input_stem, &key_str);
             let mut hh = header.clone();
             append_pg(&mut hh, &PgInfo::new("split", !args.no_pg))?;
@@ -47,11 +65,12 @@ pub fn run(args: SplitArgs) -> Result<()> {
             writers.insert(key_str.clone(), w);
             writers.get_mut(&key_str).unwrap()
         };
-        let _ = writer.write_record_buf(&rec);
+        write_record_tolerant(writer, &rec, "split", &mut skipped)?;
     }
     for (_, w) in writers {
         w.finish()?;
     }
+    report_skipped("split", skipped);
     Ok(())
 }
 

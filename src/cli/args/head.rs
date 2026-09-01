@@ -3,8 +3,16 @@ use std::path::PathBuf;
 use clap::Parser;
 
 /// Print first N records of a BAM/SAM.
+/// `-h` is the header-line count here, as in samtools head, so clap's
+/// auto-generated short help flag is turned off and `--help` declared
+/// explicitly.
 #[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
 pub struct HeadArgs {
+    /// Print help.
+    #[arg(long = "help", action = clap::ArgAction::Help)]
+    pub help: Option<bool>,
+
     /// Input.
     #[arg(value_name = "IN")]
     pub input: PathBuf,

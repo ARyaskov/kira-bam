@@ -2,8 +2,17 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+/// `-h` means "with header" here, as it does in samtools, so clap's
+/// auto-generated short help flag is turned off and `--help` declared
+/// explicitly. Leaving both on `-h` tripped clap's uniqueness assertion, which
+/// failed `cli_definition_is_valid` and made `-h` ambiguous in release builds.
 #[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
 pub struct ViewArgs {
+    /// Print help.
+    #[arg(long = "help", action = clap::ArgAction::Help)]
+    pub help: Option<bool>,
+
     /// Input file (SAM/BAM, or `-` for stdin).
     #[arg(value_name = "IN")]
     pub input: PathBuf,

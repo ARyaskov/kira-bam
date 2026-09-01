@@ -22,15 +22,46 @@ const ALL_COLUMNS: [&str; 9] = [
     "meanmapq",
 ];
 
+/// One bit per reference base, packed 64 to a word.
+///
+/// A byte per base cost ~3.1 GB across a human reference — and the whole
+/// reference was allocated up front, `-r` or not. Bits cut that eightfold, and
+/// only the contigs actually reported get allocated at all.
+#[derive(Default)]
+struct CoveredBits {
+    words: Vec<u64>,
+    /// Bases set so far, counted as they are set rather than by a final scan
+    /// over every base of the contig.
+    popcount: u64,
+}
+
+impl CoveredBits {
+    fn with_len(len: usize) -> Self {
+        Self {
+            words: vec![0u64; len.div_ceil(64)],
+            popcount: 0,
+        }
+    }
+
+    /// Mark the 0-based position `i` covered.
+    fn set(&mut self, i: usize) {
+        let (word, bit) = (i / 64, i % 64);
+        let mask = 1u64 << bit;
+        if let Some(w) = self.words.get_mut(word)
+            && *w & mask == 0
+        {
+            *w |= mask;
+            self.popcount += 1;
+        }
+    }
+}
+
 #[derive(Default)]
 struct RefStats {
     name: String,
     length: usize,
     numreads: u64,
-    /// Bitmap (one u8 per base, 1 = covered). Compact at 1 byte/base; for chr1 ≈ 250 MB.
-    /// Fine in practice, awful for whole-genome single-ref.
-    /// TODO: use BitSet for memory.
-    covered: Vec<u8>,
+    covered: CoveredBits,
     sum_depth: u64,
     sum_baseq: u64,
     sum_baseq_n: u64,
@@ -48,15 +79,21 @@ pub fn run(args: CoverageArgs) -> Result<()> {
     let mut stats: HashMap<usize, RefStats, std::hash::BuildHasherDefault<FxHasher>> =
         HashMap::default();
 
-    // Pre-populate so refs with zero reads still get a row.
+    // Pre-populate so refs with zero reads still get a row — but only the ones
+    // `-r` asks for. Allocating a bitmap for every contig regardless meant a
+    // single-region run still paid for the whole genome.
     for (i, (name, sq)) in header.reference_sequences().iter().enumerate() {
+        let name = name.to_string();
+        if !args.regions.is_empty() && !args.regions.contains(&name) {
+            continue;
+        }
         let len = usize::from(sq.length());
         stats.insert(
             i,
             RefStats {
-                name: name.to_string(),
+                name,
                 length: len,
-                covered: vec![0u8; len],
+                covered: CoveredBits::with_len(len),
                 ..Default::default()
             },
         );
@@ -81,7 +118,10 @@ pub fn run(args: CoverageArgs) -> Result<()> {
             Some(p) => usize::from(p),
             None => continue,
         };
-        let st = stats.get_mut(&tid).unwrap();
+        // Absent when `-r` excluded this contig.
+        let Some(st) = stats.get_mut(&tid) else {
+            continue;
+        };
         st.numreads += 1;
         let mapq = rec.mapping_quality().map(u8::from).unwrap_or(0) as u64;
         st.sum_mapq += mapq;
@@ -107,7 +147,7 @@ pub fn run(args: CoverageArgs) -> Result<()> {
                     if ref_pos >= 1 && ref_pos <= st.length {
                         let q = quals.get(read_idx).copied().unwrap_or(0);
                         if q >= args.min_baseq {
-                            st.covered[ref_pos - 1] = 1;
+                            st.covered.set(ref_pos - 1);
                             st.sum_depth += 1;
                             st.sum_baseq += q as u64;
                             st.sum_baseq_n += 1;
@@ -143,10 +183,9 @@ pub fn run(args: CoverageArgs) -> Result<()> {
     rows.sort_by_key(|r| header_index(&header, &r.name));
 
     for st in rows {
-        if !args.regions.is_empty() && !args.regions.iter().any(|r| r == &st.name) {
-            continue;
-        }
-        let covbases: u64 = st.covered.iter().map(|&b| b as u64).sum();
+        // Maintained as bases are marked, rather than an O(contig length) scan
+        // per row at the end.
+        let covbases: u64 = st.covered.popcount;
         let coverage_pct = if st.length > 0 {
             100.0 * covbases as f64 / st.length as f64
         } else {

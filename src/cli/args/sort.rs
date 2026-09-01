@@ -36,8 +36,10 @@ pub struct SortArgs {
     #[arg(short = 'l', long = "compression-level", value_name = "INT")]
     pub compression_level: Option<u8>,
 
-    /// Reference FASTA — only needed when input or output is CRAM.
-    #[arg(short = 'T', long = "reference")]
+    /// Reference FASTA — only needed when input or output is CRAM. Long-only:
+    /// `-T` is the tmp dir here, as in samtools sort. Both were bound to `-T`,
+    /// which tripped clap's uniqueness assertion and left the flag ambiguous.
+    #[arg(long = "reference")]
     pub reference: Option<PathBuf>,
 
     /// Drop records without all of these flag bits set (samtools issue #912).

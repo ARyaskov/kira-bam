@@ -25,6 +25,12 @@ pub struct SplitArgs {
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 
+    /// Cap on simultaneously open output files. Every distinct tag value needs
+    /// its own writer (an fd plus a ~1 MiB buffer), so an unbounded split on a
+    /// high-cardinality tag such as `CB` exhausts the process fd limit.
+    #[arg(long = "max-outputs", default_value_t = 256)]
+    pub max_outputs: usize,
+
     /// Reference FASTA, required to decode CRAM input (`.fai` must exist alongside).
     #[arg(short = 'T', long = "reference")]
     pub reference: Option<PathBuf>,

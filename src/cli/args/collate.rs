@@ -25,9 +25,17 @@ pub struct CollateArgs {
     #[arg(long = "no-PG")]
     pub no_pg: bool,
 
-    /// Number of hash buckets (samtools `-r`). Larger = less spill but more RAM.
-    #[arg(short = 'r', long = "buckets", default_value_t = 1_048_576)]
+    /// Number of temporary files to hash read names across when the input does
+    /// not fit in memory. Every record of one name lands in the same file, so
+    /// each can then be grouped independently. More files = less memory per
+    /// file, at the cost of more open descriptors.
+    #[arg(short = 'r', long = "buckets", default_value_t = 64)]
     pub buckets: usize,
+
+    /// Approximate memory budget before spilling to `--tmpdir` (e.g. `768M`,
+    /// `4G`, or `auto` for a fraction of total RAM).
+    #[arg(short = 'm', long = "memory", default_value = "768M")]
+    pub memory: String,
 
     /// Tmp dir.
     #[arg(short = 'T', long = "tmpdir")]

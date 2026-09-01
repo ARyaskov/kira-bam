@@ -6,7 +6,8 @@ use noodles_sam::alignment::record_buf::data::field::Value;
 
 use crate::cli::FixmateArgs;
 use crate::io::{
-    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, is_record_level_error,
+    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, report_skipped,
+    write_record_tolerant,
 };
 use crate::types::OutputFormat;
 
@@ -28,12 +29,13 @@ fn check_query_grouped(header: &noodles_sam::Header, force: bool) -> Result<()> 
     use noodles_sam::header::record::value::map::header::{group_order, sort_order, tag};
 
     let hd = header.header();
-    let field = |t| hd.and_then(|h| h.other_fields().get(&t)).map(|v| v.to_vec());
+    let field = |t| {
+        hd.and_then(|h| h.other_fields().get(&t))
+            .map(|v| v.to_vec())
+    };
     let so = field(tag::SORT_ORDER);
     let go = field(tag::GROUP_ORDER);
-    if so.as_deref() == Some(sort_order::QUERY_NAME)
-        || go.as_deref() == Some(group_order::QUERY)
-    {
+    if so.as_deref() == Some(sort_order::QUERY_NAME) || go.as_deref() == Some(group_order::QUERY) {
         return Ok(());
     }
     let found = so
@@ -72,25 +74,29 @@ pub fn run(args: FixmateArgs) -> Result<()> {
     let mut writer = BamWriter::create(Some(&args.output), header, fmt)?;
     writer.write_header()?;
 
-    let mut current_qname: Vec<u8> = Vec::new();
+    // `Option` rather than "empty means no group": a record may legitimately
+    // carry an empty name, and conflating the two made the sentinel depend on
+    // the data.
+    let mut current_qname: Option<Vec<u8>> = None;
     let mut group: Vec<RecordBuf> = Vec::new();
     let mut rec = RecordBuf::default();
+    let mut skipped = 0u64;
 
     while reader.read_record_buf(&mut rec)? {
         let q: Vec<u8> = rec.name().map(|n| n.to_vec()).unwrap_or_default();
-        if q != current_qname && !group.is_empty() {
-            flush_group(&mut group, &mut writer, &args)?;
-            current_qname.clear();
+        if current_qname.as_ref().is_some_and(|c| *c != q) {
+            flush_group(&mut group, &mut writer, &args, &mut skipped)?;
         }
-        if current_qname.is_empty() {
-            current_qname = q;
-        }
-        group.push(rec.clone());
+        current_qname = Some(q);
+        // The reader refills `rec` each round, so the group can take ownership
+        // instead of cloning every record.
+        group.push(std::mem::take(&mut rec));
     }
     if !group.is_empty() {
-        flush_group(&mut group, &mut writer, &args)?;
+        flush_group(&mut group, &mut writer, &args, &mut skipped)?;
     }
     writer.finish()?;
+    report_skipped("fixmate", skipped);
     Ok(())
 }
 
@@ -98,6 +104,7 @@ fn flush_group(
     group: &mut Vec<RecordBuf>,
     writer: &mut BamWriter,
     args: &FixmateArgs,
+    skipped: &mut u64,
 ) -> Result<()> {
     let primary: Vec<usize> = (0..group.len())
         .filter(|&i| {
@@ -131,12 +138,7 @@ fn flush_group(
                 continue;
             }
         }
-        if let Err(e) = writer.write_record_buf(&r) {
-            if !is_record_level_error(&e) {
-                return Err(e);
-            }
-            eprintln!("[kira-bam fixmate] skip record: {e:#}");
-        }
+        write_record_tolerant(writer, &r, "fixmate", skipped)?;
     }
     Ok(())
 }
@@ -177,12 +179,14 @@ fn fix_mate_pair(a: &mut RecordBuf, b: &mut RecordBuf, args: &FixmateArgs) {
         nb &= !FLAG_MUNMAP;
     }
 
-    // Proper-pair: same ref, both mapped, opposite strands, reasonable distance.
-    let proper = !a_unmap
-        && !b_unmap
-        && a.reference_sequence_id() == b.reference_sequence_id()
-        && a.reference_sequence_id().is_some()
-        && ((a_flags ^ b_flags) & FLAG_REVERSE) != 0;
+    // Proper pair: same reference, both mapped, and the two reads facing each
+    // other — the leftmost on the forward strand, the rightmost on the
+    // reverse. Requiring only that the strands *differ* also accepted
+    // outward-facing (RF) pairs, which are exactly the ones a structural
+    // variant produces and which no aligner calls proper.
+    let same_ref = a.reference_sequence_id() == b.reference_sequence_id()
+        && a.reference_sequence_id().is_some();
+    let proper = !a_unmap && !b_unmap && same_ref && faces_inward(a, b);
     if proper {
         na |= FLAG_PROPER_PAIR;
         nb |= FLAG_PROPER_PAIR;
@@ -194,37 +198,16 @@ fn fix_mate_pair(a: &mut RecordBuf, b: &mut RecordBuf, args: &FixmateArgs) {
     *a.flags_mut() = Flags::from(na);
     *b.flags_mut() = Flags::from(nb);
 
-    // TLEN: signed insert size.
-    if a.reference_sequence_id() == b.reference_sequence_id() && !a_unmap && !b_unmap {
-        let a_start = a
-            .alignment_start()
-            .map(|p| usize::from(p) as i64)
-            .unwrap_or(0);
-        let b_start = b
-            .alignment_start()
-            .map(|p| usize::from(p) as i64)
-            .unwrap_or(0);
-        let a_end = a
-            .alignment_end()
-            .map(|p| usize::from(p) as i64)
-            .unwrap_or(a_start);
-        let b_end = b
-            .alignment_end()
-            .map(|p| usize::from(p) as i64)
-            .unwrap_or(b_start);
-        let (left_start, right_end) = if a_start <= b_start {
-            (a_start, b_end.max(a_end))
-        } else {
-            (b_start, a_end.max(b_end))
-        };
-        let isize_val = right_end - left_start + 1;
-        let a_tlen: i32 = if a_start <= b_start {
-            isize_val as i32
-        } else {
-            -(isize_val as i32)
-        };
-        *a.template_length_mut() = a_tlen;
-        *b.template_length_mut() = -a_tlen;
+    // TLEN: the signed 5'-to-5' distance between the mates, which is how
+    // htslib's `bam_mating_core` defines it. The old
+    // `rightmost_end - leftmost_start + 1` is a different quantity — the span
+    // of the template including both reads — and disagreed with samtools on
+    // every pair.
+    if same_ref && !a_unmap && !b_unmap {
+        let a5 = five_prime(a);
+        let b5 = five_prime(b);
+        *a.template_length_mut() = (b5 - a5) as i32;
+        *b.template_length_mut() = (a5 - b5) as i32;
     } else {
         *a.template_length_mut() = 0;
         *b.template_length_mut() = 0;
@@ -232,6 +215,51 @@ fn fix_mate_pair(a: &mut RecordBuf, b: &mut RecordBuf, args: &FixmateArgs) {
 
     if args.add_mc_ms {
         add_mc_ms_tags(a, b);
+    }
+    // MC describes the mate's alignment; an unmapped mate has none, and a
+    // stale MC left behind is read as a real CIGAR by anything downstream.
+    if b_unmap {
+        a.data_mut().remove(&Tag::MATE_CIGAR);
+    }
+    if a_unmap {
+        b.data_mut().remove(&Tag::MATE_CIGAR);
+    }
+}
+
+/// The read's 5'-most reference coordinate: POS on the forward strand, the
+/// alignment end on the reverse.
+fn five_prime(rec: &RecordBuf) -> i64 {
+    let start = rec
+        .alignment_start()
+        .map(|p| usize::from(p) as i64)
+        .unwrap_or(0);
+    if u16::from(rec.flags()) & FLAG_REVERSE != 0 {
+        rec.alignment_end()
+            .map(|p| usize::from(p) as i64)
+            .unwrap_or(start)
+    } else {
+        start
+    }
+}
+
+/// Do the mates point at each other (FR), rather than away (RF) or along the
+/// same strand (FF/RR)? The leftmost 5' end must be forward.
+fn faces_inward(a: &RecordBuf, b: &RecordBuf) -> bool {
+    let a_rev = u16::from(a.flags()) & FLAG_REVERSE != 0;
+    let b_rev = u16::from(b.flags()) & FLAG_REVERSE != 0;
+    if a_rev == b_rev {
+        return false;
+    }
+    let a_start = a.alignment_start().map(usize::from).unwrap_or(0);
+    let b_start = b.alignment_start().map(usize::from).unwrap_or(0);
+    // Whichever starts first must be the forward-strand read. Equal starts are
+    // ambiguous but still face inward under either assignment.
+    if a_start == b_start {
+        true
+    } else if a_start < b_start {
+        !a_rev
+    } else {
+        !b_rev
     }
 }
 

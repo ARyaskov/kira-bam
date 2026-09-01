@@ -236,11 +236,13 @@ where
     R: noodles_bgzf::io::BufRead + noodles_bgzf::io::Seek,
 {
     let mut n: u64 = 0;
+    // Counting needs the flags, MAPQ and span only. Building a `RecordBuf` per
+    // record also decoded the name, CIGAR, sequence, qualities and tags — all
+    // of it thrown away a line later.
     if spec == "*" {
         for rec_result in reader.query_unmapped()? {
             let rec = rec_result?;
-            let buf = RecordBuf::try_from_alignment_record(header, &rec)?;
-            if pass_filters(&buf, args, exclude) {
+            if raw_passes(&rec, args, exclude)? {
                 n += 1;
             }
         }
@@ -251,13 +253,50 @@ where
         let query = reader.query(header, &region)?;
         for rec_result in query.records() {
             let rec = rec_result?;
-            let buf = RecordBuf::try_from_alignment_record(header, &rec)?;
-            if pass_filters(&buf, args, exclude) {
+            if raw_passes(&rec, args, exclude)? {
                 n += 1;
             }
         }
     }
     Ok(n)
+}
+
+/// [`pass_filters`] against an undecoded BAM record.
+fn raw_passes(rec: &bam::Record, args: &ViewArgs, exclude: &[ExcludeRegion]) -> Result<bool> {
+    use noodles_sam::alignment::Record as _;
+
+    let flags = u16::from(rec.flags());
+    if args.require_flags != 0 && (flags & args.require_flags) != args.require_flags {
+        return Ok(false);
+    }
+    if args.filter_flags != 0 && (flags & args.filter_flags) != 0 {
+        return Ok(false);
+    }
+    match rec.mapping_quality() {
+        Some(mapq) if u8::from(mapq) < args.min_mapq => return Ok(false),
+        None if args.min_mapq > 0 => return Ok(false),
+        _ => {}
+    }
+    if exclude.is_empty() {
+        return Ok(true);
+    }
+    let (Some(tid), Some(start)) = (
+        rec.reference_sequence_id().transpose()?,
+        rec.alignment_start().transpose()?,
+    ) else {
+        // Unplaced records overlap no region.
+        return Ok(true);
+    };
+    let r_start = usize::from(start) as u64;
+    let r_end = rec
+        .alignment_end()
+        .transpose()?
+        .map(|p| usize::from(p) as u64)
+        .unwrap_or(r_start);
+    let excluded = exclude
+        .iter()
+        .any(|r| r.tid == tid && r_end >= r.start && r_start <= r.end);
+    Ok(!excluded)
 }
 
 /// A `-v` exclusion resolved against the header: reference id plus a 1-based
@@ -294,9 +333,7 @@ fn resolve_exclude_regions(
                         .with_context(|| format!("-v {spec}: bad {what}"))
                 };
                 match range.split_once('-') {
-                    Some((a, b)) if !b.is_empty() => {
-                        (parse(a, "start")?, parse(b, "end")?)
-                    }
+                    Some((a, b)) if !b.is_empty() => (parse(a, "start")?, parse(b, "end")?),
                     Some((a, _)) => (parse(a, "start")?, u64::MAX),
                     None => (parse(range, "start")?, u64::MAX),
                 }

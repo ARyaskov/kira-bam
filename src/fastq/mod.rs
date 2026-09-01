@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::FastqArgs;
+use crate::collate::NameBuckets;
 use crate::io::{BamReader, install_thread_pool};
 
 const FLAG_UNMAP: u16 = 0x4;
@@ -46,6 +47,11 @@ pub fn run(args: FastqArgs) -> Result<()> {
         .context("open input")?;
 
     if !args.collate {
+        // Adjacent-pair scan. It needs name-grouped input, which a
+        // coordinate-sorted BAM is not — every read then lands in singletons,
+        // so say so rather than let an empty R1/R2 look like a successful run.
+        warn_if_not_name_grouped(reader.header());
+
         let mut prev: Option<RecordBuf> = None;
         let mut rec = RecordBuf::default();
         while reader.read_record_buf(&mut rec)? {
@@ -53,12 +59,15 @@ pub fn run(args: FastqArgs) -> Result<()> {
             if (f & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY)) != 0 {
                 continue;
             }
+            // The reader refills `rec` each round, so it can be moved out
+            // instead of cloned.
+            let cur = std::mem::take(&mut rec);
             match prev.take() {
                 Some(p) => {
-                    if same_qname(&p, &rec) {
+                    if same_qname(&p, &cur) {
                         emit_pair(
                             &p,
-                            &rec,
+                            &cur,
                             &mut r1,
                             &mut r2,
                             &mut orphans,
@@ -67,57 +76,78 @@ pub fn run(args: FastqArgs) -> Result<()> {
                         )?;
                     } else {
                         emit_single(&p, &mut singletons, &mut r1, &mut stdout_sink, &args)?;
-                        prev = Some(rec.clone());
+                        prev = Some(cur);
                     }
                 }
-                None => prev = Some(rec.clone()),
+                None => prev = Some(cur),
             }
         }
         if let Some(p) = prev.take() {
             emit_single(&p, &mut singletons, &mut r1, &mut stdout_sink, &args)?;
         }
     } else {
-        let mut buf: Vec<RecordBuf> = Vec::new();
+        // Group by name through the collate buckets rather than sorting the
+        // whole file in memory, which needed the entire BAM resident (cloned,
+        // at that) before a single read could be written.
+        let header = reader.header().clone();
+        let mut groups = NameBuckets::new(args.tmpdir.as_deref(), &header, args.buckets.max(1))?;
         let mut rec = RecordBuf::default();
         while reader.read_record_buf(&mut rec)? {
             let f = u16::from(rec.flags());
             if (f & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY)) != 0 {
                 continue;
             }
-            buf.push(rec.clone());
+            groups.push(&rec)?;
         }
-        buf.sort_by(|a, b| {
-            let an: &[u8] = a.name().map(AsRef::as_ref).unwrap_or(&[]);
-            let bn: &[u8] = b.name().map(AsRef::as_ref).unwrap_or(&[]);
-            an.cmp(bn)
-        });
-        let mut i = 0;
-        while i < buf.len() {
-            let j = (i + 1..buf.len())
-                .find(|&k| !same_qname(&buf[i], &buf[k]))
-                .unwrap_or(buf.len());
-            if j - i == 2 {
-                let (a, b) = (buf[i].clone(), buf[i + 1].clone());
+        groups.for_each_group(|recs| {
+            if recs.len() == 2 {
                 emit_pair(
-                    &a,
-                    &b,
+                    &recs[0],
+                    &recs[1],
                     &mut r1,
                     &mut r2,
                     &mut orphans,
                     &mut stdout_sink,
                     &args,
-                )?;
+                )
             } else {
-                for rec in buf.iter().take(j).skip(i) {
-                    let rec = rec.clone();
-                    emit_single(&rec, &mut singletons, &mut r1, &mut stdout_sink, &args)?;
+                for rec in recs {
+                    emit_single(rec, &mut singletons, &mut r1, &mut stdout_sink, &args)?;
                 }
+                Ok(())
             }
-            i = j;
-        }
+        })?;
     }
 
     Ok(())
+}
+
+/// Warn when the header does not claim name-grouped order, which the
+/// adjacent-pair scan requires.
+fn warn_if_not_name_grouped(header: &noodles_sam::Header) {
+    use noodles_sam::header::record::value::map::header::tag as hd_tag;
+
+    let hd = header.header();
+    let value = |t| {
+        hd.and_then(|h| h.other_fields().get(&t))
+            .map(|v| v.to_vec())
+            .unwrap_or_default()
+    };
+    let so = value(hd_tag::SORT_ORDER);
+    let go = value(hd_tag::GROUP_ORDER);
+    let grouped = so == b"queryname" || go == b"query";
+    if !grouped {
+        let shown = if so.is_empty() {
+            "unspecified".to_string()
+        } else {
+            String::from_utf8_lossy(&so).into_owned()
+        };
+        eprintln!(
+            "[kira-bam fastq] warning: @HD sort order is {shown}, not queryname. Mates are only \
+             paired when they are adjacent, so this run will send most reads to singletons — \
+             pass --collate, or name-sort the input first."
+        );
+    }
 }
 
 fn same_qname(a: &RecordBuf, b: &RecordBuf) -> bool {
@@ -203,25 +233,46 @@ fn emit_record(
             .rev()
             .map(|&b| complement(b))
             .collect();
-        let qual: Vec<u8> = rec
-            .quality_scores()
-            .as_ref()
-            .iter()
-            .rev()
-            .map(|&q| q + 33)
-            .collect();
+        let qual = phred33(rec, seq.len());
         write_seq(out, name, &suffix, &seq, &qual, args.fasta)?;
     } else {
         let seq: Vec<u8> = rec.sequence().as_ref().to_vec();
-        let qual: Vec<u8> = rec
-            .quality_scores()
-            .as_ref()
-            .iter()
-            .map(|&q| q + 33)
-            .collect();
+        let qual = phred33(rec, seq.len());
         write_seq(out, name, &suffix, &seq, &qual, args.fasta)?;
     }
     Ok(())
+}
+
+/// Phred+33 line for the record, reversed to match a reverse-complemented
+/// sequence.
+///
+/// A record with no qualities stores 0xFF per base, which `q + 33` overflowed
+/// — a panic in debug, a run of `' '` in release. FASTQ spells "unknown" as
+/// `!` (Phred 0), and the line has to be exactly as long as SEQ or the record
+/// is malformed, which is why the length comes from the caller.
+fn phred33(rec: &RecordBuf, seq_len: usize) -> Vec<u8> {
+    const MISSING: u8 = 0xFF;
+    let quals = rec.quality_scores().as_ref();
+    let reverse =
+        (u16::from(rec.flags()) & FLAG_REVERSE) != 0 && (u16::from(rec.flags()) & FLAG_UNMAP) == 0;
+    if quals.is_empty() || quals.iter().all(|&q| q == MISSING) {
+        return vec![b'!'; seq_len];
+    }
+    let mut out: Vec<u8> = quals
+        .iter()
+        .map(|&q| {
+            if q == MISSING {
+                b'!'
+            } else {
+                q.saturating_add(33).min(126)
+            }
+        })
+        .collect();
+    if reverse {
+        out.reverse();
+    }
+    out.resize(seq_len, b'!');
+    out
 }
 
 fn write_seq(
@@ -252,17 +303,43 @@ fn write_seq(
     Ok(())
 }
 
+/// Full IUPAC complement. Passing the ambiguity codes through unchanged, as
+/// this used to, silently produced a wrong reverse complement for any read
+/// carrying one — BAM's 4-bit encoding represents all sixteen.
 fn complement(b: u8) -> u8 {
     match b {
         b'A' => b'T',
         b'T' => b'A',
         b'C' => b'G',
         b'G' => b'C',
+        b'U' => b'A',
+        b'R' => b'Y', // A/G  -> T/C
+        b'Y' => b'R',
+        b'S' => b'S', // C/G is its own complement
+        b'W' => b'W', // A/T likewise
+        b'K' => b'M', // G/T  -> C/A
+        b'M' => b'K',
+        b'B' => b'V', // not-A -> not-T
+        b'V' => b'B',
+        b'D' => b'H', // not-C -> not-G
+        b'H' => b'D',
+        b'N' => b'N',
         b'a' => b't',
         b't' => b'a',
         b'c' => b'g',
         b'g' => b'c',
-        b'N' | b'n' => b'N',
+        b'u' => b'a',
+        b'r' => b'y',
+        b'y' => b'r',
+        b's' => b's',
+        b'w' => b'w',
+        b'k' => b'm',
+        b'm' => b'k',
+        b'b' => b'v',
+        b'v' => b'b',
+        b'd' => b'h',
+        b'h' => b'd',
+        b'n' => b'n',
         x => x,
     }
 }

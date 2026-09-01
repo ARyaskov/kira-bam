@@ -1,11 +1,14 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use bstr::{BStr, BString};
 use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
+use noodles_sam::header::record::value::map::header::tag as hd_tag;
+use noodles_sam::header::record::value::map::program::tag as pg_tag;
+use noodles_sam::header::record::value::{Map, map};
 
 use crate::cli::MergeArgs;
 use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
@@ -72,7 +75,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
     // the streaming merge below.
     let input_headers: Vec<Header> = readers.iter().map(|r| r.header().clone()).collect();
     let (mut merged_header, rg_renames) =
-        merge_headers(input_headers.iter().collect::<Vec<_>>())?;
+        merge_headers(input_headers.iter().collect::<Vec<_>>(), kind)?;
     append_pg(&mut merged_header, &PgInfo::new("merge", !args.no_pg))?;
     // Per-input map: local reference id → merged reference id (matched by @SQ name).
     let tid_maps = build_tid_maps(&input_headers, &merged_header);
@@ -135,7 +138,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
     while let Some(item) = heap.pop() {
         writer.write_record_buf(&item.record)?;
         let src = item.src;
-            let mut rec = item.record;
+        let mut rec = item.record;
         if readers[src].read_record_buf(&mut rec)? {
             remap_ids(&mut rec, &tid_maps[src]);
             remap_read_group(&mut rec, &rg_renames[src]);
@@ -155,7 +158,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
 type RgRenames = HashMap<BString, BString>;
 
 /// Build the merged header, plus the read-group renames it forced.
-fn merge_headers(headers: Vec<&Header>) -> Result<(Header, Vec<RgRenames>)> {
+fn merge_headers(headers: Vec<&Header>, kind: SortKind) -> Result<(Header, Vec<RgRenames>)> {
     use bstr::ByteSlice;
 
     let mut merged = headers
@@ -221,21 +224,63 @@ fn merge_headers(headers: Vec<&Header>) -> Result<(Header, Vec<RgRenames>)> {
             merged.comments_mut().push(c.clone());
         }
 
-        // @PG: append, but reuse noodles Programs::add so chains stay valid.
-        for (pg_id, pg_map) in h.programs().as_ref() {
-            let mut final_id: BString = pg_id.clone();
-            let mut suffix = 1usize;
-            while merged.programs().as_ref().contains_key(final_id.as_bstr()) {
-                final_id = BString::from(format!("{}-{suffix}", pg_id.as_bstr()));
-                suffix += 1;
+        // @PG: append with raw inserts so the input's own chain is preserved
+        // rather than re-rooted. Renaming a colliding ID has to carry through
+        // to the `PP` links that pointed at it, or the chain ends up naming
+        // the *first* input's program of that name — or nothing at all.
+        let pg_renames: HashMap<BString, BString> = {
+            let mut taken: HashSet<BString> = merged.programs().as_ref().keys().cloned().collect();
+            let mut renames = HashMap::new();
+            for pg_id in h.programs().as_ref().keys() {
+                let mut final_id: BString = pg_id.clone();
+                let mut suffix = 1usize;
+                while taken.contains(&final_id) {
+                    final_id = BString::from(format!("{}-{suffix}", pg_id.as_bstr()));
+                    suffix += 1;
+                }
+                taken.insert(final_id.clone());
+                if final_id != *pg_id {
+                    renames.insert(pg_id.clone(), final_id);
+                }
             }
-            // Use raw insert so we don't re-chain — preserve original PP links.
-            merged
-                .programs_mut()
-                .as_mut()
-                .insert(final_id, pg_map.clone());
+            renames
+        };
+        for (pg_id, pg_map) in h.programs().as_ref() {
+            let final_id = pg_renames
+                .get(pg_id)
+                .cloned()
+                .unwrap_or_else(|| pg_id.clone());
+            let mut pg_map = pg_map.clone();
+            if let Some(pp) = pg_map
+                .other_fields_mut()
+                .get_mut(&pg_tag::PREVIOUS_PROGRAM_ID)
+                && let Some(renamed) = pg_renames.get(&BString::from(pp.to_vec()))
+            {
+                *pp = renamed.clone();
+            }
+            merged.programs_mut().as_mut().insert(final_id, pg_map);
         }
     }
+
+    // @HD carries the sort order, and it came in as a clone of the first
+    // input's header — so a name merge used to advertise `SO:coordinate`.
+    let sort_order: &[u8] = match kind {
+        SortKind::Coordinate => b"coordinate",
+        SortKind::QueryName => b"queryname",
+    };
+    match merged.header_mut() {
+        Some(hd) => {
+            hd.other_fields_mut()
+                .insert(hd_tag::SORT_ORDER, BString::from(sort_order));
+        }
+        None => {
+            let mut hd = Map::<map::Header>::default();
+            hd.other_fields_mut()
+                .insert(hd_tag::SORT_ORDER, BString::from(sort_order));
+            *merged.header_mut() = Some(hd);
+        }
+    }
+
     Ok((merged, rg_renames))
 }
 

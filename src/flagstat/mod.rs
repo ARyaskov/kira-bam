@@ -129,45 +129,70 @@ pub fn run(args: FlagstatArgs) -> Result<()> {
     Ok(())
 }
 
+/// samtools' `-O json` schema: two objects keyed `"QC-passed reads"` and
+/// `"QC-failed reads"`, each holding the same field names the plain-text report
+/// uses, with the percentages as their own `… %` entries. The old flat
+/// `{key: {pass, fail}}` shape parsed as valid JSON but no samtools consumer
+/// could read it.
 fn print_flagstat_json(t: &FlagstatTotals) {
-    let p = &t.pass;
-    let f = &t.fail;
-    fn line(k: &str, p: u64, f: u64) -> String {
-        format!("  \"{k}\": {{ \"pass\": {p}, \"fail\": {f} }}")
+    println!("{{");
+    println!("{},", counts_json("QC-passed reads", &t.pass));
+    println!("{}", counts_json("QC-failed reads", &t.fail));
+    println!("}}");
+}
+
+fn counts_json(label: &str, c: &Counts) -> String {
+    /// Percentages are `null` where samtools prints `N/A`.
+    fn ratio(num: u64, den: u64) -> String {
+        if den == 0 {
+            "null".to_string()
+        } else {
+            format!("{:.6}", (num as f64) * 100.0 / (den as f64))
+        }
     }
-    let entries = vec![
-        line("total", p.total, f.total),
-        line("primary", p.primary, f.primary),
-        line("secondary", p.secondary, f.secondary),
-        line("supplementary", p.supplementary, f.supplementary),
-        line("duplicates", p.duplicates, f.duplicates),
-        line(
-            "primary_duplicates",
-            p.primary_duplicates,
-            f.primary_duplicates,
+    let fields = [
+        format!("\"total\": {}", c.total),
+        format!("\"primary\": {}", c.primary),
+        format!("\"secondary\": {}", c.secondary),
+        format!("\"supplementary\": {}", c.supplementary),
+        format!("\"duplicates\": {}", c.duplicates),
+        format!("\"primary duplicates\": {}", c.primary_duplicates),
+        format!("\"mapped\": {}", c.mapped),
+        format!("\"mapped %\": {}", ratio(c.mapped, c.total)),
+        format!("\"primary mapped\": {}", c.primary_mapped),
+        format!(
+            "\"primary mapped %\": {}",
+            ratio(c.primary_mapped, c.primary)
         ),
-        line("mapped", p.mapped, f.mapped),
-        line("primary_mapped", p.primary_mapped, f.primary_mapped),
-        line("paired", p.paired, f.paired),
-        line("read1", p.read1, f.read1),
-        line("read2", p.read2, f.read2),
-        line("properly_paired", p.properly_paired, f.properly_paired),
-        line(
-            "with_itself_and_mate_mapped",
-            p.with_itself_and_mate_mapped,
-            f.with_itself_and_mate_mapped,
+        format!("\"paired in sequencing\": {}", c.paired),
+        format!("\"read1\": {}", c.read1),
+        format!("\"read2\": {}", c.read2),
+        format!("\"properly paired\": {}", c.properly_paired),
+        format!(
+            "\"properly paired %\": {}",
+            ratio(c.properly_paired, c.paired)
         ),
-        line("singletons", p.singletons, f.singletons),
-        line("mate_diff_chr", p.mate_diff_chr, f.mate_diff_chr),
-        line(
-            "mate_diff_chr_mq5",
-            p.mate_diff_chr_mq5,
-            f.mate_diff_chr_mq5,
+        format!(
+            "\"with itself and mate mapped\": {}",
+            c.with_itself_and_mate_mapped
+        ),
+        format!("\"singletons\": {}", c.singletons),
+        format!("\"singletons %\": {}", ratio(c.singletons, c.paired)),
+        format!(
+            "\"with mate mapped to a different chr\": {}",
+            c.mate_diff_chr
+        ),
+        format!(
+            "\"with mate mapped to a different chr (mapQ>=5)\": {}",
+            c.mate_diff_chr_mq5
         ),
     ];
-    println!("{{");
-    println!("{}", entries.join(",\n"));
-    println!("}}");
+    let body = fields
+        .iter()
+        .map(|f| format!("    {f}"))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("  \"{label}\": {{\n{body}\n  }}")
 }
 
 fn pct(num: u64, den: u64) -> String {

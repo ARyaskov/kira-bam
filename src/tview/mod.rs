@@ -1,16 +1,13 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use noodles_bam as bam;
 use noodles_core::Region;
-use noodles_fasta as fasta;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::cigar::op::Kind;
-use rustc_hash::FxHasher;
 
 use crate::cli::TviewArgs;
+use crate::faidx::RefCache;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -44,11 +41,16 @@ pub fn run(args: TviewArgs) -> Result<()> {
         }
     }
 
-    let refs = match &args.reference {
-        Some(p) => load_fasta(p)?,
-        None => HashMap::default(),
+    // Indexed rather than whole-genome-in-RAM: tview only ever renders one
+    // window of one contig.
+    let mut refs = match &args.reference {
+        Some(p) => Some(RefCache::open(p)?),
+        None => None,
     };
-    let ref_seq = refs.get(chrom.as_bytes());
+    let ref_seq = match &mut refs {
+        Some(cache) => cache.sequence(&chrom)?,
+        None => None,
+    };
 
     let mut stdout = std::io::stdout().lock();
     let color = !args.no_color;
@@ -129,7 +131,7 @@ pub fn run(args: TviewArgs) -> Result<()> {
     Ok(())
 }
 
-fn paint(b: u8, _ref_seq: Option<&Vec<u8>>, _start_1: u64, _line: &[u8]) -> String {
+fn paint(b: u8, _ref_seq: Option<&[u8]>, _start_1: u64, _line: &[u8]) -> String {
     let color = match b {
         b'A' | b'a' => GREEN,
         b'C' | b'c' => BLUE,
@@ -188,20 +190,6 @@ fn render_read(rec: &RecordBuf, win_start_1: u64, win_width: usize) -> Option<(u
     let render_start = start_1.max(win_start_1);
     let render_end = render_start + bases.len() as u64 - 1;
     Some((render_start, render_end, bases))
-}
-
-fn load_fasta(
-    path: &std::path::Path,
-) -> Result<HashMap<Vec<u8>, Vec<u8>, std::hash::BuildHasherDefault<FxHasher>>> {
-    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut reader = fasta::io::Reader::new(BufReader::with_capacity(1 << 20, f));
-    let mut out: HashMap<Vec<u8>, Vec<u8>, std::hash::BuildHasherDefault<FxHasher>> =
-        HashMap::default();
-    for result in reader.records() {
-        let r = result?;
-        out.insert(r.name().to_vec(), r.sequence().as_ref().to_vec());
-    }
-    Ok(out)
 }
 
 fn parse_position(s: &str) -> Result<(String, u64)> {

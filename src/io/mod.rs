@@ -104,22 +104,68 @@ impl PgInfo {
     }
 }
 
-/// Append a `@PG` record to the header, chaining to the existing leaf via `PP`.
+/// Append one `@PG` record to the header, chaining to the existing leaf via
+/// `PP`.
+///
+/// Deliberately not `Programs::add`. noodles resolves an ID collision by
+/// appending the *previous program's ID*, so re-running a recipe over its own
+/// output grew IDs without bound
+/// (`kira-bam.sort-kira-bam.sort-kira-bam.sort`); and when the header holds
+/// several chains — which every merge produces — it adds one record per leaf,
+/// duplicating this invocation across the header. samtools adds exactly one
+/// record, with `ID`, `ID-1`, `ID-2`… on collision, so that is what this does.
 pub fn append_pg(header: &mut Header, pg: &PgInfo) -> Result<()> {
     if !pg.enable {
         return Ok(());
     }
-    let map = Map::<Program>::builder()
+    let id = unique_pg_id(header, &pg.id_prefix);
+    let previous = last_leaf_program_id(header);
+
+    let mut builder = Map::<Program>::builder()
         .insert(pg_tag::NAME, pg.name.as_bytes())
         .insert(pg_tag::VERSION, pg.version.as_bytes())
-        .insert(pg_tag::COMMAND_LINE, pg.cli.as_bytes())
-        .build()
-        .context("build @PG record")?;
-    header
-        .programs_mut()
-        .add(pg.id_prefix.as_bytes(), map)
-        .context("attach @PG to header chain")?;
+        .insert(pg_tag::COMMAND_LINE, pg.cli.as_bytes());
+    if let Some(pp) = &previous {
+        builder = builder.insert(pg_tag::PREVIOUS_PROGRAM_ID, pp.as_slice());
+    }
+    let map = builder.build().context("build @PG record")?;
+
+    header.programs_mut().as_mut().insert(id, map);
     Ok(())
+}
+
+/// First free ID in the `prefix`, `prefix-1`, `prefix-2`, … sequence.
+fn unique_pg_id(header: &Header, prefix: &str) -> bstr::BString {
+    use bstr::ByteSlice;
+
+    let programs = header.programs().as_ref();
+    let mut id = bstr::BString::from(prefix.as_bytes());
+    let mut n = 1usize;
+    while programs.contains_key(id.as_bstr()) {
+        id = bstr::BString::from(format!("{prefix}-{n}").into_bytes());
+        n += 1;
+    }
+    id
+}
+
+/// The last program that nothing else links back to — the end of the chain a
+/// new record should extend. Headers can hold several chains (a merge unions
+/// the inputs'), and the new record joins only the last of them, so one
+/// invocation stays one `@PG` line.
+fn last_leaf_program_id(header: &Header) -> Option<bstr::BString> {
+    use bstr::ByteSlice;
+    use std::collections::HashSet;
+
+    let programs = header.programs().as_ref();
+    let referenced: HashSet<&bstr::BStr> = programs
+        .values()
+        .filter_map(|m| m.other_fields().get(&pg_tag::PREVIOUS_PROGRAM_ID))
+        .map(|v| v.as_bstr())
+        .collect();
+    programs
+        .keys()
+        .rfind(|id| !referenced.contains(id.as_bstr()))
+        .cloned()
 }
 
 const BGZF_MAGIC: [u8; 2] = [0x1f, 0x8b];
@@ -132,18 +178,84 @@ pub const BGZF_EOF: [u8; 28] = [
     0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+/// BAM's uncompressed magic, the first four bytes inside the BGZF stream.
+const BAM_MAGIC: [u8; 4] = *b"BAM\x01";
+
+/// Is this gzip member BGZF? BGZF is gzip with `FLG.FEXTRA` set and a `BC`
+/// extra subfield carrying the block size; `gzip(1)` sets neither. Checking the
+/// header structure separates the two without decompressing, exactly as
+/// htslib's `hts_detect_format` does.
+fn is_bgzf_header(head: &[u8]) -> bool {
+    const FEXTRA: u8 = 0x04;
+    if head.len() < 12 || head[3] & FEXTRA == 0 {
+        return false;
+    }
+    let xlen = u16::from_le_bytes([head[10], head[11]]) as usize;
+    let Some(extra) = head.get(12..12 + xlen) else {
+        return false;
+    };
+    // Extra subfields are `SI1 SI2 SLEN(u16le) data[SLEN]`, packed back to back.
+    let mut i = 0usize;
+    while i + 4 <= extra.len() {
+        let slen = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
+        if extra[i] == b'B' && extra[i + 1] == b'C' {
+            return true;
+        }
+        i += 4 + slen;
+    }
+    false
+}
+
+/// The first four decompressed bytes of a BGZF file, used to tell BAM from a
+/// bgzipped SAM. A short or undecodable stream just reports "not BAM" — the
+/// real parse error then comes from the reader, with its own context.
+fn bgzf_leading_bytes(path: &Path) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    if let Ok(file) = File::open(path) {
+        let mut r = bgzf::io::Reader::new(file);
+        // A partial read leaves the tail zeroed, which cannot match BAM_MAGIC.
+        let _ = r.read(&mut out);
+    }
+    out
+}
+
 fn detect_format<P: AsRef<Path>>(path: P) -> io::Result<InputFormat> {
     let path = path.as_ref();
     let mut f = File::open(path)?;
-    let mut buf = [0u8; 4];
+    // Enough for the gzip header plus its extra field; BGZF's is 6 bytes.
+    let mut buf = [0u8; 64];
     let n = f.read(&mut buf)?;
-    let detected = if n >= 4 && buf == CRAM_MAGIC {
+    let head = &buf[..n];
+
+    let detected = if n >= 4 && head[..4] == CRAM_MAGIC {
         InputFormat::Cram
-    } else if n >= 2 && buf[..2] == BGZF_MAGIC {
-        InputFormat::Bam
+    } else if n >= 2 && head[..2] == BGZF_MAGIC {
+        if !is_bgzf_header(head) {
+            // Plain gzip. Feeding it to the BAM parser used to fail with an
+            // opaque decode error several layers down; say what is actually
+            // wrong and how to fix it.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is plain gzip, not BGZF. kira-bam reads BGZF (what `bgzip` and every \
+                     BAM writer produce); recompress with `bgzip`, or decompress first \
+                     (`gunzip -c file | kira-bam ...`).",
+                    path.display()
+                ),
+            ));
+        }
+        // BGZF carries BAM, but also bgzipped SAM — tell them apart by magic
+        // rather than assuming, which sent every bgzipped SAM into the BAM
+        // parser.
+        if bgzf_leading_bytes(path) == BAM_MAGIC {
+            InputFormat::Bam
+        } else {
+            InputFormat::BgzfSam
+        }
     } else {
         InputFormat::Sam
     };
+
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext_l = ext.to_ascii_lowercase();
         let mismatch = matches!(
@@ -152,6 +264,8 @@ fn detect_format<P: AsRef<Path>>(path: P) -> io::Result<InputFormat> {
                 | (InputFormat::Bam, "cram")
                 | (InputFormat::Sam, "bam")
                 | (InputFormat::Sam, "cram")
+                | (InputFormat::BgzfSam, "bam")
+                | (InputFormat::BgzfSam, "cram")
                 | (InputFormat::Cram, "sam")
                 | (InputFormat::Cram, "bam")
         );
@@ -170,6 +284,8 @@ fn detect_format<P: AsRef<Path>>(path: P) -> io::Result<InputFormat> {
 pub enum InputFormat {
     Bam,
     Sam,
+    /// SAM text inside a BGZF stream, as `bgzip file.sam` produces.
+    BgzfSam,
     Cram,
 }
 
@@ -271,6 +387,9 @@ enum ReaderImpl {
     /// calls. Wins ~10-15 % on the aligner→sort handoff (tmp SAM is on
     /// disk, but the kernel already has it warm in page cache).
     SamMmap(sam::io::Reader<Cursor<MmapView>>),
+    /// SAM text inside a BGZF stream (`bgzip file.sam`). mmap buys nothing here
+    /// — the cost is decompression, not the read syscalls.
+    SamBgzf(sam::io::Reader<BufReader<bgzf::io::Reader<File>>>),
     Cram(CramSource),
 }
 
@@ -456,6 +575,18 @@ impl BamReader {
                     summary_fallback: RecordBuf::default(),
                 })
             }
+            InputFormat::BgzfSam => {
+                let file = File::open(path).context("open BGZF SAM")?;
+                let bgz = bgzf::io::Reader::new(file);
+                let mut reader = sam::io::Reader::new(BufReader::with_capacity(1 << 20, bgz));
+                let header = reader.read_header().context("read SAM header (BGZF)")?;
+                Ok(Self {
+                    inner: ReaderImpl::SamBgzf(reader),
+                    header,
+                    raw: bam::Record::default(),
+                    summary_fallback: RecordBuf::default(),
+                })
+            }
             InputFormat::Cram => {
                 let file = File::open(path).context("open CRAM")?;
                 let buf_file = BufReader::with_capacity(1 << 20, file);
@@ -515,6 +646,12 @@ impl BamReader {
                     .context("read SAM record (mmap)")?;
                 Ok(n > 0)
             }
+            ReaderImpl::SamBgzf(r) => {
+                let n = r
+                    .read_record_buf(&self.header, buf)
+                    .context("read SAM record (BGZF)")?;
+                Ok(n > 0)
+            }
             ReaderImpl::Cram(r) => r.read_record_buf(&self.header, buf),
         }
     }
@@ -557,10 +694,24 @@ impl BamReader {
         }
     }
 
+    /// Byte offset into the *compressed* stream, for BAM input only.
+    ///
+    /// Lets a caller extrapolate a record count from a short sample — sizing a
+    /// hash map, say — instead of paying a full decompression pass to count
+    /// exactly.
+    pub fn compressed_position(&self) -> Option<u64> {
+        match &self.inner {
+            ReaderImpl::Bam(r) => Some(r.get_ref().virtual_position().compressed()),
+            ReaderImpl::BamMmap(r) => Some(r.get_ref().virtual_position().compressed()),
+            _ => None,
+        }
+    }
+
     pub fn input_format(&self) -> InputFormat {
         match self.inner {
             ReaderImpl::Bam(_) | ReaderImpl::BamMmap(_) => InputFormat::Bam,
             ReaderImpl::Sam(_) | ReaderImpl::SamMmap(_) => InputFormat::Sam,
+            ReaderImpl::SamBgzf(_) => InputFormat::BgzfSam,
             ReaderImpl::Cram(_) => InputFormat::Cram,
         }
     }
@@ -681,8 +832,8 @@ impl BamWriter {
                 if opts.compression_workers >= 2 {
                     let workers = std::num::NonZero::new(opts.compression_workers)
                         .unwrap_or(std::num::NonZero::<usize>::MIN);
-                    let mut builder =
-                        bgzf::io::multithreaded_writer::Builder::default().set_worker_count(workers);
+                    let mut builder = bgzf::io::multithreaded_writer::Builder::default()
+                        .set_worker_count(workers);
                     if let Some(level) = opts.compression_level {
                         builder = builder.set_compression_level(level);
                     }
@@ -698,9 +849,12 @@ impl BamWriter {
                 }
             }
             OutputFormat::UncompressedBam => {
-                // FAST not NONE — works around noodles-bgzf 0.47 level-0 round-trip regression.
+                // Actually uncompressed, which is what `view -u` and the sort
+                // spill files ask for. This used to fall back to FAST to dodge
+                // a noodles-bgzf level-0 problem; `uncompressed_bam_round_trips`
+                // holds that fix in place.
                 let bgz = bgzf::io::writer::Builder::default()
-                    .set_compression_level(bgzf::io::writer::CompressionLevel::FAST)
+                    .set_compression_level(bgzf::io::writer::CompressionLevel::NONE)
                     .build_from_writer(buf);
                 WriterImpl::Bam(bam::io::Writer::from(bgz))
             }
@@ -773,7 +927,10 @@ impl BamWriter {
             self.write_header()?;
         }
         match &mut self.inner {
-            WriterImpl::Bam(w) => w.get_mut().write_all(raw).context("write pre-encoded BAM")?,
+            WriterImpl::Bam(w) => w
+                .get_mut()
+                .write_all(raw)
+                .context("write pre-encoded BAM")?,
             WriterImpl::BamMt(w) => w
                 .get_mut()
                 .write_all(raw)
@@ -836,6 +993,39 @@ pub fn is_broken_pipe(e: &anyhow::Error) -> bool {
         .any(|e| e.kind() == io::ErrorKind::BrokenPipe)
 }
 
+/// Write one record, tolerating only the record-validity failures noodles
+/// reports more strictly than samtools. Anything else — a full disk, a closed
+/// pipe, a failing sink — propagates, so a truncated output can never exit 0.
+///
+/// `skipped` accumulates the tolerated failures; pass it to [`report_skipped`]
+/// once the stream is done.
+pub fn write_record_tolerant(
+    writer: &mut BamWriter,
+    record: &RecordBuf,
+    tool: &str,
+    skipped: &mut u64,
+) -> Result<()> {
+    if let Err(e) = writer.write_record_buf(record) {
+        if !is_record_level_error(&e) {
+            return Err(e);
+        }
+        *skipped += 1;
+        if *skipped <= 5 {
+            eprintln!("[kira-bam {tool}] skip record: {e:#}");
+        } else if *skipped == 6 {
+            eprintln!("[kira-bam {tool}] (further skips suppressed)");
+        }
+    }
+    Ok(())
+}
+
+/// Summarise the records [`write_record_tolerant`] dropped.
+pub fn report_skipped(tool: &str, skipped: u64) {
+    if skipped > 0 {
+        eprintln!("[kira-bam {tool}] {skipped} records skipped as invalid");
+    }
+}
+
 /// Encode `records` into the raw BAM record stream consumed by
 /// [`BamWriter::write_preencoded`], returning how many records noodles rejected.
 ///
@@ -895,8 +1085,7 @@ mod finish_tests {
             OutputFormat::UncompressedBam,
             OutputFormat::Sam,
         ] {
-            let mut w =
-                BamWriter::from_writer(Box::new(FailingSink), header(), fmt).unwrap();
+            let mut w = BamWriter::from_writer(Box::new(FailingSink), header(), fmt).unwrap();
             // Header writes land in the 1 MiB BufWriter, not on the sink.
             let _ = w.write_header();
             assert!(
@@ -917,12 +1106,201 @@ mod finish_tests {
         assert!(!is_record_level_error(&broken));
         assert!(is_broken_pipe(&broken));
 
-        let record = anyhow::Error::new(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid CIGAR",
-        ))
-        .context("write BAM record");
+        let record =
+            anyhow::Error::new(io::Error::new(io::ErrorKind::InvalidInput, "invalid CIGAR"))
+                .context("write BAM record");
         assert!(is_record_level_error(&record));
         assert!(!is_broken_pipe(&record));
+    }
+}
+
+#[cfg(test)]
+mod uncompressed_tests {
+    use super::*;
+    use noodles_core::Position;
+    use noodles_sam::alignment::record::Flags;
+    use noodles_sam::alignment::record::cigar::{Op, op::Kind};
+    use noodles_sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+    use noodles_sam::header::record::value::{Map, map::ReferenceSequence};
+    use std::num::NonZeroUsize;
+
+    /// `view -u` promises an uncompressed BAM, and `sort` writes its spill
+    /// files that way to skip compression it never benefits from. Both were
+    /// silently getting level 1 instead; this pins the level-0 round trip so
+    /// the workaround cannot creep back unnoticed.
+    #[test]
+    fn uncompressed_bam_round_trips() {
+        let len = NonZeroUsize::try_from(1000).unwrap();
+        let header = Header::builder()
+            .add_reference_sequence("chr1", Map::<ReferenceSequence>::new(len))
+            .build();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u.bam");
+
+        let mut w =
+            BamWriter::create(Some(&path), header.clone(), OutputFormat::UncompressedBam).unwrap();
+        w.write_header().unwrap();
+        for i in 0..100 {
+            let rec = RecordBuf::builder()
+                .set_name(format!("r{i}"))
+                .set_flags(Flags::default())
+                .set_reference_sequence_id(0)
+                .set_alignment_start(Position::try_from(i + 1).unwrap())
+                .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 4)]))
+                .set_sequence(Sequence::from(b"ACGT".to_vec()))
+                .set_quality_scores(QualityScores::from(vec![30u8; 4]))
+                .build();
+            w.write_record_buf(&rec).unwrap();
+        }
+        w.finish().unwrap();
+
+        let mut reader = BamReader::open(&path).unwrap();
+        assert_eq!(reader.header().reference_sequences().len(), 1);
+        let mut rec = RecordBuf::default();
+        let mut n = 0;
+        while reader.read_record_buf(&mut rec).unwrap() {
+            n += 1;
+        }
+        assert_eq!(n, 100, "records lost in the uncompressed round trip");
+    }
+
+    /// `bgzip file.sam` is a BGZF stream that is not a BAM. Assuming every
+    /// gzip file was a BAM sent it to the BAM parser, which failed several
+    /// layers down with nothing about the actual problem.
+    #[test]
+    fn bgzipped_sam_is_read_as_sam() {
+        const SAM: &str = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:1000\n\
+             r1\t0\tchr1\t10\t60\t4M\t*\t0\t0\tACGT\tIIII\n\
+             r2\t0\tchr1\t20\t60\t4M\t*\t0\t0\tACGT\tIIII\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reads.sam.gz");
+        let file = File::create(&path).unwrap();
+        let mut w = bgzf::io::Writer::new(file);
+        w.write_all(SAM.as_bytes()).unwrap();
+        w.finish().unwrap();
+
+        assert_eq!(detect_format(&path).unwrap(), InputFormat::BgzfSam);
+
+        let mut reader = BamReader::open(&path).unwrap();
+        assert_eq!(reader.header().reference_sequences().len(), 1);
+        let mut rec = RecordBuf::default();
+        let mut n = 0;
+        while reader.read_record_buf(&mut rec).unwrap() {
+            n += 1;
+        }
+        assert_eq!(n, 2);
+    }
+
+    /// Plain `gzip` output is not BGZF and cannot be read; the error has to say
+    /// so rather than surface as a BAM decode failure.
+    #[test]
+    fn plain_gzip_is_rejected_by_name() {
+        // A minimal gzip member: header with no FEXTRA, then an empty stored
+        // deflate block. Only the header matters to detection.
+        let mut bytes: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        bytes.extend_from_slice(&[0x03, 0x00]);
+        bytes.extend_from_slice(&[0u8; 8]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.sam.gz");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = detect_format(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("plain gzip"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use super::*;
+
+    fn pg(subcmd: &str) -> PgInfo {
+        PgInfo {
+            id_prefix: format!("kira-bam.{subcmd}"),
+            name: "kira-bam".to_string(),
+            version: "0.0.0".to_string(),
+            cli: "kira-bam test".to_string(),
+            enable: true,
+        }
+    }
+
+    fn ids(header: &Header) -> Vec<String> {
+        header
+            .programs()
+            .as_ref()
+            .keys()
+            .map(|k| k.to_string())
+            .collect()
+    }
+
+    fn pp_of(header: &Header, id: &str) -> Option<String> {
+        header
+            .programs()
+            .as_ref()
+            .get(id.as_bytes())
+            .and_then(|m| m.other_fields().get(&pg_tag::PREVIOUS_PROGRAM_ID))
+            .map(|v| v.to_string())
+    }
+
+    #[test]
+    fn chains_through_pp() {
+        let mut h = Header::default();
+        append_pg(&mut h, &pg("sort")).unwrap();
+        append_pg(&mut h, &pg("markdup")).unwrap();
+        assert_eq!(ids(&h), ["kira-bam.sort", "kira-bam.markdup"]);
+        assert_eq!(pp_of(&h, "kira-bam.sort"), None);
+        assert_eq!(
+            pp_of(&h, "kira-bam.markdup").as_deref(),
+            Some("kira-bam.sort")
+        );
+    }
+
+    /// Re-running the same subcommand over its own output must not collide, and
+    /// must not grow the ID by the whole previous ID each time.
+    #[test]
+    fn repeated_runs_get_numbered_ids() {
+        let mut h = Header::default();
+        for _ in 0..4 {
+            append_pg(&mut h, &pg("sort")).unwrap();
+        }
+        assert_eq!(
+            ids(&h),
+            [
+                "kira-bam.sort",
+                "kira-bam.sort-1",
+                "kira-bam.sort-2",
+                "kira-bam.sort-3"
+            ]
+        );
+        assert_eq!(
+            pp_of(&h, "kira-bam.sort-3").as_deref(),
+            Some("kira-bam.sort-2")
+        );
+    }
+
+    /// A merged header holds one chain per input. The new record joins the last
+    /// one; it must not be duplicated across every chain.
+    #[test]
+    fn one_record_even_with_several_chains() {
+        let mut h = Header::default();
+        let leaf = |name: &str| {
+            Map::<Program>::builder()
+                .insert(pg_tag::NAME, name.as_bytes())
+                .build()
+                .unwrap()
+        };
+        h.programs_mut().as_mut().insert("bwa".into(), leaf("bwa"));
+        h.programs_mut()
+            .as_mut()
+            .insert("bwa-1".into(), leaf("bwa-other"));
+
+        append_pg(&mut h, &pg("merge")).unwrap();
+        assert_eq!(ids(&h), ["bwa", "bwa-1", "kira-bam.merge"]);
+        assert_eq!(pp_of(&h, "kira-bam.merge").as_deref(), Some("bwa-1"));
     }
 }

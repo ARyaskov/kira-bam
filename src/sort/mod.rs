@@ -30,7 +30,7 @@ const ESTIMATED_BYTES_PER_RECORD: usize = 512;
 /// Approximate live heap bytes of one decoded record. Budgeting in records
 /// instead would overshoot by two orders of magnitude on long reads, where a
 /// record costs ~200 kB rather than a few hundred bytes.
-fn approx_heap_size(rec: &RecordBuf) -> usize {
+pub(crate) fn approx_heap_size(rec: &RecordBuf) -> usize {
     /// Struct, `Vec` headers and allocator round-up.
     const FIXED: usize = 160;
     /// Undercounts long tag values.
@@ -111,7 +111,7 @@ impl PartialOrd for SortKey {
 
 /// Natural "string + number" comparison, a faithful port of htslib's
 /// `strnum_cmp` (used by `samtools sort -n`): maximal digit runs compare as
-/// numbers (leading zeros ignored, then more-leading-zeros sorts greater),
+/// numbers (leading zeros ignored, then more-leading-zeros sorts *less*),
 /// everything else byte-by-byte. This makes `r2` sort before `r10` exactly as
 /// samtools does.
 pub(crate) fn strnum_cmp(a: &[u8], b: &[u8]) -> Ordering {
@@ -161,8 +161,13 @@ pub(crate) fn strnum_cmp(a: &[u8], b: &[u8]) -> Ordering {
             } else if db {
                 return Ordering::Less;
             } else if ia != ib {
-                // Equal value but a different number of leading zeros consumed.
-                return ia.cmp(&ib);
+                // Equal value, different numbers of leading zeros consumed.
+                // htslib breaks the tie by *offset*, and the string that
+                // consumed fewer characters — the one with fewer zeros — sorts
+                // greater: `pa - a < pb - b ? 1 : -1`. Comparing the offsets the
+                // other way round put `1x` before `01x`, the opposite of
+                // samtools, on every name whose zero padding varies.
+                return ib.cmp(&ia);
             }
             // Equal numbers, same offset — fall through and keep comparing.
         } else if a[ia] != b[ib] {
@@ -683,7 +688,9 @@ mod sort_order_tests {
         keyed.sort_by(|a, b| a.0.cmp(&b.0));
         keyed
             .iter()
-            .map(|(_, i)| String::from_utf8_lossy(records[*i].name().unwrap().as_ref()).into_owned())
+            .map(|(_, i)| {
+                String::from_utf8_lossy(records[*i].name().unwrap().as_ref()).into_owned()
+            })
             .collect()
     }
 
@@ -751,7 +758,9 @@ mod sort_order_tests {
         let order: Vec<u32> = (0..n).map(|i| ((i + 7) % n) as u32).collect();
         let want: Vec<String> = order
             .iter()
-            .map(|&j| String::from_utf8_lossy(records[j as usize].name().unwrap().as_ref()).into_owned())
+            .map(|&j| {
+                String::from_utf8_lossy(records[j as usize].name().unwrap().as_ref()).into_owned()
+            })
             .collect();
         let mut got = records;
         apply_permutation(&mut got, order);
@@ -785,11 +794,43 @@ mod strnum_tests {
 
     #[test]
     fn leading_zeros_value_then_offset_tiebreak() {
-        // Equal numeric value: htslib breaks the tie on how many leading zeros
-        // were consumed (the one that consumed more sorts greater).
-        assert_eq!(cmp("00042", "42"), Ordering::Greater);
-        assert_eq!(cmp("1", "01"), Ordering::Less);
+        // Equal numeric value: htslib breaks the tie on how many characters
+        // each side consumed — `pa - a < pb - b ? 1 : -1` — so the string with
+        // *fewer* leading zeros sorts greater. These expectations previously
+        // encoded the opposite, which is what `sort -n` actually did.
+        assert_eq!(cmp("00042", "42"), Ordering::Less);
+        assert_eq!(cmp("42", "00042"), Ordering::Greater);
+        assert_eq!(cmp("1", "01"), Ordering::Greater);
+        assert_eq!(cmp("01x", "1x"), Ordering::Less);
         assert_eq!(cmp("042", "042"), Ordering::Equal);
+    }
+
+    /// Where two digit runs differ mid-run, htslib compares the first differing
+    /// digit once neither side has a longer run left — not the characters that
+    /// follow the numbers.
+    #[test]
+    fn equal_length_runs_compare_on_the_first_differing_digit() {
+        assert_eq!(cmp("a13b", "a12c"), Ordering::Greater);
+        assert_eq!(cmp("a12c", "a13b"), Ordering::Less);
+    }
+
+    /// The ordering has to be a strict weak ordering, or an unstable sort can
+    /// misbehave: reversing the arguments must reverse the answer.
+    #[test]
+    fn antisymmetric() {
+        let names = [
+            "r1", "r01", "r001", "r2", "r10", "a13b", "a12c", "1x", "01x", "chr1", "chr10", "",
+            "0", "00", "x", "x0y", "x00y",
+        ];
+        for a in names {
+            for b in names {
+                assert_eq!(
+                    cmp(a, b),
+                    cmp(b, a).reverse(),
+                    "cmp({a:?}, {b:?}) is not the reverse of cmp({b:?}, {a:?})"
+                );
+            }
+        }
     }
 
     #[test]

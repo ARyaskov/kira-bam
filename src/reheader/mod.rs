@@ -5,7 +5,7 @@ use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::ReheaderArgs;
-use crate::io::{BamReader, BamWriter, PgInfo, append_pg};
+use crate::io::{BamReader, BamWriter, PgInfo, append_pg, report_skipped, write_record_tolerant};
 use crate::types::OutputFormat;
 
 pub fn run(args: ReheaderArgs) -> Result<()> {
@@ -29,9 +29,11 @@ pub fn run(args: ReheaderArgs) -> Result<()> {
     let mut writer = BamWriter::create(Some(&args.output), new_header, OutputFormat::Bam)?;
     writer.write_header()?;
     let mut rec = RecordBuf::default();
+    let mut skipped = 0u64;
     while reader.read_record_buf(&mut rec)? {
-        let _ = writer.write_record_buf(&rec);
+        write_record_tolerant(&mut writer, &rec, "reheader", &mut skipped)?;
     }
     writer.finish()?;
+    report_skipped("reheader", skipped);
     Ok(())
 }

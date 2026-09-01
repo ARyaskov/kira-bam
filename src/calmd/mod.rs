@@ -1,25 +1,25 @@
-use std::collections::HashMap;
-use std::fs::File;
-
 use anyhow::{Context, Result};
-use noodles_fasta as fasta;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::cigar::op::Kind;
 use noodles_sam::alignment::record::data::field::Tag;
 use noodles_sam::alignment::record_buf::data::field::Value;
-use rustc_hash::FxHasher;
 
 use crate::cli::CalmdArgs;
-use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
+use crate::faidx::RefCache;
+use crate::io::{
+    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, report_skipped,
+    write_record_tolerant,
+};
 use crate::types::OutputFormat;
 
 pub fn run(args: CalmdArgs) -> Result<()> {
     install_thread_pool(args.threads);
 
-    let refs = load_reference(&args.reference)?;
+    // One contig at a time via the `.fai`, not the whole genome in a map.
+    let mut refs = RefCache::open(&args.reference)?;
 
-    let mut reader = BamReader::open_with_reference(&args.input, Some(&args.reference))
-        .context("open input")?;
+    let mut reader =
+        BamReader::open_with_reference(&args.input, Some(&args.reference)).context("open input")?;
     let mut header = reader.header().clone();
     append_pg(&mut header, &PgInfo::new("calmd", !args.no_pg))?;
 
@@ -33,60 +33,57 @@ pub fn run(args: CalmdArgs) -> Result<()> {
     let mut writer = BamWriter::create(args.output.as_deref(), header.clone(), fmt)?;
     writer.write_header()?;
 
+    // Contig names resolved once, not rebuilt as a String per record.
+    let ref_names: Vec<String> = header
+        .reference_sequences()
+        .keys()
+        .map(|n| n.to_string())
+        .collect();
+
     let mut rec = RecordBuf::default();
+    let mut skipped = 0u64;
+    let mut md = String::new();
     while reader.read_record_buf(&mut rec)? {
         if let Some(tid) = rec.reference_sequence_id() {
-            let ref_name: String = header
-                .reference_sequences()
-                .get_index(tid)
-                .map(|(n, _)| n.to_string())
-                .unwrap_or_default();
-            if let Some(seq) = refs.get(ref_name.as_bytes())
+            let ref_name = ref_names.get(tid).map(String::as_str).unwrap_or("");
+            if let Some(seq) = refs.sequence(ref_name)?
                 && let Some(start) = rec.alignment_start()
             {
                 let start = usize::from(start);
-                if let Some((md, nm)) = compute_md_nm(&rec, seq, start) {
+                if let Some(nm) = compute_md_nm(&rec, seq, start, &mut md) {
                     // samtools calmd writes exactly two tags: MD (mismatch string)
                     // and NM (edit distance). It must NOT touch NH — that tag is the
                     // number of reported alignments for a multi-mapper and is owned by
                     // the aligner. The previous code wrote NH = NM, silently corrupting
                     // multi-mapper bookkeeping for any downstream RNA-seq tool.
                     rec.data_mut()
-                        .insert(Tag::MISMATCHED_POSITIONS, Value::String(md.into()));
+                        .insert(Tag::MISMATCHED_POSITIONS, Value::String(md.clone().into()));
                     rec.data_mut()
                         .insert(Tag::EDIT_DISTANCE, Value::Int32(nm as i32));
                 }
             }
         }
-        let _ = writer.write_record_buf(&rec);
+        write_record_tolerant(&mut writer, &rec, "calmd", &mut skipped)?;
     }
     writer.finish()?;
+    report_skipped("calmd", skipped);
     Ok(())
 }
 
-fn load_reference(
-    path: &std::path::Path,
-) -> Result<HashMap<Vec<u8>, Vec<u8>, std::hash::BuildHasherDefault<FxHasher>>> {
-    let file = File::open(path).with_context(|| format!("open reference {}", path.display()))?;
-    let mut reader = fasta::io::Reader::new(std::io::BufReader::with_capacity(1 << 20, file));
-    let mut out: HashMap<Vec<u8>, Vec<u8>, std::hash::BuildHasherDefault<FxHasher>> =
-        HashMap::default();
-    for result in reader.records() {
-        let record = result.context("read FASTA record")?;
-        let name = record.name().to_vec();
-        let seq = record.sequence().as_ref().to_vec();
-        out.insert(name, seq);
-    }
-    Ok(out)
-}
-
-fn compute_md_nm(rec: &RecordBuf, refseq: &[u8], ref_start_1: usize) -> Option<(String, u32)> {
+/// Build the MD string into `md` (cleared first) and return the edit distance.
+/// `None` leaves `md` unspecified and means the record could not be scored.
+fn compute_md_nm(
+    rec: &RecordBuf,
+    refseq: &[u8],
+    ref_start_1: usize,
+    md: &mut String,
+) -> Option<u32> {
     use std::fmt::Write;
     let seq = rec.sequence().as_ref();
     if seq.is_empty() {
         return None;
     }
-    let mut md = String::new();
+    md.clear();
     let mut nm: u32 = 0;
     let mut read_idx: usize = 0;
     let mut ref_idx: usize = ref_start_1.saturating_sub(1);
@@ -141,5 +138,5 @@ fn compute_md_nm(rec: &RecordBuf, refseq: &[u8], ref_start_1: usize) -> Option<(
         }
     }
     write!(md, "{run_match}").ok()?;
-    Some((md, nm))
+    Some(nm)
 }

@@ -54,8 +54,20 @@ const FLAG_QCFAIL: u16 = 0x200;
 const FLAG_DUP: u16 = 0x400;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
-const MAX_INSERT_SIZE: usize = 8000;
-const MAX_READ_LENGTH: usize = 1024;
+/// Initial histogram capacities, not caps. They used to be hard limits, so any
+/// insert or read longer than this vanished from the report with no indication
+/// — silently truncating exactly the tail a QC plot is there to show. Long-read
+/// data made both routinely wrong.
+const INITIAL_INSERT_SIZE_BINS: usize = 8000;
+const INITIAL_READ_LENGTH_BINS: usize = 1024;
+
+/// Record a hit in `hist` at `idx`, growing it as needed.
+fn bump(hist: &mut Vec<u64>, idx: usize) {
+    if idx >= hist.len() {
+        hist.resize(idx + 1, 0);
+    }
+    hist[idx] += 1;
+}
 
 #[derive(Default)]
 struct Stats {
@@ -94,12 +106,18 @@ pub fn run(args: StatsArgs) -> Result<()> {
         .context("open input")?;
     let header = reader.header().clone();
     let mut st = Stats {
-        insert_size_hist: vec![0; MAX_INSERT_SIZE + 1],
-        read_length_hist: vec![0; MAX_READ_LENGTH + 1],
+        insert_size_hist: vec![0; INITIAL_INSERT_SIZE_BINS + 1],
+        read_length_hist: vec![0; INITIAL_READ_LENGTH_BINS + 1],
         gc_hist: vec![0; 101],
         mapq_hist: vec![0; 256],
         ..Default::default()
     };
+    // Contig names resolved once, not rebuilt as a String per record.
+    let ref_names: Vec<String> = header
+        .reference_sequences()
+        .keys()
+        .map(|n| n.to_string())
+        .collect();
 
     let mut rec = RecordBuf::default();
     while reader.read_record_buf(&mut rec)? {
@@ -111,11 +129,7 @@ pub fn run(args: StatsArgs) -> Result<()> {
         // BED filter (samtools issue #2172).
         if let Some(b) = &bed {
             if let Some(tid) = rec.reference_sequence_id() {
-                let ref_name: String = header
-                    .reference_sequences()
-                    .get_index(tid)
-                    .map(|(n, _)| n.to_string())
-                    .unwrap_or_default();
+                let ref_name = ref_names.get(tid).map(String::as_str).unwrap_or("");
                 let s = rec
                     .alignment_start()
                     .map(|p| usize::from(p) as u64)
@@ -125,7 +139,7 @@ pub fn run(args: StatsArgs) -> Result<()> {
                     .map(|p| usize::from(p) as u64)
                     .unwrap_or(s);
                 let pass = b
-                    .get(&ref_name)
+                    .get(ref_name)
                     .map(|ivs| in_any(ivs, s, e))
                     .unwrap_or(false);
                 if !pass {
@@ -137,17 +151,18 @@ pub fn run(args: StatsArgs) -> Result<()> {
                 continue;
             }
         }
-        if let Some(mapq) = rec.mapping_quality() {
-            let mapq = u8::from(mapq);
-            if mapq < args.min_mapq {
-                st.filtered_out += 1;
-                continue;
-            }
-            st.sum_mapq += mapq as u64;
-            st.mapq_hist[mapq as usize] += 1;
-            if mapq == 0 {
-                st.reads_mq0 += 1;
-            }
+        // MAPQ 255 means "unavailable", which noodles reports as `None`. Those
+        // records used to skip the `-q` filter and every MAPQ counter entirely;
+        // treating the sentinel as its literal 255 keeps one record on one code
+        // path.
+        let mapq = rec.mapping_quality().map(u8::from).unwrap_or(255);
+        if mapq < args.min_mapq {
+            st.filtered_out += 1;
+            continue;
+        }
+        st.mapq_hist[mapq as usize] += 1;
+        if mapq == 0 {
+            st.reads_mq0 += 1;
         }
         if (flags & FLAG_QCFAIL) != 0 {
             st.qc_failed += 1;
@@ -160,6 +175,10 @@ pub fn run(args: StatsArgs) -> Result<()> {
             st.reads_unmapped += 1;
         } else {
             st.mapped += 1;
+            // Summed over the same records "average MAPQ" divides by, so the
+            // two agree; unmapped reads used to contribute to the numerator
+            // while the denominator counted only mapped ones.
+            st.sum_mapq += mapq as u64;
             // "bases mapped" = full read length of mapped reads.
             st.bases_mapped_seq += rec.sequence().as_ref().len() as u64;
             // "bases mapped (cigar)" = only ref-and-read-consuming ops.
@@ -177,17 +196,18 @@ pub fn run(args: StatsArgs) -> Result<()> {
             if (flags & FLAG_PROPER_PAIR) != 0 {
                 st.properly_paired += 1;
             }
-            let isize = rec.template_length().unsigned_abs() as usize;
-            if isize <= MAX_INSERT_SIZE {
-                st.insert_size_hist[isize] += 1;
+            // One count per *pair*, not per read: samtools tallies the insert
+            // size only on the record with a positive TLEN, so counting both
+            // mates doubled every bin of the IS histogram.
+            let tlen = rec.template_length();
+            if tlen > 0 {
+                bump(&mut st.insert_size_hist, tlen as usize);
             }
         }
         let seq = rec.sequence().as_ref();
         let read_len = seq.len();
         st.bases_total += read_len as u64;
-        if read_len <= MAX_READ_LENGTH {
-            st.read_length_hist[read_len] += 1;
-        }
+        bump(&mut st.read_length_hist, read_len);
         let n_count = seq.iter().filter(|&&b| b == b'N' || b == b'n').count();
         st.bases_n += n_count as u64;
         let gc = seq
@@ -208,16 +228,20 @@ pub fn run(args: StatsArgs) -> Result<()> {
         writeln!(out, "# sample {s}")?;
     }
     writeln!(out, "# This file was produced by kira-bam stats.")?;
+    // Field names and order follow samtools stats, which is what MultiQC and
+    // every other `SN`-line parser keys on. `total bases` in particular is
+    // spelled `total length` there and was simply not found before.
     writeln!(out, "SN\traw total sequences:\t{}", st.raw_total)?;
     writeln!(out, "SN\tfiltered sequences:\t{}", st.filtered_out)?;
+    writeln!(out, "SN\tsequences:\t{}", st.raw_total - st.filtered_out)?;
     writeln!(out, "SN\treads mapped:\t{}", st.mapped)?;
     writeln!(out, "SN\treads unmapped:\t{}", st.reads_unmapped)?;
-    writeln!(out, "SN\treads duplicated:\t{}", st.duplicates)?;
-    writeln!(out, "SN\treads QC failed:\t{}", st.reads_qc_failed)?;
-    writeln!(out, "SN\treads paired:\t{}", st.paired)?;
     writeln!(out, "SN\treads properly paired:\t{}", st.properly_paired)?;
+    writeln!(out, "SN\treads paired:\t{}", st.paired)?;
+    writeln!(out, "SN\treads duplicated:\t{}", st.duplicates)?;
     writeln!(out, "SN\treads MQ0:\t{}", st.reads_mq0)?;
-    writeln!(out, "SN\ttotal bases:\t{}", st.bases_total)?;
+    writeln!(out, "SN\treads QC failed:\t{}", st.reads_qc_failed)?;
+    writeln!(out, "SN\ttotal length:\t{}", st.bases_total)?;
     writeln!(out, "SN\tbases mapped:\t{}", st.bases_mapped_seq)?;
     writeln!(out, "SN\tbases mapped (cigar):\t{}", st.bases_mapped)?;
     writeln!(out, "SN\tbases N:\t{}", st.bases_n)?;

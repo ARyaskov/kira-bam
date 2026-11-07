@@ -44,14 +44,12 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
             write_base(&mut out, b'N', &mut line_pos, args.line_width)?;
             last_pos += 1;
         }
-        let mut depth = col.len() as u32;
-        if depth > args.max_depth {
-            depth = args.max_depth;
+        if col.len() > args.max_depth as usize {
+            col.truncate(args.max_depth as usize);
         }
         let base = majority(&col, args.call_fraction);
         write_base(&mut out, base, &mut line_pos, args.line_width)?;
         last_pos = pos;
-        let _ = depth;
     }
     if current_tid.is_some() {
         writeln!(out)?;
@@ -100,5 +98,94 @@ fn majority(col: &[(u8, u8)], threshold: f32) -> u8 {
         2 => b'G',
         3 => b'T',
         _ => b'N',
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::BamWriter;
+    use crate::types::OutputFormat;
+    use noodles_core::Position;
+    use noodles_sam::Header;
+    use noodles_sam::alignment::RecordBuf;
+    use noodles_sam::alignment::record::Flags;
+    use noodles_sam::alignment::record::cigar::Op;
+    use noodles_sam::alignment::record::cigar::op::Kind;
+    use noodles_sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+    use noodles_sam::header::record::value::{Map, map::ReferenceSequence};
+    use std::num::NonZeroUsize;
+
+    fn header() -> Header {
+        let len = NonZeroUsize::try_from(1_000).unwrap();
+        Header::builder()
+            .add_reference_sequence("chr1", Map::<ReferenceSequence>::new(len))
+            .build()
+    }
+
+    fn read(name: &str, seq: &[u8]) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(0)
+            // Start at 1: later starts shift every call right behind N padding
+            // and the assertion would have to model the padding, not the cap.
+            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 5)]))
+            .set_sequence(Sequence::from(seq.to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; 5]))
+            .build()
+    }
+
+    /// Run consensus over a BAM of stacked reads and return the called bases.
+    fn consensus_bases(max_depth: u32, records: &[RecordBuf]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let bam = dir.path().join("in.bam");
+        let fasta = dir.path().join("out.fa");
+        {
+            let mut w = BamWriter::create(Some(&bam), header(), OutputFormat::Bam).unwrap();
+            w.write_header().unwrap();
+            for r in records {
+                w.write_record_buf(r).unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        let args = ConsensusArgs {
+            input: bam,
+            output: Some(fasta.clone()),
+            min_mapq: 0,
+            min_baseq: 0,
+            max_depth,
+            call_fraction: 0.5,
+            line_width: 60,
+            reference: None,
+        };
+        run(args).unwrap();
+
+        // Skip the `>chr1` header line; collect the wrapped base calls.
+        let text = std::fs::read_to_string(&fasta).unwrap();
+        text.lines().skip(1).collect::<String>()
+    }
+
+    #[test]
+    fn max_depth_caps_the_column_before_the_call() {
+        // The first read deep calls `C`. Without the cap the column is 2 deep
+        // C vs T, a tie, and this base call flipped; with `-d 1` the cap makes
+        // the call follow the surviving read.
+        let bases = consensus_bases(
+            1,
+            &[read("r1", b"CCCCC"), read("r2", b"TTTTT")],
+        );
+        assert_eq!(bases, "CCCCC", "call must reflect -d 1, not the tie: {bases:?}");
+    }
+
+    #[test]
+    fn zero_depth_calls_every_position_n() {
+        let bases = consensus_bases(
+            0,
+            &[read("r1", b"ACGTA"), read("r2", b"ACGTA")],
+        );
+        assert_eq!(bases, "NNNNN", "an empty capped column must call N: {bases:?}");
     }
 }

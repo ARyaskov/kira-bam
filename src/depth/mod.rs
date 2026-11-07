@@ -20,7 +20,7 @@ struct DepthIv {
 /// increasing order, so membership only needs the cursor advanced; testing every
 /// interval per position costs `positions × intervals`.
 #[derive(Debug, Default)]
-struct BedCursor {
+pub(crate) struct BedCursor {
     ivs: Vec<DepthIv>,
     at: usize,
 }
@@ -40,7 +40,7 @@ impl BedCursor {
     }
 
     /// Is `pos` covered? Positions must be non-decreasing between calls.
-    fn contains(&mut self, pos: u64) -> bool {
+    pub(crate) fn contains(&mut self, pos: u64) -> bool {
         while self.at < self.ivs.len() && self.ivs[self.at].end < pos {
             self.at += 1;
         }
@@ -50,7 +50,7 @@ impl BedCursor {
     /// Lowest and highest position this contig's intervals touch. Lets the
     /// `-a` sweep skip straight to the restricted span instead of walking the
     /// whole reference to discard it a position at a time.
-    fn span(&self) -> Option<(u64, u64)> {
+    pub(crate) fn span(&self) -> Option<(u64, u64)> {
         match (self.ivs.first(), self.ivs.last()) {
             (Some(f), Some(l)) => Some((f.start, l.end)),
             _ => None,
@@ -58,12 +58,12 @@ impl BedCursor {
     }
 }
 
-type CursorMap = HashMap<String, BedCursor, std::hash::BuildHasherDefault<FxHasher>>;
+pub(crate) type CursorMap = HashMap<String, BedCursor, std::hash::BuildHasherDefault<FxHasher>>;
 
 /// Parse `-r` region specs into the same cursor structure `-b` uses: both are
 /// just per-contig position filters. `chr`, `chr:start` and `chr:start-end`
 /// are all accepted, 1-based inclusive as samtools writes them.
-fn parse_regions(specs: &[String], refs: &[(String, usize)]) -> Result<CursorMap> {
+pub(crate) fn parse_regions(specs: &[String], refs: &[(String, usize)]) -> Result<CursorMap> {
     let mut raw: HashMap<String, Vec<DepthIv>, std::hash::BuildHasherDefault<FxHasher>> =
         HashMap::default();
     for spec in specs {

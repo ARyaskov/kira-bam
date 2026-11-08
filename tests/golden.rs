@@ -429,7 +429,60 @@ fn cram_roundtrip_preserves_alignment() {
     assert_eq!(original, restored, "CRAM round-trip changed an alignment field");
 }
 
+#[test]
+fn mpileup_multi_input_columns_match_samtools() {
+    let st = require_samtools!();
+    let dir = tmpdir();
+    let a = build_bam(&st, dir.path(), "ma", MERGE_A_SAM);
+    let b = build_bam(&st, dir.path(), "mb", MERGE_B_SAM);
+
+    let k_out = dir.path().join("k.mpileup.tsv");
+    run_ok(
+        "kira mpileup",
+        Command::new(kira_bam())
+            .args(["mpileup", "-o"])
+            .arg(&k_out)
+            .arg(&a)
+            .arg(&b),
+    );
+    let kira = mpileup_depth_projection(&strip_cr(&std::fs::read_to_string(&k_out).unwrap()));
+
+    // -B drops BAQ (kira has none); the projection compares CHROM/POS/REF and
+    // every sample's depth only, because kira lacks samtools' ^/$/indel/strand
+    // base markup.
+    let s_out = run_ok(
+        "samtools mpileup",
+        Command::new(&st)
+            .args(["mpileup", "-B", "-d", "8000", "-q", "0", "-Q", "13"])
+            .arg(&a)
+            .arg(&b),
+    );
+    assert_eq!(
+        mpileup_depth_projection(&s_out),
+        kira,
+        "mpileup multi-input projection differs from samtools"
+    );
+}
+
 // ── comparison helpers ────────────────────────────────────────────────────────
+
+/// CHROM POS REF plus the leading depth field of each following
+/// depth/bases/quals triplet — the multi-input invariant both tools must keep.
+fn mpileup_depth_projection(out: &str) -> Vec<String> {
+    out.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let mut p = vec![f[0].to_string(), f[1].to_string(), f[2].to_string()];
+            let mut i = 3;
+            while i < f.len() {
+                p.push(f[i].to_string());
+                i += 3;
+            }
+            p.join("\t")
+        })
+        .collect()
+}
 
 /// Sorted multiset of non-empty lines (order-insensitive record-set equality).
 fn multiset(body: &str) -> Vec<String> {
@@ -483,11 +536,11 @@ fn assert_coordinate_sorted(samtools: &str, bam: &Path) {
     let header = run_ok("samtools view -H", Command::new(samtools).args(["view", "-H"]).arg(bam));
     let mut order: HashMap<String, usize> = HashMap::new();
     for line in header.lines() {
-        if let Some(rest) = line.strip_prefix("@SQ\t") {
-            if let Some(sn) = rest.split('\t').find_map(|f| f.strip_prefix("SN:")) {
-                let idx = order.len();
-                order.insert(sn.to_string(), idx);
-            }
+        if let Some(rest) = line.strip_prefix("@SQ\t")
+            && let Some(sn) = rest.split('\t').find_map(|f| f.strip_prefix("SN:"))
+        {
+            let idx = order.len();
+            order.insert(sn.to_string(), idx);
         }
     }
     let body = decode(samtools, bam, &[]);

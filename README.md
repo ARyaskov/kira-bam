@@ -188,7 +188,10 @@ kira-bam tview     -p chr:pos [-w INT] [-d INT] [--no-color] in.indexed.bam [ref
   8000), `-Q` defaults to 13. `-r` bounds every row, covered or zero-filled;
   `-a` emits every position including zero-coverage ones, from the start to the
   end (or the `-r` span) of each reference sequence that has reads — reference
-  sequences without reads stay absent even if a region names them.
+  sequences without reads stay absent even if a region names them. Multiple
+  input BAMs each add their own depth/bases/quality triplet, in the order the
+  files are given; a position is emitted when any input covers it, and an
+  input lacking coverage there contributes a `0 * *` triplet.
 - **`consensus`** — majority-call consensus as FASTA. `--call-fraction` is the
   fraction a base must reach to be called (default 0.5, below it becomes `N`),
   `--line-width` the FASTA wrap (default 60). Input must be coordinate-sorted.

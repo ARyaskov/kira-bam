@@ -155,10 +155,13 @@ pub fn run(args: MergeArgs) -> Result<()> {
 
 /// Per-input map from a read-group ID as stored in that input's records to the
 /// one it was given in the merged header.
-type RgRenames = HashMap<BString, BString>;
+pub(crate) type RgRenames = HashMap<BString, BString>;
 
 /// Build the merged header, plus the read-group renames it forced.
-fn merge_headers(headers: Vec<&Header>, kind: SortKind) -> Result<(Header, Vec<RgRenames>)> {
+pub(crate) fn merge_headers(
+    headers: Vec<&Header>,
+    kind: SortKind,
+) -> Result<(Header, Vec<RgRenames>)> {
     use bstr::ByteSlice;
 
     let mut merged = headers
@@ -288,7 +291,7 @@ fn merge_headers(headers: Vec<&Header>, kind: SortKind) -> Result<(Header, Vec<R
 /// every record) to the corresponding id in the merged header, matched by @SQ
 /// name. `None` means the name is absent from the merged header — impossible
 /// when the merged header is the union of all inputs, but handled defensively.
-fn build_tid_maps(inputs: &[Header], merged: &Header) -> Vec<Vec<Option<usize>>> {
+pub(crate) fn build_tid_maps(inputs: &[Header], merged: &Header) -> Vec<Vec<Option<usize>>> {
     use std::collections::HashMap;
     let merged_idx: HashMap<String, usize> = merged
         .reference_sequences()
@@ -311,7 +314,7 @@ fn build_tid_maps(inputs: &[Header], merged: &Header) -> Vec<Vec<Option<usize>>>
 /// visiting local tids 0,1,2,… (the order a coordinate-sorted input emits them)
 /// are non-decreasing. A `false` result means the input's @SQ order is a
 /// permutation of the merged order and cannot be stream-merged.
-fn is_sorted_compatible(map: &[Option<usize>]) -> bool {
+pub(crate) fn is_sorted_compatible(map: &[Option<usize>]) -> bool {
     let mut last: Option<usize> = None;
     for &m in map {
         if let Some(v) = m {

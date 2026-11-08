@@ -4,7 +4,7 @@ use clap::Parser;
 
 #[derive(Parser, Debug)]
 pub struct MpileupArgs {
-    /// Input BAM (sorted).
+    /// Input BAM(s) (sorted).
     #[arg(value_name = "IN", required = true)]
     pub inputs: Vec<PathBuf>,
 

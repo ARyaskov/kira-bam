@@ -173,19 +173,19 @@ mod tests {
         // The first read deep calls `C`. Without the cap the column is 2 deep
         // C vs T, a tie, and this base call flipped; with `-d 1` the cap makes
         // the call follow the surviving read.
-        let bases = consensus_bases(
-            1,
-            &[read("r1", b"CCCCC"), read("r2", b"TTTTT")],
+        let bases = consensus_bases(1, &[read("r1", b"CCCCC"), read("r2", b"TTTTT")]);
+        assert_eq!(
+            bases, "CCCCC",
+            "call must reflect -d 1, not the tie: {bases:?}"
         );
-        assert_eq!(bases, "CCCCC", "call must reflect -d 1, not the tie: {bases:?}");
     }
 
     #[test]
     fn zero_depth_calls_every_position_n() {
-        let bases = consensus_bases(
-            0,
-            &[read("r1", b"ACGTA"), read("r2", b"ACGTA")],
+        let bases = consensus_bases(0, &[read("r1", b"ACGTA"), read("r2", b"ACGTA")]);
+        assert_eq!(
+            bases, "NNNNN",
+            "an empty capped column must call N: {bases:?}"
         );
-        assert_eq!(bases, "NNNNN", "an empty capped column must call N: {bases:?}");
     }
 }

@@ -31,7 +31,9 @@ use std::process::Command;
 // ── harness plumbing ──────────────────────────────────────────────────────────
 
 fn samtools() -> Option<String> {
-    std::env::var("KIRA_BAM_SAMTOOLS").ok().filter(|s| !s.is_empty())
+    std::env::var("KIRA_BAM_SAMTOOLS")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn kira_bam() -> String {
@@ -39,7 +41,9 @@ fn kira_bam() -> String {
 }
 
 fn fixtures_dir() -> Option<String> {
-    std::env::var("KIRA_BAM_FIXTURES").ok().filter(|s| !s.is_empty())
+    std::env::var("KIRA_BAM_FIXTURES")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn strip_cr(s: &str) -> String {
@@ -224,8 +228,14 @@ fn flagstat_byte_identical() {
     let st = require_samtools!();
     let dir = tmpdir();
     for bam in corpus(&st, dir.path()) {
-        let s = run_ok("samtools flagstat", Command::new(&st).arg("flagstat").arg(&bam));
-        let k = run_ok("kira flagstat", Command::new(kira_bam()).arg("flagstat").arg(&bam));
+        let s = run_ok(
+            "samtools flagstat",
+            Command::new(&st).arg("flagstat").arg(&bam),
+        );
+        let k = run_ok(
+            "kira flagstat",
+            Command::new(kira_bam()).arg("flagstat").arg(&bam),
+        );
         assert_eq!(s, k, "flagstat mismatch for {}", bam.display());
     }
 }
@@ -269,9 +279,18 @@ fn sort_matches_samtools() {
     let bam = build_bam(&st, dir.path(), "basic", BASIC_SAM);
 
     let ks = dir.path().join("k.sorted.bam");
-    run_ok("kira sort", Command::new(kira_bam()).args(["sort", "-o"]).arg(&ks).arg(&bam));
+    run_ok(
+        "kira sort",
+        Command::new(kira_bam())
+            .args(["sort", "-o"])
+            .arg(&ks)
+            .arg(&bam),
+    );
     let ss = dir.path().join("s.sorted.bam");
-    run_ok("samtools sort", Command::new(&st).args(["sort", "-o"]).arg(&ss).arg(&bam));
+    run_ok(
+        "samtools sort",
+        Command::new(&st).args(["sort", "-o"]).arg(&ss).arg(&bam),
+    );
 
     let kbody = decode(&st, &ks, &[]);
     let sbody = decode(&st, &ss, &[]);
@@ -294,9 +313,18 @@ fn sort_coordinate_ties_byte_identical() {
     let dir = tmpdir();
     let bam = build_bam(&st, dir.path(), "ties", TIES_SAM);
     let ks = dir.path().join("k.bam");
-    run_ok("kira sort", Command::new(kira_bam()).args(["sort", "-o"]).arg(&ks).arg(&bam));
+    run_ok(
+        "kira sort",
+        Command::new(kira_bam())
+            .args(["sort", "-o"])
+            .arg(&ks)
+            .arg(&bam),
+    );
     let ss = dir.path().join("s.bam");
-    run_ok("samtools sort", Command::new(&st).args(["sort", "-o"]).arg(&ss).arg(&bam));
+    run_ok(
+        "samtools sort",
+        Command::new(&st).args(["sort", "-o"]).arg(&ss).arg(&bam),
+    );
     // Strict: with the htslib-matching (tid, pos, reverse) key + stable order, the
     // coordinate tie-break must be byte-identical, not merely the same multiset.
     assert_eq!(
@@ -312,9 +340,21 @@ fn sort_name_order_byte_identical() {
     let dir = tmpdir();
     let bam = build_bam(&st, dir.path(), "nties", NAME_TIES_SAM);
     let ks = dir.path().join("k.bam");
-    run_ok("kira sort -n", Command::new(kira_bam()).args(["sort", "-n", "-o"]).arg(&ks).arg(&bam));
+    run_ok(
+        "kira sort -n",
+        Command::new(kira_bam())
+            .args(["sort", "-n", "-o"])
+            .arg(&ks)
+            .arg(&bam),
+    );
     let ss = dir.path().join("s.bam");
-    run_ok("samtools sort -n", Command::new(&st).args(["sort", "-n", "-o"]).arg(&ss).arg(&bam));
+    run_ok(
+        "samtools sort -n",
+        Command::new(&st)
+            .args(["sort", "-n", "-o"])
+            .arg(&ss)
+            .arg(&bam),
+    );
     assert_eq!(
         decode(&st, &ss, &[]),
         decode(&st, &ks, &[]),
@@ -332,10 +372,22 @@ fn merge_byte_identical() {
     let km = dir.path().join("k.merged.bam");
     run_ok(
         "kira merge",
-        Command::new(kira_bam()).args(["merge", "-f", "-o"]).arg(&km).arg(&a).arg(&b),
+        Command::new(kira_bam())
+            .args(["merge", "-f", "-o"])
+            .arg(&km)
+            .arg(&a)
+            .arg(&b),
     );
     let sm = dir.path().join("s.merged.bam");
-    run_ok("samtools merge", Command::new(&st).arg("merge").arg("-f").arg(&sm).arg(&a).arg(&b));
+    run_ok(
+        "samtools merge",
+        Command::new(&st)
+            .arg("merge")
+            .arg("-f")
+            .arg(&sm)
+            .arg(&a)
+            .arg(&b),
+    );
     assert_eq!(
         decode(&st, &sm, &[]),
         decode(&st, &km, &[]),
@@ -349,13 +401,28 @@ fn index_and_idxstats_match() {
     let dir = tmpdir();
     let bam = build_bam(&st, dir.path(), "basic", BASIC_SAM);
     let sorted = dir.path().join("sorted.bam");
-    run_ok("samtools sort", Command::new(&st).args(["sort", "-o"]).arg(&sorted).arg(&bam));
+    run_ok(
+        "samtools sort",
+        Command::new(&st)
+            .args(["sort", "-o"])
+            .arg(&sorted)
+            .arg(&bam),
+    );
 
     // Build the index with kira, then make samtools read it: tests both the
     // kira-written .bai and kira idxstats against samtools.
-    run_ok("kira index", Command::new(kira_bam()).arg("index").arg(&sorted));
-    let s = run_ok("samtools idxstats", Command::new(&st).arg("idxstats").arg(&sorted));
-    let k = run_ok("kira idxstats", Command::new(kira_bam()).arg("idxstats").arg(&sorted));
+    run_ok(
+        "kira index",
+        Command::new(kira_bam()).arg("index").arg(&sorted),
+    );
+    let s = run_ok(
+        "samtools idxstats",
+        Command::new(&st).arg("idxstats").arg(&sorted),
+    );
+    let k = run_ok(
+        "kira idxstats",
+        Command::new(kira_bam()).arg("idxstats").arg(&sorted),
+    );
     assert_eq!(s, k, "idxstats mismatch on kira-built index");
 }
 
@@ -368,14 +435,32 @@ fn markdup_duplicate_set_matches() {
     // Both tools require the standard prep: fixmate -m (adds MC/ms) then sort.
     // Prepare once with samtools so the markdup *input* is identical for both.
     let fm = dir.path().join("fm.bam");
-    run_ok("samtools fixmate", Command::new(&st).args(["fixmate", "-m"]).arg(&raw).arg(&fm));
+    run_ok(
+        "samtools fixmate",
+        Command::new(&st).args(["fixmate", "-m"]).arg(&raw).arg(&fm),
+    );
     let prepared = dir.path().join("prepared.bam");
-    run_ok("samtools sort", Command::new(&st).args(["sort", "-o"]).arg(&prepared).arg(&fm));
+    run_ok(
+        "samtools sort",
+        Command::new(&st)
+            .args(["sort", "-o"])
+            .arg(&prepared)
+            .arg(&fm),
+    );
 
     let s_md = dir.path().join("s.md.bam");
-    run_ok("samtools markdup", Command::new(&st).arg("markdup").arg(&prepared).arg(&s_md));
+    run_ok(
+        "samtools markdup",
+        Command::new(&st).arg("markdup").arg(&prepared).arg(&s_md),
+    );
     let k_md = dir.path().join("k.md.bam");
-    run_ok("kira markdup", Command::new(kira_bam()).arg("markdup").arg(&prepared).arg(&k_md));
+    run_ok(
+        "kira markdup",
+        Command::new(kira_bam())
+            .arg("markdup")
+            .arg(&prepared)
+            .arg(&k_md),
+    );
 
     assert_eq!(
         dup_flagged_qnames(&st, &s_md),
@@ -393,8 +478,14 @@ fn calmd_md_nm_values_match() {
     run_ok("samtools faidx", Command::new(&st).arg("faidx").arg(&refp));
     let bam = build_bam(&st, dir.path(), "aln", ALIGNED_SAM);
 
-    let s = run_ok("samtools calmd", Command::new(&st).arg("calmd").arg(&bam).arg(&refp));
-    let k = run_ok("kira calmd", Command::new(kira_bam()).arg("calmd").arg(&bam).arg(&refp));
+    let s = run_ok(
+        "samtools calmd",
+        Command::new(&st).arg("calmd").arg(&bam).arg(&refp),
+    );
+    let k = run_ok(
+        "kira calmd",
+        Command::new(kira_bam()).arg("calmd").arg(&bam).arg(&refp),
+    );
     // Compare MD/NM by read, order-independent (samtools emits NM,MD; kira MD,NM).
     assert_eq!(
         md_nm_by_read(&s),
@@ -426,7 +517,10 @@ fn cram_roundtrip_preserves_alignment() {
     // only the mandatory fields (cols 1–11), which must round-trip losslessly.
     let original = mandatory_fields(&decode(&st, &bam, &[]));
     let restored = mandatory_fields(&decode(&st, &cram, &["-T", refp.to_str().unwrap()]));
-    assert_eq!(original, restored, "CRAM round-trip changed an alignment field");
+    assert_eq!(
+        original, restored,
+        "CRAM round-trip changed an alignment field"
+    );
 }
 
 #[test]
@@ -486,7 +580,11 @@ fn mpileup_depth_projection(out: &str) -> Vec<String> {
 
 /// Sorted multiset of non-empty lines (order-insensitive record-set equality).
 fn multiset(body: &str) -> Vec<String> {
-    let mut v: Vec<String> = body.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+    let mut v: Vec<String> = body
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
     v.sort();
     v
 }
@@ -501,11 +599,14 @@ fn mandatory_fields(body: &str) -> Vec<String> {
 
 /// QNAMEs of records carrying the duplicate flag (0x400), as a set.
 fn dup_flagged_qnames(samtools: &str, bam: &Path) -> BTreeSet<String> {
-    run_ok("samtools view -f1024", Command::new(samtools).args(["view", "-f", "1024"]).arg(bam))
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.split('\t').next().unwrap_or("").to_string())
-        .collect()
+    run_ok(
+        "samtools view -f1024",
+        Command::new(samtools).args(["view", "-f", "1024"]).arg(bam),
+    )
+    .lines()
+    .filter(|l| !l.is_empty())
+    .map(|l| l.split('\t').next().unwrap_or("").to_string())
+    .collect()
 }
 
 /// Map QNAME → (MD, NM) by scanning optional fields, ignoring tag order.
@@ -533,7 +634,10 @@ fn md_nm_by_read(body: &str) -> BTreeMap<String, (String, String)> {
 /// Assert a BAM is in coordinate order: (reference index, position) is
 /// non-decreasing, with unmapped (`*`) records placed last.
 fn assert_coordinate_sorted(samtools: &str, bam: &Path) {
-    let header = run_ok("samtools view -H", Command::new(samtools).args(["view", "-H"]).arg(bam));
+    let header = run_ok(
+        "samtools view -H",
+        Command::new(samtools).args(["view", "-H"]).arg(bam),
+    );
     let mut order: HashMap<String, usize> = HashMap::new();
     for line in header.lines() {
         if let Some(rest) = line.strip_prefix("@SQ\t")
@@ -549,7 +653,11 @@ fn assert_coordinate_sorted(samtools: &str, bam: &Path) {
         let mut f = line.split('\t');
         let rname = f.nth(2).unwrap_or("*");
         let pos: i64 = f.next().unwrap_or("0").parse().unwrap_or(0);
-        let tid = if rname == "*" { usize::MAX } else { *order.get(rname).unwrap_or(&usize::MAX) };
+        let tid = if rname == "*" {
+            usize::MAX
+        } else {
+            *order.get(rname).unwrap_or(&usize::MAX)
+        };
         let cur = (tid, pos);
         assert!(cur >= last, "not coordinate-sorted at {line}");
         last = cur;

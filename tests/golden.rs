@@ -26,6 +26,9 @@
 //!   after folding samtools' `^`/`$`/strand boundary markup (kira omits that
 //!   markup, and the fixture is deliberately indel-free).
 //! * CRAM round-trip — identical mandatory fields (cols 1–11) after decode.
+//! * `depth -a -r` — byte-identical output on the shared flag subset (no
+//!   `-aa`/`-J`/`-d`/`-s` and no paired/secondary/duplicate reads), plus an
+//!   ungated exact-output check on the coordinate-boundary fixture.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -550,6 +553,68 @@ fn cram_roundtrip_preserves_alignment() {
         original, restored,
         "CRAM round-trip changed an alignment field"
     );
+}
+
+/// Depth edge fixture: one contig (`chr1` LN:8) with single-base reads at the
+/// first and last 1-based coordinate positions, CIGAR 1M. Single-end, flags 0,
+/// MAPQ 60, base quality `I` — above all defaults (excl 0x704, min MAPQ 0,
+/// min BQ 0) and free of D/N and overlapping pairs, so every observation
+/// counts exactly once.
+const DEPTH_EDGE_SAM: &str = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:8
+d1\t0\tchr1\t1\t60\t1M\t*\t0\t0\tA\tI
+d8\t0\tchr1\t8\t60\t1M\t*\t0\t0\tA\tI
+";
+
+/// The exact `depth -a -r chr1:1-8` output both tools must produce for
+/// [`DEPTH_EDGE_SAM`]: every contig position 1–8 (1-based inclusive), depth 1
+/// at the read positions and 0 elsewhere.
+fn depth_edge_expected() -> String {
+    (1..=8)
+        .map(|p| format!("chr1\t{p}\t{}", u32::from(p == 1 || p == 8)))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+#[test]
+fn depth_region_all_positions_exact() {
+    // Ungated: kira reads plain SAM text directly, so the first/last-coordinate
+    // boundary behavior is checked even without samtools.
+    let dir = tmpdir();
+    let sam = dir.path().join("depth_edge.sam");
+    std::fs::write(&sam, DEPTH_EDGE_SAM).unwrap();
+    let out = run_ok(
+        "kira depth -a -r",
+        Command::new(kira_bam())
+            .args(["depth", "-a", "-r", "chr1:1-8"])
+            .arg(&sam),
+    );
+    assert_eq!(out, depth_edge_expected(), "kira depth edge mismatch");
+}
+
+#[test]
+fn depth_region_all_positions_matches_samtools() {
+    let st = require_samtools!();
+    let dir = tmpdir();
+    let bam = build_bam(&st, dir.path(), "depth_edge", DEPTH_EDGE_SAM);
+    // `-r` region access goes through the index.
+    run_ok("samtools index", Command::new(&st).arg("index").arg(&bam));
+    let s = run_ok(
+        "samtools depth -a -r",
+        Command::new(&st)
+            .args(["depth", "-a", "-r", "chr1:1-8"])
+            .arg(&bam),
+    );
+    let k = run_ok(
+        "kira depth -a -r",
+        Command::new(kira_bam())
+            .args(["depth", "-a", "-r", "chr1:1-8"])
+            .arg(&bam),
+    );
+    assert_eq!(s, k, "depth -a -r differs from samtools");
+    assert_eq!(k, depth_edge_expected());
 }
 
 #[test]

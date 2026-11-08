@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// Replace the header of a BAM file without rewriting the body.
+/// Replace the header of a BAM file, re-encoding each record into a fresh BAM.
 #[derive(Parser, Debug)]
 pub struct ReheaderArgs {
     /// New header (SAM format).

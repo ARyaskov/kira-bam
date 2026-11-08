@@ -73,7 +73,8 @@ kira-bam quickcheck [-v] [-u] in1.bam in2.bam ...
 - **`split`** — one output file per distinct tag value. `-d` picks the tag
   (default `RG`), `-f` the filename pattern, where `%*` expands to the input
   file stem and `%!` to the tag value (default `%*_%!.bam`).
-- **`reheader`** — replaces the header and copies the body blocks untouched.
+- **`reheader`** — replaces the header; every record is decoded and re-encoded
+  into a fresh BAM file, not copied as raw blocks (`cat` is the raw-block copy).
   `-o` is mandatory: unlike samtools, kira-bam never rewrites in place.
 - **`addreplacerg`** — `-r` is the new `@RG` line; `-m` is one of `orphan-only`
   (default), `overwrite_all`, `overwrite_orphans`, `lenient`.

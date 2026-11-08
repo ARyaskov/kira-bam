@@ -784,6 +784,89 @@ fn mpileup_multi_input_columns_match_samtools() {
     );
 }
 
+// ── coverage ─────────────────────────────────────────────────────────────────
+
+/// Coverage fixture: one 10 bp contig and two all-`M` single-end reads (flag 0,
+/// no indel/skip or pair semantics) whose spans overlap at positions 3–4, so
+/// those bases count once in `covbases` but both read bases count in the depth
+/// sum. c1 has MAPQ 40 with base quality `I` (Phred 40); c2 has MAPQ 60 with
+/// base quality `!` — `!` is Phred 0 under the SAM Phred+33 encoding (ASCII 33,
+/// so `!` − 33 = 0 just as `I` − 33 = 40) — low enough for base quality
+/// filtering (inclusive: `q >= min_baseq`, so Q0 bases still count under the
+/// default `-Q 0`) while the read itself still passes the MAPQ filter.
+const COVERAGE_SAM: &str = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:10
+c1\t0\tchr1\t1\t40\t4M\t*\t0\t0\tACGT\tIIII
+c2\t0\tchr1\t3\t60\t4M\t*\t0\t0\tGTAC\t!!!!
+";
+
+/// The full `coverage` output: the 9-column header plus one `chr1` row, each
+/// line terminated. `startpos` is always 1 and `endpos` the contig length in
+/// kira's full-contig summary.
+fn coverage_expected(row: &str) -> String {
+    format!(
+        "#rname\t#startpos\t#endpos\t#numreads\t#covbases\t#coverage\t\
+         #meandepth\t#meanbaseq\t#meanmapq\n{row}\n"
+    )
+}
+
+#[test]
+fn coverage_baseq_mapq_filters_exact_ungated() {
+    // Ungated: kira reads plain SAM text directly, so the base- vs read-level
+    // filter split is checked without samtools (whose startpos/endpos summary
+    // semantics differ and are not pinned).
+    let dir = tmpdir();
+    let sam = dir.path().join("coverage.sam");
+    std::fs::write(&sam, COVERAGE_SAM).unwrap();
+
+    // Default (-q 0, -Q 0): both reads count, and Phred-0 bases survive `-Q 0`
+    // because the base-quality filter is inclusive (q >= min_baseq). covbases
+    // is the covered-byte set (positions 1–6 → 6), meandepth sums per-base
+    // observations (8 over LN=10 → 0.8), meanbaseq averages the eight bases
+    // (4×40 + 4×0 → 20.0), meanmapq averages the two reads (40, 60 → 50).
+    let out = run_ok(
+        "kira coverage",
+        Command::new(kira_bam()).arg("coverage").arg(&sam),
+    );
+    assert_eq!(
+        out,
+        coverage_expected("chr1\t1\t10\t2\t6\t60.0000\t0.8000\t20.0000\t50.0000"),
+        "kira coverage default mismatch"
+    );
+
+    // -q 50 excludes c1 (MAPQ 40 < 50) before any accounting: it leaves
+    // numreads, covbases and meanmapq entirely.
+    let out = run_ok(
+        "kira coverage -q 50",
+        Command::new(kira_bam())
+            .args(["coverage", "-q", "50"])
+            .arg(&sam),
+    );
+    assert_eq!(
+        out,
+        coverage_expected("chr1\t1\t10\t1\t4\t40.0000\t0.4000\t0.0000\t60.0000"),
+        "kira coverage -q filter mismatch"
+    );
+
+    // -Q 20 drops only c2's Phred-0 bases from covbases/depth/meanbaseq, while
+    // the MAPQ-passing read still counts in numreads and meanmapq: the
+    // read-level MAPQ filter (-q) and base-level BQ filter (-Q) have different
+    // reach. c1's Phred-40 bases pass, so covbases/meandepth reflect only
+    // positions 1–4.
+    let out = run_ok(
+        "kira coverage -Q 20",
+        Command::new(kira_bam())
+            .args(["coverage", "-Q", "20"])
+            .arg(&sam),
+    );
+    assert_eq!(
+        out,
+        coverage_expected("chr1\t1\t10\t2\t4\t40.0000\t0.4000\t40.0000\t50.0000"),
+        "kira coverage -Q filter mismatch"
+    );
+}
+
 // ── comparison helpers ────────────────────────────────────────────────────────
 
 /// Parse one sample's `depth bases quals` triplet into normalized

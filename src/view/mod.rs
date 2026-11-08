@@ -359,10 +359,7 @@ fn pass_filters(rec: &crate::io::Record, args: &ViewArgs, exclude: &[ExcludeRegi
     } else if args.min_mapq > 0 {
         return false;
     }
-    if !exclude.is_empty() && record_excluded(rec, exclude) {
-        return false;
-    }
-    true
+    exclude.is_empty() || !record_excluded(rec, exclude)
 }
 
 /// Does the record overlap any `-v` region? Unplaced records never do.

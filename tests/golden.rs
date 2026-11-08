@@ -22,6 +22,9 @@
 //! * `markdup` — identical *set* of duplicate-flagged reads (prepared through
 //!   the standard `fixmate -m | sort` pipeline both tools require).
 //! * `calmd` — identical MD/NM tag values (tag order is allowed to differ).
+//! * `mpileup` — CHROM/POS/REF plus every sample's depth/bases/quals triplet
+//!   after folding samtools' `^`/`$`/strand boundary markup (kira omits that
+//!   markup, and the fixture is deliberately indel-free).
 //! * CRAM round-trip — identical mandatory fields (cols 1–11) after decode.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -176,6 +179,32 @@ const MERGE_B_SAM: &str = "\
 b1\t0\tchr1\t100\t60\t5M\t*\t0\t0\tACGTA\tIIIII
 b2\t16\tchr1\t100\t60\t5M\t*\t0\t0\tACGTA\tIIIII
 b3\t0\tchr1\t200\t60\t5M\t*\t0\t0\tACGTA\tIIIII
+";
+
+/// 60 bp `ACGT`-repeat FASTA matching the mpileup fixtures (one contig, so a
+/// single `faidx` write enables both tools' reference styling).
+fn mpileup_reference_fasta() -> String {
+    let seq: String = (0..60).map(|i| ['A', 'C', 'G', 'T'][i % 4]).collect();
+    format!(">chr1\n{seq}\n")
+}
+
+/// mpileup golden, input A: one forward 6M read at pos 1, all matching the
+/// `ACGT` repeat, quals `IJKLMN` (Phred 40–45, above the shared `-Q 13` floor).
+const MPILEUP_A_SAM: &str = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:60
+a1\t0\tchr1\t1\t60\t6M\t*\t0\t0\tACGTAC\tIJKLMN
+";
+
+/// mpileup golden, input B: b1 covers pos 2–7 (`CGTACG`, all matching, quals
+/// `ABCDEF`); b2 covers pos 6–11 (`CGTTCG`, one mismatch at pos 9: reads `T`
+/// against reference `A`, quals `OPQRST`). Forward-only, indel-free, so the
+/// only expected samtools markup is read-start `^`+mapQ and read-end `$`.
+const MPILEUP_B_SAM: &str = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:60
+b1\t0\tchr1\t2\t60\t6M\t*\t0\t0\tCGTACG\tABCDEF
+b2\t0\tchr1\t6\t60\t6M\t*\t0\t0\tCGTTCG\tOPQRST
 ";
 
 /// 200 bp `ACGT`-repeat reference matching `ALIGNED_SAM`.
@@ -527,55 +556,223 @@ fn cram_roundtrip_preserves_alignment() {
 fn mpileup_multi_input_columns_match_samtools() {
     let st = require_samtools!();
     let dir = tmpdir();
-    let a = build_bam(&st, dir.path(), "ma", MERGE_A_SAM);
-    let b = build_bam(&st, dir.path(), "mb", MERGE_B_SAM);
+    let refp = dir.path().join("ref.fa");
+    std::fs::write(&refp, mpileup_reference_fasta()).unwrap();
+    run_ok("samtools faidx", Command::new(&st).arg("faidx").arg(&refp));
+    let a = build_bam(&st, dir.path(), "mpa", MPILEUP_A_SAM);
+    let b = build_bam(&st, dir.path(), "mpb", MPILEUP_B_SAM);
 
     let k_out = dir.path().join("k.mpileup.tsv");
     run_ok(
         "kira mpileup",
         Command::new(kira_bam())
-            .args(["mpileup", "-o"])
+            .args(["mpileup", "-f"])
+            .arg(&refp)
+            .args(["-o"])
             .arg(&k_out)
+            .args(["-d", "8000", "-q", "0", "-Q", "13"])
             .arg(&a)
             .arg(&b),
     );
-    let kira = mpileup_depth_projection(&strip_cr(&std::fs::read_to_string(&k_out).unwrap()));
+    let kira = mpileup_column_projection(&strip_cr(&std::fs::read_to_string(&k_out).unwrap()))
+        .unwrap_or_else(|e| panic!("kira mpileup output rejected by the normalizer: {e}"));
 
-    // -B drops BAQ (kira has none); the projection compares CHROM/POS/REF and
-    // every sample's depth only, because kira lacks samtools' ^/$/indel/strand
-    // base markup.
+    // -B drops BAQ (kira has none) and the filters are matched, so the only
+    // remaining representational difference is samtools' boundary/strand
+    // markup, which the projection folds away per sample.
     let s_out = run_ok(
         "samtools mpileup",
         Command::new(&st)
-            .args(["mpileup", "-B", "-d", "8000", "-q", "0", "-Q", "13"])
+            .args(["mpileup", "-B", "-f"])
+            .arg(&refp)
+            .args(["-d", "8000", "-q", "0", "-Q", "13"])
             .arg(&a)
             .arg(&b),
     );
+    let sam = mpileup_column_projection(&s_out)
+        .unwrap_or_else(|e| panic!("samtools mpileup output rejected by the normalizer: {e}"));
+
+    // Full per-sample comparison — CHROM/POS/REF plus each input's depth,
+    // normalized base calls, and quality bytes in CLI sample order — not just
+    // the depth projection.
     assert_eq!(
-        mpileup_depth_projection(&s_out),
-        kira,
-        "mpileup multi-input projection differs from samtools"
+        sam, kira,
+        "mpileup multi-input columns differ from samtools"
     );
 }
 
 // ── comparison helpers ────────────────────────────────────────────────────────
 
-/// CHROM POS REF plus the leading depth field of each following
-/// depth/bases/quals triplet — the multi-input invariant both tools must keep.
-fn mpileup_depth_projection(out: &str) -> Vec<String> {
+/// Parse one sample's `depth bases quals` triplet into normalized
+/// `depth bases quals`, or a description of what could not be represented.
+///
+/// Samtools can emit markup kira omits: the read-start `^` followed by exactly
+/// one mapping-quality byte, the read-end `$`, and strand notation (`,`, and
+/// lowercase letters, for reverse-strand observations). Those marker bytes take
+/// no base or quality slot, so they are folded away while the retained bases
+/// keep their pairing order with the quality bytes. Zero coverage is the exact
+/// `0 * *` sentinel. Indel (`+`/`-`) and deletion/ref-skip (`*#<>`) tokens are
+/// rejected loudly: the golden fixture is deliberately indel-free, so a hit
+/// means counting characters would be wrong (one observation must pair with
+/// exactly one quality byte), not silently stripped.
+fn mpileup_sample_projection(
+    depth: &str,
+    bases: &str,
+    quals: &str,
+) -> Result<(String, String, String), String> {
+    let depth: u32 = depth
+        .parse()
+        .map_err(|_| format!("non-numeric depth field: {depth:?}"))?;
+    if depth == 0 {
+        if bases != "*" || quals != "*" {
+            return Err(format!(
+                "zero-depth sample is not the `0 * *` sentinel: {bases:?} {quals:?}"
+            ));
+        }
+        return Ok((depth.to_string(), bases.to_string(), quals.to_string()));
+    }
+
+    let b = bases.as_bytes();
+    let mut normalized = String::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'^' => {
+                // Read-start marker: `^` plus exactly one mapQ byte, neither
+                // of which is a base observation.
+                if i + 1 >= b.len() {
+                    return Err("dangling read-start `^` marker".to_string());
+                }
+                i += 2;
+            }
+            b'$' => i += 1, // read-end marker, not a base observation
+            b'.' | b',' => {
+                normalized.push('.');
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() => {
+                normalized.push(c.to_ascii_uppercase() as char);
+                i += 1;
+            }
+            b'+' | b'-' => {
+                return Err(format!(
+                    "indel markup `{}` in the bases column: the mpileup golden \
+                     fixture is indel-free, so this row cannot be paired with \
+                     its qualities",
+                    b[i] as char
+                ));
+            }
+            b'*' | b'#' | b'<' | b'>' => {
+                return Err(format!(
+                    "deletion/reference-skip markup `{}` in the bases column: \
+                     the mpileup golden fixture has no skipped observations",
+                    b[i] as char
+                ));
+            }
+            c => {
+                return Err(format!("unsupported pileup base token {:#04x}", c));
+            }
+        }
+    }
+
+    // One base observation must pair with exactly one quality byte, and the
+    // depth column must agree with both.
+    let n_quals = quals.len();
+    if normalized.len() != n_quals || depth as usize != n_quals {
+        return Err(format!(
+            "bases, qualities and depth are not one-to-one: {} normalized \
+             bases, {} quality bytes, depth {depth}",
+            normalized.len(),
+            n_quals
+        ));
+    }
+    Ok((depth.to_string(), normalized, quals.to_string()))
+}
+
+/// CHROM/POS/REF plus every sample's triplet normalized through
+/// [`mpileup_sample_projection`], in CLI sample order — the multi-input
+/// invariant both tools must keep (depth, base calls and qualities per input).
+fn mpileup_column_projection(out: &str) -> Result<Vec<String>, String> {
     out.lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
-            let mut p = vec![f[0].to_string(), f[1].to_string(), f[2].to_string()];
-            let mut i = 3;
-            while i < f.len() {
-                p.push(f[i].to_string());
-                i += 3;
+            // CHROM/POS/REF plus one depth/bases/quals triplet per input:
+            // exactly 3 + 3N fields.
+            if f.len() < 6 || f.len() % 3 != 0 {
+                return Err(format!("malformed mpileup row: {l:?}"));
             }
-            p.join("\t")
+            let mut parts: Vec<String> = f[..3].iter().map(|s| (*s).to_owned()).collect();
+            for s in f[3..].chunks_exact(3) {
+                let (d, b, q) = mpileup_sample_projection(s[0], s[1], s[2])?;
+                parts.push(d);
+                parts.push(b);
+                parts.push(q);
+            }
+            Ok(parts.join("\t"))
         })
         .collect()
+}
+
+#[test]
+fn mpileup_normalizer_strips_read_start_and_end_markers() {
+    // `^` consumes exactly the next byte (mapQ 60 → `]`); `$` trails the read's
+    // final base and takes no base or quality slot.
+    let (d, b, q) = mpileup_sample_projection("1", "^].", "I").unwrap();
+    assert_eq!((d.as_str(), b.as_str(), q.as_str()), ("1", ".", "I"));
+    // Two observations in one row where the first read ends (`.$. ` shape:
+    // b1's base, its `$`, then the next read's base).
+    let (d, b, q) = mpileup_sample_projection("2", "^].$.", "IJ").unwrap();
+    assert_eq!((d.as_str(), b.as_str(), q.as_str()), ("2", "..", "IJ"));
+}
+
+#[test]
+fn mpileup_normalizer_normalizes_strand_notation() {
+    // samtools marks reverse-strand matches with `,` and mismatches lowercase;
+    // kira only ever emits `.` and uppercase letters.
+    let (d, b, q) = mpileup_sample_projection("5", ",ACac", "!!!!!").unwrap();
+    assert_eq!(
+        (d.as_str(), b.as_str(), q.as_str()),
+        ("5", ".ACAC", "!!!!!")
+    );
+}
+
+#[test]
+fn mpileup_normalizer_requires_the_zero_sentinel() {
+    let (d, b, q) = mpileup_sample_projection("0", "*", "*").unwrap();
+    assert_eq!((d.as_str(), b.as_str(), q.as_str()), ("0", "*", "*"));
+    assert!(mpileup_sample_projection("0", ".", "I").is_err());
+}
+
+#[test]
+fn mpileup_normalizer_rejects_indel_and_refskip_markup_and_bad_counts() {
+    // Indel and deletion/ref-skip tokens must fail clearly, not be stripped.
+    for bad in ['+', '-', '*', '#', '<', '>'] {
+        let err = mpileup_sample_projection("1", &bad.to_string(), "I").unwrap_err();
+        assert!(!err.is_empty(), "no rejection for {bad:?}");
+    }
+    // A `^` without its mapQ byte is malformed.
+    assert!(mpileup_sample_projection("1", "^", "I").is_err());
+    // Bases, qualities and depth must be one-to-one.
+    assert!(mpileup_sample_projection("2", "..", "I").is_err());
+    assert!(mpileup_sample_projection("1", "..", "II").is_err());
+    assert!(mpileup_sample_projection("3", "..", "II").is_err());
+}
+
+#[test]
+fn mpileup_projection_normalizes_samtools_markup_to_kira_shape() {
+    // Row for pos 7 of the mpileup golden fixture: kira writes `..` where
+    // samtools writes `.$. ` (b's first read ends mid-column), and input A
+    // contributes the zero sentinel. Both must project identically.
+    let kira = "chr1\t7\tG\t2\t..\tFP\t0\t*\t*";
+    let samtools = "chr1\t7\tG\t2\t.$.\tFP\t0\t*\t*";
+    let k = mpileup_column_projection(kira).unwrap_or_else(|e| panic!("{e}"));
+    let s = mpileup_column_projection(samtools).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(s, k);
+    // Exactly 3 + 3N fields: a 1-sample row is accepted, anything else malformed.
+    assert!(mpileup_column_projection("chr1\t7\tG\t1\t.\tI").is_ok());
+    assert!(mpileup_column_projection("chr1\t7\tG\t2\t..").is_err());
+    assert!(mpileup_column_projection("chr1\t7\tG\t2\t..\tFP\t0").is_err());
 }
 
 /// Sorted multiset of non-empty lines (order-insensitive record-set equality).

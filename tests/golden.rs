@@ -29,6 +29,9 @@
 //! * `depth -a -r` — byte-identical output on the shared flag subset (no
 //!   `-aa`/`-J`/`-d`/`-s` and no paired/secondary/duplicate reads), plus an
 //!   ungated exact-output check on the coordinate-boundary fixture.
+//! * `bedcov` — byte-identical echoed BED columns plus one per-input column,
+//!   including the missing-`@SQ` row, plus an ungated exact-output check built
+//!   entirely with kira (`sort` + `index` feed `bedcov`'s indexed reader).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -615,6 +618,121 @@ fn depth_region_all_positions_matches_samtools() {
     );
     assert_eq!(s, k, "depth -a -r differs from samtools");
     assert_eq!(k, depth_edge_expected());
+}
+
+// ── bedcov ────────────────────────────────────────────────────────────────────
+
+/// `bedcov` fixture: one 20 bp contig (`chr1`) and three single-end all-`M`
+/// reads in coordinate order, flag 0, MAPQ 60, qual `I` — above every default
+/// filter, with no D/N, MAPQ 255, pairs, secondary or duplicate records, so
+/// each read contributes exactly its covered reference span. The recordings
+/// deliberately leave `chr2` out of the header so the missing-`@SQ` path (0 +
+/// a stderr warning) is exercised.
+///
+/// Covered spans (BED 0-based half-open): b1 [2,6), b2 [4,8), b3 [14,20).
+const BEDCOV_SAM: &str = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:20
+b1\t0\tchr1\t3\t60\t4M\t*\t0\t0\tACGT\tIIII
+b2\t0\tchr1\t5\t60\t4M\t*\t0\t0\tACGT\tIIII
+b3\t0\tchr1\t15\t60\t6M\t*\t0\t0\tACGTAC\tIIIIII
+";
+
+/// BED rows compared against samtools: the four `chr1` intervals only. The
+/// missing-`@SQ` `chr2` row is covered only by the ungated Kira expected-
+/// output test `bedcov_rows_exact_ungated`, because cross-tool behavior for
+/// a BED name absent from `@SQ` isn't established (samtools not pinned);
+/// `bedcov_rows_match_samtools` therefore never sees that row.
+const BEDCOV_BED_SHARED: &str = "chr1\t0\t10\n\
+                                 chr1\t4\t5\n\
+                                 chr1\t6\t10\n\
+                                 chr1\t14\t20\n";
+
+/// Tab-separated BED used with [`BEDCOV_SAM`] in the ungated Kira comparison.
+/// Coordinates are 0-based half-open; the trailing Kira-only row
+/// `chr2 0 10` names a contig no input has in its header.
+/// Built at runtime: `concat!` accepts literals, not const identifiers.
+fn bedcov_bed() -> String {
+    BEDCOV_BED_SHARED.to_owned() + "chr2\t0\t10\n"
+}
+
+/// Expected `bedcov` output for [`BEDCOV_BED_SHARED`] + [`BEDCOV_SAM`]: the BED
+/// columns echoed verbatim plus one sum-of-covered-base column per input.
+///
+/// `chr1 0 10` (1-based 1–10): b1 contributes 4 bases (3–6) and b2 contributes
+/// 4 (5–8); their overlap 5–6 counts twice → 8. `chr1 4 5` is the single base 5 under both b1 and b2
+/// → 2. `chr1 6 10` (1-based 7–10) reaches only b2's tail (7–8) — b1's last
+/// base 6 is excluded by the half-open start → 2. `chr1 14 20` is 1-based
+/// 15–20, entirely under b3 → 6.
+const BEDCOV_EXPECTED_SHARED: &str = "chr1\t0\t10\t8\n\
+                                      chr1\t4\t5\t2\n\
+                                      chr1\t6\t10\t2\n\
+                                      chr1\t14\t20\t6\n";
+
+/// `bedcov` output for the ungated Kira comparison: [`BEDCOV_BED_SHARED`] +
+/// [`BEDCOV_SAM`] must produce exactly
+/// [`BEDCOV_EXPECTED_SHARED`], plus the Kira-only `chr2` row with no
+/// `@SQ` anywhere → 0.
+fn bedcov_expected() -> String {
+    BEDCOV_EXPECTED_SHARED.to_owned() + "chr2\t0\t10\t0\n"
+}
+
+#[test]
+fn bedcov_rows_exact_ungated() {
+    // Ungated: the fixture is plain SAM text, and the whole chain (sort →
+    // index → bedcov) runs on kira itself — no samtools needed.
+    let dir = tmpdir();
+    let sam = dir.path().join("bedcov.sam");
+    std::fs::write(&sam, BEDCOV_SAM).unwrap();
+    let bed = dir.path().join("bedcov.bed");
+    std::fs::write(&bed, bedcov_bed()).unwrap();
+
+    let sorted = dir.path().join("bedcov.sorted.bam");
+    run_ok(
+        "kira sort",
+        Command::new(kira_bam())
+            .args(["sort", "-o"])
+            .arg(&sorted)
+            .arg(&sam),
+    );
+    run_ok(
+        "kira index",
+        Command::new(kira_bam()).arg("index").arg(&sorted),
+    );
+    let out = run_ok(
+        "kira bedcov",
+        Command::new(kira_bam())
+            .arg("bedcov")
+            .arg(&bed)
+            .arg(&sorted),
+    );
+    assert_eq!(out, bedcov_expected(), "kira bedcov rows differ");
+}
+
+#[test]
+fn bedcov_rows_match_samtools() {
+    let st = require_samtools!();
+    let dir = tmpdir();
+    // Shared rows only; the missing-`@SQ` row stays in the Kira-only
+    // test above (cross-tool behavior not established).
+    let bed = dir.path().join("bedcov.bed");
+    std::fs::write(&bed, BEDCOV_BED_SHARED).unwrap();
+    let bam = build_bam(&st, dir.path(), "bedcov", BEDCOV_SAM);
+    // Both tools take the indexed-BAM route.
+    run_ok("samtools index", Command::new(&st).arg("index").arg(&bam));
+    let s = run_ok(
+        "samtools bedcov",
+        Command::new(&st).arg("bedcov").arg(&bed).arg(&bam),
+    );
+    let k = run_ok(
+        "kira bedcov",
+        Command::new(kira_bam()).arg("bedcov").arg(&bed).arg(&bam),
+    );
+    assert_eq!(s, k, "bedcov differs from samtools");
+    assert_eq!(
+        k, BEDCOV_EXPECTED_SHARED,
+        "bedcov rows differ from expected"
+    );
 }
 
 #[test]

@@ -468,12 +468,16 @@ pub fn run(args: SortArgs) -> Result<()> {
         writer.finish()?;
         return Ok(());
     }
+    // Fail before producing any output: a silent sort-only fallback dropped all
+    // duplicate flags from a run the caller believed was marked.
     if args.markdup {
-        eprintln!(
-            "[kira-bam sort] warning: --markdup requires single-chunk in-memory sort \
-             (current memory hint produces {} spill chunks). Falling back to sort-only; \
-             run `kira-bam markdup` on the output, or bump `-m`/use `-m auto`.",
-            spilled.len() + (current_chunk.is_empty() as usize ^ 1)
+        anyhow::bail!(
+            "--markdup needs the whole input in one in-memory chunk, but the sort \
+             would spill to {} temp chunk(s) at -m {}. Raise `-m` (or use `-m auto`) \
+             to keep the sort in memory, or sort without --markdup and run \
+             `kira-bam markdup` on the sorted output.",
+            spilled.len() + (!current_chunk.is_empty()) as usize,
+            args.memory.trim()
         );
     }
 

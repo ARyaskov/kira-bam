@@ -58,9 +58,11 @@ pub struct SortArgs {
     ///
     /// Equivalent to piping `kira-bam sort … | kira-bam markdup -`, but
     /// performed in-memory after the sort step — avoids one full BAM
-    /// read+write roundtrip. Only effective when the input fits in a
-    /// single in-memory chunk (i.e. `-m` is large enough); spilled sorts
-    /// fall back to the standalone two-pass markdup.
+    /// read+write roundtrip. The whole input must fit in a single
+    /// in-memory chunk: raise `-m` (or use `-m auto`) so the sort does
+    /// not spill, or run `sort` and `kira-bam markdup` as two separate
+    /// commands. If the sort would spill, this fails with an error and
+    /// writes no output.
     #[arg(long = "markdup")]
     pub markdup: bool,
 

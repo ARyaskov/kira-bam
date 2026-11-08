@@ -101,7 +101,9 @@ kira-bam markdup [-r] [-d INT] [-s STATS] [-S] [-u] [-@ N] [-T ref.fa]
   sort — same result as piping into `markdup`, one BAM roundtrip cheaper — and
   is tuned by `--markdup-barcode-tag`, `--markdup-mode-ancient` and
   `--markdup-supplementary`; it only applies when the input fits in a single
-  in-memory chunk, otherwise it warns and falls back to sort-only.
+  in-memory chunk. If the sort would spill, it fails with an error and writes
+  no output — raise `-m` (or use `-m auto`), or run `kira-bam markdup`
+  separately on the sorted output.
 - **`collate`** — groups records of the same qname together without a full
   name-sort. Writes `<out_prefix>.bam`. `-f` collates only primary alignments;
   `-r` sets the hash bucket count (default 1048576 — larger means less spill and

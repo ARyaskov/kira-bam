@@ -20,7 +20,9 @@ pub struct SortArgs {
     #[arg(short = '@', long = "threads", default_value_t = 8)]
     pub threads: usize,
 
-    /// Approximate per-thread memory budget for in-memory chunks (e.g. `768M`, `4G`).
+    /// Approximate total memory budget for the in-memory sort chunks (not
+    /// per-thread as in samtools sort). Accepts `768M`, `4G`, a plain byte
+    /// count (1 MiB floor), or `auto` (3/4 of total RAM, 512 MiB floor).
     #[arg(short = 'm', long = "memory", default_value = "768M")]
     pub memory: String,
 

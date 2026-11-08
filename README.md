@@ -95,8 +95,10 @@ kira-bam markdup [-r] [-d INT] [-s STATS] [-S] [-u] [-@ N] [-T ref.fa]
 ```
 
 - **`sort`** — coordinate order by default, `-n` for natural qname order. `-m`
-  is the per-thread in-memory chunk budget and accepts `768M`, `4G`, a plain
-  byte count, or `auto` (3/4 of total RAM, floor 512 MB). `-f`/`-F` drop records
+  is the approximate total in-memory chunk budget — not per-thread as in
+  samtools (`-@` controls compression workers and adds their separate buffer
+  memory) — and accepts `768M`, `4G`, a plain byte count (1 MiB floor), or
+  `auto` (3/4 of total RAM, floor 512 MB). `-f`/`-F` drop records
   by flag mask during the pass. `--markdup` folds duplicate marking into the
   sort — same result as piping into `markdup`, one BAM roundtrip cheaper — and
   is tuned by `--markdup-barcode-tag`, `--markdup-mode-ancient` and

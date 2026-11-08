@@ -699,11 +699,11 @@ fn mpileup_column_projection(out: &str) -> Result<Vec<String>, String> {
             let f: Vec<&str> = l.split('\t').collect();
             // CHROM/POS/REF plus one depth/bases/quals triplet per input:
             // exactly 3 + 3N fields.
-            if f.len() < 6 || f.len() % 3 != 0 {
+            if f.len() < 6 || !f.len().is_multiple_of(3) {
                 return Err(format!("malformed mpileup row: {l:?}"));
             }
             let mut parts: Vec<String> = f[..3].iter().map(|s| (*s).to_owned()).collect();
-            for s in f[3..].chunks_exact(3) {
+            for s in f[3..].as_chunks::<3>().0 {
                 let (d, b, q) = mpileup_sample_projection(s[0], s[1], s[2])?;
                 parts.push(d);
                 parts.push(b);

@@ -164,9 +164,10 @@ kira-bam ampliconstats [-q INT] [-o OUT] amplicons.bed in1.bam [in2.bam ...]
   form.
 - **`idxstats`** — per-reference mapped/unmapped counts read straight from the
   `.bai`/`.csi`, so it needs an indexed BAM and no body scan.
-- **`stats`** — the `samtools stats` report. `-r` adds the GC and error-rate
-  sections, `-t` restricts to a BED, `-q` sets a MAPQ floor, `--sample-name`
-  annotates the output.
+- **`stats`** — the `samtools stats` report. `-r` is a reference FASTA used to
+  decode CRAM input only: the GC histogram is emitted unconditionally and no
+  error-rate sections are currently produced. `-t` restricts to a BED, `-q`
+  sets a MAPQ floor, `--sample-name` annotates the output.
 - **`depth`** — per-base depth. `-a` also prints zero-coverage positions, `-b`
   restricts to a BED, `-r` (repeatable) to regions, `-q`/`-Q` set MAPQ and base
   quality floors.

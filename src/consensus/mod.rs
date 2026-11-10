@@ -19,21 +19,52 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
 
     let mut pileup = PileupIter::new(reader, args.min_mapq, args.min_baseq);
 
+    // @SQ order and lengths drive the output: the FASTA must list every
+    // reference in header order, padded to its LN, not just the covered ones.
+    let ref_seqs: Vec<(String, usize)> = header
+        .reference_sequences()
+        .iter()
+        .map(|(name, sq)| (name.to_string(), usize::from(sq.length())))
+        .collect();
+
     let mut current_tid: Option<usize> = None;
+    // First contig not (partially) written yet; contigs before that either
+    // had columns or were emitted whole when the sweep jumped past them.
+    let mut undone: usize = 0;
     let mut last_pos: usize = 0;
     let mut line_pos: usize = 0;
 
     let mut col: Vec<(u8, u8)> = Vec::new();
     while let Some((tid, pos)) = pileup.next_column_into(&mut col)? {
         if current_tid != Some(tid) {
-            if current_tid.is_some() {
-                writeln!(out)?;
+            if let Some(prev) = current_tid {
+                // The covered span of the previous contig is complete: pad
+                // from the last pileup column to its @SQ LN, numbering the
+                // whole tail with N.
+                while last_pos < ref_seqs[prev].1 {
+                    write_base(&mut out, b'N', &mut line_pos, args.line_width)?;
+                    last_pos += 1;
+                }
+                // `write_base` already wrapped at the width, so a full final
+                // line must not gain a blank line.
+                if line_pos > 0 {
+                    writeln!(out)?;
+                }
             }
-            let name = header
-                .reference_sequences()
-                .get_index(tid)
-                .map(|(n, _)| n.to_string())
-                .unwrap_or_default();
+            // Contigs the pileup skipped entirely (no records) can never
+            // open a line of their own; emit them whole, in header order.
+            for (name, len) in &ref_seqs[undone..tid] {
+                writeln!(out, ">{name}")?;
+                let mut lp = 0;
+                for _ in 0..*len {
+                    write_base(&mut out, b'N', &mut lp, args.line_width)?;
+                }
+                if lp > 0 {
+                    writeln!(out)?;
+                }
+            }
+            undone = tid + 1;
+            let name = &ref_seqs[tid].0;
             writeln!(out, ">{name}")?;
             current_tid = Some(tid);
             last_pos = 0;
@@ -51,8 +82,26 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
         write_base(&mut out, base, &mut line_pos, args.line_width)?;
         last_pos = pos;
     }
-    if current_tid.is_some() {
-        writeln!(out)?;
+    if let Some(prev) = current_tid {
+        while last_pos < ref_seqs[prev].1 {
+            write_base(&mut out, b'N', &mut line_pos, args.line_width)?;
+            last_pos += 1;
+        }
+        // `write_base` already wrapped at the width, so a full final line
+        // must not gain a blank line.
+        if line_pos > 0 {
+            writeln!(out)?;
+        }
+    }
+    for (name, len) in &ref_seqs[undone..] {
+        writeln!(out, ">{name}")?;
+        let mut lp = 0;
+        for _ in 0..*len {
+            write_base(&mut out, b'N', &mut lp, args.line_width)?;
+        }
+        if lp > 0 {
+            writeln!(out)?;
+        }
     }
     Ok(())
 }
@@ -139,11 +188,19 @@ mod tests {
 
     /// Run consensus over a BAM of stacked reads and return the called bases.
     fn consensus_bases(max_depth: u32, records: &[RecordBuf]) -> String {
+        consensus_for(header(), records, max_depth)
+            .lines()
+            .skip(1)
+            .collect::<String>()
+    }
+
+    /// The full FASTA text: every `>` sequence line plus the wrapped calls.
+    fn consensus_for(header: Header, records: &[RecordBuf], max_depth: u32) -> String {
         let dir = tempfile::tempdir().unwrap();
         let bam = dir.path().join("in.bam");
         let fasta = dir.path().join("out.fa");
         {
-            let mut w = BamWriter::create(Some(&bam), header(), OutputFormat::Bam).unwrap();
+            let mut w = BamWriter::create(Some(&bam), header, OutputFormat::Bam).unwrap();
             w.write_header().unwrap();
             for r in records {
                 w.write_record_buf(r).unwrap();
@@ -163,9 +220,7 @@ mod tests {
         };
         run(args).unwrap();
 
-        // Skip the `>chr1` header line; collect the wrapped base calls.
-        let text = std::fs::read_to_string(&fasta).unwrap();
-        text.lines().skip(1).collect::<String>()
+        std::fs::read_to_string(&fasta).unwrap()
     }
 
     #[test]
@@ -175,8 +230,9 @@ mod tests {
         // the call follow the surviving read.
         let bases = consensus_bases(1, &[read("r1", b"CCCCC"), read("r2", b"TTTTT")]);
         assert_eq!(
-            bases, "CCCCC",
-            "call must reflect -d 1, not the tie: {bases:?}"
+            bases,
+            format!("{}{}", "CCCCC", "N".repeat(995)),
+            "call must reflect -d 1, not the tie: {bases:?}",
         );
     }
 
@@ -184,8 +240,86 @@ mod tests {
     fn zero_depth_calls_every_position_n() {
         let bases = consensus_bases(0, &[read("r1", b"ACGTA"), read("r2", b"ACGTA")]);
         assert_eq!(
-            bases, "NNNNN",
-            "an empty capped column must call N: {bases:?}"
+            bases,
+            "N".repeat(1_000),
+            "an empty capped column must call N: {bases:?}",
         );
+    }
+
+    #[test]
+    fn output_extends_to_the_reference_length() {
+        // chr1 is 8 long; a 5-base read covers 1..=5, so 6..=8 must be N.
+        let len = Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZeroUsize::try_from(8).unwrap()),
+            )
+            .build();
+        let text = consensus_for(len, &[read("r1", b"CCCCC")], 8_000);
+        assert_eq!(text, ">chr1\nCCCCCNNN\n");
+    }
+
+    #[test]
+    fn sequences_filling_the_width_exactly_leave_no_blank_line() {
+        // Uncovered LN 60 (== line_width): one full wrapped all-N line and
+        // nothing after it.
+        let all_n = Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZeroUsize::try_from(60).unwrap()),
+            )
+            .build();
+        let text = consensus_for(all_n, &[], 8_000);
+        assert_eq!(text, format!(">chr1\n{}\n", "N".repeat(60)));
+
+        // Covered with LN 65 (multiple of width plus 5 calls): the wrapped
+        // call+tail line ends exactly at width 60 and 5 tail Ns follow on
+        // their own line, with no blank line between.
+        let covered = Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZeroUsize::try_from(65).unwrap()),
+            )
+            .build();
+        let text = consensus_for(covered, &[read("r1", b"CCCCC")], 8_000);
+        assert_eq!(
+            text,
+            format!(
+                ">chr1\n{}\n{}\n",
+                format!("{}{}", "C".repeat(5), "N".repeat(55)),
+                "N".repeat(5),
+            ),
+        );
+    }
+
+    #[test]
+    fn uncovered_contig_is_emitted_as_all_n() {
+        // chr2 has no records: it must still appear, in header order, all N.
+        let header = Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZeroUsize::try_from(10).unwrap()),
+            )
+            .add_reference_sequence(
+                "chr2",
+                Map::<ReferenceSequence>::new(NonZeroUsize::try_from(6).unwrap()),
+            )
+            .build();
+        let text = consensus_for(header, &[read("r1", b"CCCCC")], 8_000);
+        assert_eq!(text, ">chr1\nCCCCCNNNNN\n>chr2\nNNNNNN\n");
+    }
+
+    #[test]
+    fn empty_input_emits_every_reference() {
+        // A small contig with no records at all is emitted whole and filled
+        // to its @SQ LN with N (larger contigs only change the wrapping).
+        let len = Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZeroUsize::try_from(8).unwrap()),
+            )
+            .build();
+        let text = consensus_for(len, &[], 8_000);
+        assert_eq!(text, ">chr1\nNNNNNNNN\n");
     }
 }

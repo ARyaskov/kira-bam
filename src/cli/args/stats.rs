@@ -13,7 +13,8 @@ pub struct StatsArgs {
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
-    /// Optional reference FASTA (enables GC and error-rate stats).
+    /// Optional reference FASTA (used for CRAM decode only; the GC histogram
+    /// is emitted unconditionally and no error-rate sections are produced).
     #[arg(short = 'r', long = "reference")]
     pub reference: Option<PathBuf>,
 

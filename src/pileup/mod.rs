@@ -1,7 +1,10 @@
 //! Streaming pileup over a coordinate-sorted BAM.
 //!
 //! Yields `(tid, pos, [(base, qual)])` in genomic order, keeping a sliding window
-//! of active reads keyed by alignment end. Nothing allocates per position or per
+//! of active reads keyed by alignment end. A position's observations are the
+//! bases at or above `min_baseq` plus deletions as `*` (q 0): deletions count
+//! toward depth instead of being dropped. Bases below `min_baseq` are not
+//! observed at all — never an inflating `N`. Nothing allocates per position or per
 //! record in steady state: the column goes into a caller-owned buffer, decode
 //! buffers are recycled as reads leave the window, and one record buffer is
 //! reused throughout.
@@ -10,7 +13,7 @@ use anyhow::Result;
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::record::cigar::op::Kind;
 
-use crate::io::BamReader;
+use crate::io::RecordSource;
 
 pub type PileupColumn = (usize, usize, Vec<(u8, u8)>);
 
@@ -24,7 +27,7 @@ pub struct ActiveRead {
 }
 
 pub struct PileupIter {
-    reader: BamReader,
+    reader: Box<dyn RecordSource>,
     active: Vec<ActiveRead>,
     /// Decode buffers of reads that left the window.
     free: Vec<Vec<(u8, u8)>>,
@@ -46,9 +49,9 @@ pub struct PileupIter {
 }
 
 impl PileupIter {
-    pub fn new(reader: BamReader, min_mapq: u8, min_baseq: u8) -> Self {
+    pub fn new(reader: impl RecordSource + 'static, min_mapq: u8, min_baseq: u8) -> Self {
         Self {
-            reader,
+            reader: Box::new(reader),
             active: Vec::new(),
             free: Vec::new(),
             cur: RecordBuf::default(),
@@ -177,7 +180,9 @@ impl PileupIter {
                 let offset = pos as i64 - a.ref_start as i64;
                 if offset >= 0 && (offset as usize) < a.bases.len() {
                     let (b, q) = a.bases[offset as usize];
-                    if b != b'*' {
+                    // A deletion (`*`) is an observation: depth counts it and
+                    // mpileup prints it. Only the filtered sentinel is dropped.
+                    if b != 0 {
                         col.push((b, q));
                     }
                 }
@@ -186,8 +191,8 @@ impl PileupIter {
             if !col.is_empty() {
                 return Ok(Some((tid, pos)));
             }
-            // Covered only by deletions/skips. The window shrinks as `pos`
-            // advances, so this cannot spin.
+            // Every surviving observation here was below -Q. The window
+            // shrinks as `pos` advances, so this cannot spin.
         }
     }
 
@@ -242,7 +247,11 @@ fn decode_active(
                     if q >= min_baseq {
                         buf.push((b, q));
                     } else {
-                        buf.push((b'N', 0));
+                        // Not observed: the filtered base must neither inflate
+                        // depth as an N nor appear in the column. The `\0`
+                        // sentinel is skipped when the column is built; the
+                        // slot keeps per-reference offsets aligned.
+                        buf.push((0, 0));
                     }
                     read_idx += 1;
                     ref_idx += 1;
@@ -251,9 +260,18 @@ fn decode_active(
             Kind::Insertion | Kind::SoftClip => {
                 read_idx += len;
             }
-            Kind::Deletion | Kind::Skip => {
+            Kind::Deletion => {
                 for _ in 0..len {
                     buf.push((b'*', 0));
+                    ref_idx += 1;
+                }
+            }
+            Kind::Skip => {
+                for _ in 0..len {
+                    // A skipped reference span is not an observation: it must
+                    // not inflate depth or print as a deletion. The `\0`
+                    // sentinel keeps per-reference offsets aligned.
+                    buf.push((0, 0));
                     ref_idx += 1;
                 }
             }
@@ -312,10 +330,9 @@ mod tests {
         w.finish().unwrap();
     }
 
-    /// Drive the iterator to exhaustion on a worker thread. A regression that
-    /// stops it terminating would otherwise hang the whole test run instead of
-    /// failing; here it fails in 30 s with a clear message.
-    fn columns(records: &[RecordBuf]) -> Vec<(usize, usize, usize)> {
+    /// Collect every column the iterator yields to exhaustion on a worker
+    /// thread; also available as raw columns.
+    fn observed(records: &[RecordBuf], min_baseq: u8) -> Vec<PileupColumn> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("in.bam");
         write_bam(&path, records);
@@ -323,10 +340,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let reader = BamReader::open(&path).unwrap();
-            let mut it = PileupIter::new(reader, 0, 0);
+            let mut it = PileupIter::new(reader, 0, min_baseq);
             let mut out = Vec::new();
-            while let Some((tid, pos, col)) = it.next_column().unwrap() {
-                out.push((tid, pos, col.len()));
+            while let Some(col) = it.next_column().unwrap() {
+                out.push(col);
                 if out.len() > 10_000 {
                     break;
                 }
@@ -340,6 +357,17 @@ mod tests {
             .expect("PileupIter did not terminate");
         handle.join().unwrap();
         out
+    }
+
+    /// Drive the iterator to exhaustion on a worker thread and record only
+    /// column positions and depth. A regression that stops it terminating
+    /// would otherwise hang the whole test run instead of failing; here it
+    /// fails in 30 s with a clear message.
+    fn columns(records: &[RecordBuf]) -> Vec<(usize, usize, usize)> {
+        observed(records, 0)
+            .into_iter()
+            .map(|(tid, pos, col)| (tid, pos, col.len()))
+            .collect()
     }
 
     #[test]
@@ -421,6 +449,109 @@ mod tests {
         assert!(
             err.to_string().contains("not coordinate-sorted"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    /// A read with explicit per-base qualities.
+    fn readq(name: &str, tid: usize, start: usize, quals: &[u8]) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(tid)
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar(Cigar::from(vec![Op::new(Kind::Match, quals.len())]))
+            .set_sequence(Sequence::from(vec![b'A'; quals.len()]))
+            .set_quality_scores(QualityScores::from(quals.to_vec()))
+            .build()
+    }
+
+    /// A read with a deletion in the middle: `2M 1D <len-3>M`.
+    fn read_del(name: &str, tid: usize, start: usize, quals: &[u8]) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(tid)
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar(Cigar::from(vec![
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Match, quals.len() - 2),
+            ]))
+            .set_sequence(Sequence::from(vec![b'A'; quals.len()]))
+            .set_quality_scores(QualityScores::from(quals.to_vec()))
+            .build()
+    }
+
+    #[test]
+    fn deletion_counts_as_depth_and_stays_in_the_column() {
+        let cols = observed(&[read_del("r1", 0, 10, &[30; 5])], 0);
+        // The deleted reference position (12) still yields a column and the
+        // deletion is one observation, not a dropped read.
+        let del = cols
+            .iter()
+            .find(|&&(_, p, _)| p == 12)
+            .expect("deletion column missing");
+        assert_eq!(del.2, vec![(b'*', 0)], "{cols:?}");
+        assert_eq!(cols.len(), 6, "one observation per ref position: {cols:?}");
+    }
+
+    /// A read jumping a reference skip: `2M 3N 3M` covering 10..=17.
+    fn read_skip(name: &str, tid: usize, start: usize) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(tid)
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar(Cigar::from(vec![
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Skip, 3),
+                Op::new(Kind::Match, 2),
+            ]))
+            .set_sequence(Sequence::from(b"AAAA".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; 4]))
+            .build()
+    }
+
+    #[test]
+    fn base_below_min_baseq_is_not_an_n_or_a_depth_observation() {
+        // Qual 5 with -Q 13: pos 10 has no observation at all (depth 0, no
+        // N), so the sweep produces no column there — never `[(N, 1)]`.
+        let mut quals = vec![30u8; 5];
+        quals[0] = 5;
+        let cols = observed(&[readq("r1", 0, 10, &quals)], 13);
+        assert_eq!(
+            cols,
+            vec![
+                (0, 11, vec![(b'A', 30)]),
+                (0, 12, vec![(b'A', 30)]),
+                (0, 13, vec![(b'A', 30)]),
+                (0, 14, vec![(b'A', 30)]),
+            ],
+            "{cols:?}",
+        );
+    }
+
+    #[test]
+    fn sequence_skip_is_absent_from_depth_and_never_a_deletion() {
+        // 2M covers 10-11, the 3N skip spans 12-14, 2M covers 15-16. The skip
+        // contributes nothing: no columns 12-14, no `*` observation, and the
+        // flanking matches keep their exact reference offsets.
+        let cols = observed(&[read_skip("r1", 0, 10)], 0);
+        assert_eq!(
+            cols,
+            vec![
+                (0, 10, vec![(b'A', 30)]),
+                (0, 11, vec![(b'A', 30)]),
+                (0, 15, vec![(b'A', 30)]),
+                (0, 16, vec![(b'A', 30)]),
+            ],
+            "skip span must not yield columns or `*` observations: {cols:?}",
+        );
+        assert!(
+            !cols
+                .iter()
+                .any(|(_, _, c)| c.iter().any(|&(b, _)| b == b'*')),
+            "no skipped position may print as a deletion: {cols:?}",
         );
     }
 }

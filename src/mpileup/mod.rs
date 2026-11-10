@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli::MpileupArgs;
 use crate::depth::{CursorMap, parse_regions};
 use crate::faidx::RefCache;
-use crate::io::BamReader;
+use crate::io::{BamReader, RecordSource, indexed::IndexedInput};
 use crate::merge::{RgRenames, build_tid_maps, is_sorted_compatible, merge_headers};
 use crate::pileup::PileupIter;
 use crate::sort::SortKind;
@@ -82,10 +82,22 @@ pub fn run(args: MpileupArgs) -> Result<()> {
 
     let all = args.all_positions;
     let n = readers.len();
-    let mut iters: Vec<PileupIter> = readers
-        .into_iter()
-        .map(|r| PileupIter::new(r, args.min_mapq, args.min_baseq))
-        .collect();
+    // Eligible inputs are read through index random access: only the contigs
+    // some region names — and every record of those contigs — reach the
+    // sweep. Everything else (no index, SAM/CRAM, or no regions at all) keeps
+    // the streaming reader. A present-but-unparsable index aborts here
+    // instead of quietly scanning the file with unknown rows.
+    let mut iters: Vec<PileupIter> = Vec::with_capacity(n);
+    for (i, r) in readers.into_iter().enumerate() {
+        let source: Box<dyn RecordSource> = match &regions {
+            Some(regions) => match IndexedInput::open(&inputs[i], regions)? {
+                Some(idx) => Box::new(idx),
+                None => Box::new(r),
+            },
+            None => Box::new(r),
+        };
+        iters.push(PileupIter::new(source, args.min_mapq, args.min_baseq));
+    }
     // Column buffer per input, reused across positions.
     let mut cols: Vec<Vec<(u8, u8)>> = vec![Vec::new(); n];
     // The position each input currently stands on, in union tid space.
@@ -318,8 +330,17 @@ mod tests {
     use std::num::NonZeroUsize;
 
     fn header() -> Header {
+        use noodles_sam::header::record::value::map::header::{self as hd, tag};
+        // `kira-bam index` refuses headers without `@HD SO:coordinate`, and
+        // the indexed-sweep tests build their `.bai` fixtures through it.
+        // A builder-built header carries no `@HD` at all, so create it.
+        let hd_map = noodles_sam::header::record::value::map::Map::<hd::Header>::builder()
+            .insert(tag::SORT_ORDER, hd::sort_order::COORDINATE)
+            .build()
+            .unwrap();
         let len = NonZeroUsize::try_from(1_000).unwrap();
         Header::builder()
+            .set_header(hd_map)
             .add_reference_sequence("chr1", Map::<ReferenceSequence>::new(len))
             .add_reference_sequence("chr2", Map::<ReferenceSequence>::new(len))
             .build()
@@ -347,14 +368,19 @@ mod tests {
         w.finish().unwrap();
     }
 
-    /// Write each BAM (with the matching header) and run mpileup over the list
-    /// with the given `-r`/`-a` options, returning every row's tab-separated
-    /// fields or the run error.
-    fn rows_multi(
+    /// Write each BAM (with the matching header) — and an `.bai` when `index`
+    /// is set — then run mpileup over the list with the given `-r`/`-a`
+    /// options, returning every row's tab-separated fields or the run error.
+    ///
+    /// `index = false` is the classic full-file sweep; `index = true` lets the
+    /// eligible-BAM random access kick in, so the two must agree row for row.
+    fn rows_multi_opt(
         records: &[&[RecordBuf]],
         headers: &[Header],
         regions: &[&str],
         all: bool,
+        min_baseq: u8,
+        index: bool,
     ) -> Result<Vec<Vec<String>>> {
         let dir = tempfile::tempdir().unwrap();
         let inputs: Vec<std::path::PathBuf> = records
@@ -363,6 +389,18 @@ mod tests {
             .map(|(i, rs)| {
                 let p = dir.path().join(format!("in{i}.bam"));
                 write_bam(p.as_path(), headers[i].clone(), rs);
+                if index {
+                    crate::index::run(crate::cli::IndexArgs {
+                        input: p.clone(),
+                        output: None,
+                        bai: true,
+                        csi: false,
+                        min_shift: 14,
+                        depth: 5,
+                        threads: 1,
+                    })
+                    .unwrap();
+                }
                 p
             })
             .collect();
@@ -373,7 +411,7 @@ mod tests {
             reference: None,
             regions: regions.iter().map(|s| s.to_string()).collect(),
             min_mapq: 0,
-            min_baseq: 0,
+            min_baseq,
             max_depth: 8000,
             all_positions: all,
         });
@@ -386,9 +424,19 @@ mod tests {
         })
     }
 
+    fn rows_multi(
+        records: &[&[RecordBuf]],
+        headers: &[Header],
+        regions: &[&str],
+        all: bool,
+        min_baseq: u8,
+    ) -> Result<Vec<Vec<String>>> {
+        rows_multi_opt(records, headers, regions, all, min_baseq, false)
+    }
+
     /// Single input, using the default `chr1`/`chr2` header.
     fn rows(records: &[RecordBuf], regions: &[&str], all: bool) -> Vec<Vec<String>> {
-        rows_multi(&[records], &[header()], regions, all).unwrap()
+        rows_multi(&[records], &[header()], regions, all, 0).unwrap()
     }
 
     #[test]
@@ -436,6 +484,7 @@ mod tests {
             &[header(), header()],
             &[],
             false,
+            0,
         )
         .unwrap()
     }
@@ -472,6 +521,7 @@ mod tests {
             &[header(), header()],
             &[],
             true,
+            0,
         )
         .unwrap();
         assert_eq!(rows.len(), 1_000, "{rows:?}");
@@ -494,6 +544,7 @@ mod tests {
             &[header(), header()],
             &[],
             false,
+            0,
         )
         .unwrap();
         let depth = |r: &[String], s: usize| r[3 + 3 * s].parse::<u32>().unwrap();
@@ -519,6 +570,7 @@ mod tests {
             &[h1, header()],
             &[],
             false,
+            0,
         )
         .unwrap();
         assert!(rows.iter().all(|r| r.len() == 9), "{rows:?}");
@@ -550,6 +602,7 @@ mod tests {
             &[header(), h2],
             &[],
             false,
+            0,
         )
         .unwrap_err();
         assert!(
@@ -557,5 +610,485 @@ mod tests {
                 .contains("incompatible with the merged dictionary"),
             "unexpected error: {err:#}"
         );
+    }
+
+    /// A 5-base read with 1 bp deletion at its third reference base:
+    /// `2M 1D 3M` covering 10..=15.
+    fn rec_del(name: &str, start: usize) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar(Cigar::from(vec![
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Match, 3),
+            ]))
+            .set_sequence(Sequence::from(b"AAAAA".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; 5]))
+            .build()
+    }
+
+    /// A 5-base perfect match with explicit per-base qualities.
+    fn recq(name: &str, start: usize, quals: &[u8]) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar(Cigar::from(vec![Op::new(Kind::Match, quals.len())]))
+            .set_sequence(Sequence::from(vec![b'A'; quals.len()]))
+            .set_quality_scores(QualityScores::from(quals.to_vec()))
+            .build()
+    }
+
+    #[test]
+    fn deletion_row_counts_depth_and_prints_the_star() {
+        let rows = rows(&[rec_del("r1", 10)], &[], false);
+        assert_eq!(
+            rows.len(),
+            6,
+            "the deleted base is an observation: {rows:?}"
+        );
+        let del = rows.iter().find(|r| r[1] == "12").unwrap();
+        assert_eq!(del[0], "chr1");
+        assert_eq!(del[3], "1", "deletion contributes to depth: {rows:?}");
+        assert_eq!(del[4], "*", "deletion is printed as `*`: {rows:?}");
+        assert_eq!(del[5], "!", "deletion carries quality 0: {rows:?}");
+    }
+
+    #[test]
+    fn base_below_min_baseq_does_not_inflate_depth() {
+        let mut quals = vec![30u8; 5];
+        quals[0] = 5;
+        let rows = rows_multi(&[&[recq("r1", 10, &quals)]], &[header()], &[], false, 13).unwrap();
+        assert_eq!(
+            rows.len(),
+            4,
+            "pos 10 is unobserved, not depth 1 with a printed N: {rows:?}",
+        );
+        assert_eq!(rows[0][1], "11");
+        assert!(rows.iter().all(|r| r[3] == "1"), "{rows:?}");
+    }
+
+    /// A read jumping a reference skip: `2M 3N 2M` covering 10..=16.
+    fn rec_skip(name: &str, start: usize) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar(Cigar::from(vec![
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Skip, 3),
+                Op::new(Kind::Match, 2),
+            ]))
+            .set_sequence(Sequence::from(b"AAAA".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; 4]))
+            .build()
+    }
+
+    #[test]
+    fn skipped_span_is_absent_from_depth_and_output() {
+        // 2M covers 10-11, the 3N skip spans 12-14, 2M covers 15-16. The
+        // skipped positions produce no rows without `-a` and contribute no
+        // deletion observations, unlike a D deletion.
+        let rows = rows(&[rec_skip("r1", 10)], &[], false);
+        let pos: Vec<u64> = rows.iter().map(|r| r[1].parse().unwrap()).collect();
+        assert_eq!(pos, vec![10, 11, 15, 16], "{rows:?}");
+        assert!(rows.iter().all(|r| r[3] == "1"), "{rows:?}");
+        assert!(
+            !rows.iter().any(|r| r[4] == "*"),
+            "a skipped position must not print as a deletion: {rows:?}",
+        );
+    }
+
+    /// Records written as one BAM without an index run through the streaming
+    /// sweep; the identical file with an `.bai` runs through index random
+    /// access. With `-r` regions the two must produce identical rows — that is
+    /// what "indexed instead of streamed, nothing semantic changes" means.
+    #[test]
+    fn indexed_output_matches_the_streaming_sweep() {
+        let records: Vec<RecordBuf> = vec![
+            rec("a1", 0, 10),
+            rec("a2", 0, 900),
+            rec("a3", 1, 500),
+            rec("a4", 1, 8),
+        ];
+        let regions = ["chr1:1-5", "chr1:500-505", "chr2:496-502"];
+        for all in [false, true] {
+            let streamed = rows_multi(
+                &[&records[..3], &records[3..]],
+                &[header(), header()],
+                &regions,
+                all,
+                0,
+            )
+            .unwrap();
+            let indexed = rows_multi_opt(
+                &[&records[..3], &records[3..]],
+                &[header(), header()],
+                &regions,
+                all,
+                0,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                streamed, indexed,
+                "indexed rows diverged from the streaming sweep (all={all})"
+            );
+            assert!(!indexed.is_empty(), "no rows for {regions:?}");
+        }
+    }
+
+    /// The index must serve a read that starts before the region and crosses
+    /// the boundary — only the in-region base is printed, once.
+    #[test]
+    fn read_spanning_a_region_edge_is_fetched_by_the_index() {
+        // `r1` covers 2..=6; region starts at 6, so just position 6 belongs.
+        let rows = rows_multi_opt(
+            &[&[rec("r1", 0, 2)]],
+            &[header()],
+            &["chr1:6-20"],
+            false,
+            0,
+            true,
+        )
+        .unwrap();
+        let pos: Vec<u64> = rows.iter().map(|r| r[1].parse().unwrap()).collect();
+        assert_eq!(pos, vec![6], "{rows:?}");
+        assert!(rows.iter().all(|r| r[3] == "1"), "{rows:?}");
+    }
+
+    /// One read covers two disjoint `-r` intervals of the same contig; the
+    /// sweep visits its positions in order and the region cursor admits both
+    /// intervals' own positions only, so each position is one row with one
+    /// observation of this read — never a doubled column.
+    #[test]
+    fn read_spanning_disjoint_intervals_is_counted_once() {
+        // `r1` covers 10..=14: A=[10,11] and B=[14,16]; the read ends exactly
+        // at 14 and reaches both, while the covered gap 12..13 has no region.
+        let rows = rows_multi_opt(
+            &[&[rec("r1", 0, 10)]],
+            &[header()],
+            &["chr1:10-11", "chr1:14-16"],
+            false,
+            0,
+            true,
+        )
+        .unwrap();
+        let pos: Vec<u64> = rows.iter().map(|r| r[1].parse().unwrap()).collect();
+        assert_eq!(pos, vec![10, 11, 14], "{rows:?}");
+        assert!(rows.iter().all(|r| r[3] == "1"), "{rows:?}");
+    }
+
+    /// A `.bai` that exists but cannot be parsed is an error, never a quiet
+    /// fallback to a full scan that would silently change the run.
+    #[test]
+    fn corrupt_index_reports_an_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bam_path = dir.path().join("in.bam");
+        write_bam(&bam_path, header(), &[rec("r1", 0, 10)]);
+        std::fs::write(dir.path().join("in.bam.bai"), b"not a bai file").unwrap();
+
+        let err = run(MpileupArgs {
+            inputs: vec![bam_path],
+            output: Some(dir.path().join("out.tsv")),
+            reference: None,
+            regions: vec!["chr1:5-15".to_string()],
+            min_mapq: 0,
+            min_baseq: 0,
+            max_depth: 8000,
+            all_positions: false,
+        })
+        .unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("corrupt or stale"),
+            "unexpected error: {chain}"
+        );
+        assert!(
+            chain.contains("kira-bam index"),
+            "error must suggest the rebuild command: {chain}"
+        );
+    }
+
+    /// No index at all: `-r` keeps the full-file sweep. Run the same fixture
+    /// twice with no `.bai` alongside the input, and once with an index — the
+    /// rows must not differ, and the plain BAM must run without an error even
+    /// under `-r`.
+    #[test]
+    fn missing_index_falls_back_to_the_streaming_sweep() {
+        let regions = ["chr1:5-15"];
+        let records = [rec("r1", 0, 10), rec("r2", 1, 400)];
+        // The streaming variant of `rows_multi` writes no index files, so this
+        // run exercises the fallback in `run` itself.
+        let streamed = rows_multi(&[&records], &[header()], &regions, true, 0).unwrap();
+        let indexed = rows_multi_opt(&[&records], &[header()], &regions, true, 0, true).unwrap();
+        assert_eq!(streamed, indexed, "identical fixture, divergent rows");
+    }
+
+    /// Per-contig cursor regression: records spaced so each sits in its own
+    /// binning leaf. `optimize_chunks` merges touching chunk ranges, and in a
+    /// coordinate-sorted BAM consecutive records are physically contiguous —
+    /// so each contig's index query yields one merged chunk tile, and the
+    /// traversal boundary lives between contigs: an `-r` sweep over two
+    /// contigs runs one query per contig and seeks between the tiles. Index
+    /// geometry is asserted through the same `BinningIndex::query` the
+    /// sweep's `IndexedInput` performs, and indexed `mpileup -r` output must
+    /// equal the streaming sweep's row for row.
+    #[test]
+    fn two_contig_index_queries_match_the_streaming_sweep() {
+        use noodles_core::{Position, region::Interval};
+
+        // 8 five-base reads per contig, 20 kb apart: each starts in its own
+        // 16 kb-wide leaf bin, so every record contributes a chunk.
+        const N: usize = 8;
+        const STRIDE: usize = 20_000;
+        let len = NonZeroUsize::try_from(N * STRIDE).unwrap();
+        let contig_len = N * STRIDE;
+
+        use noodles_sam::header::record::value::map::header::{self as hd, tag};
+        let hd_map = noodles_sam::header::record::value::map::Map::<hd::Header>::builder()
+            .insert(tag::SORT_ORDER, hd::sort_order::COORDINATE)
+            .build()
+            .unwrap();
+        let hdr = Header::builder()
+            .set_header(hd_map)
+            .add_reference_sequence("chr1", Map::<ReferenceSequence>::new(len))
+            .add_reference_sequence("chr2", Map::<ReferenceSequence>::new(len))
+            .build();
+
+        let records = (0..2)
+            .flat_map(|tid| (0..N).map(move |i| rec(&format!("r{tid}_{i}"), tid, 1 + i * STRIDE)))
+            .collect::<Vec<_>>();
+
+        let dir = tempfile::tempdir().unwrap();
+        let bam_path = dir.path().join("in0.bam");
+        write_bam(&bam_path, hdr.clone(), &records);
+
+        // True streamed baseline first: with no `.bai` beside the input yet,
+        // `run` must take the whole-file sweep. The full row list — not just
+        // the positions — is kept for the equality below.
+        let regions = vec![
+            "chr1:140001-140005".to_string(),
+            "chr2:140001-140005".to_string(),
+        ];
+        let rows_of = |out_path: &std::path::Path| -> Vec<Vec<String>> {
+            run(MpileupArgs {
+                inputs: vec![bam_path.clone()],
+                output: Some(out_path.to_path_buf()),
+                reference: None,
+                regions: regions.clone(),
+                min_mapq: 0,
+                min_baseq: 0,
+                max_depth: 8000,
+                all_positions: false,
+            })
+            .unwrap();
+            std::fs::read_to_string(out_path)
+                .unwrap()
+                .lines()
+                .map(|l| l.split('\t').map(String::from).collect())
+                .collect()
+        };
+        let streamed = rows_of(&dir.path().join("out-stream.tsv"));
+
+        // Assert the index geometry through the same direct query the sweep's
+        // `IndexedInput` performs: one merged chunk tile per contig, disjoint
+        // from the next, so a two-contig sweep performs one query (and a
+        // seek) per contig. Also pin that the spaced records really landed in
+        // distinct bins. The index is created only now, after the baseline.
+        use noodles_bam as bam;
+        use noodles_csi::BinningIndex as _;
+        crate::index::run(crate::cli::IndexArgs {
+            input: bam_path.clone(),
+            output: None,
+            bai: true,
+            csi: false,
+            min_shift: 14,
+            depth: 5,
+            threads: 1,
+        })
+        .unwrap();
+        let index = bam::bai::fs::read(dir.path().join("in0.bam.bai")).unwrap();
+        let whole_contig = Interval::from(
+            Position::try_from(1).unwrap()..=Position::try_from(contig_len).unwrap(),
+        );
+        for tid in 0..2 {
+            assert!(
+                index.reference_sequences()[tid].bins().len() >= N,
+                "the spaced records must occupy distinct bins: {N}"
+            );
+        }
+        let tiled: Vec<_> = (0..2)
+            .map(|tid| index.query(tid, whole_contig.clone()).unwrap())
+            .collect();
+        for (tid, chunks) in tiled.iter().enumerate() {
+            assert!(
+                !chunks.is_empty(),
+                "contig {tid} must hold at least one chunk tile"
+            );
+        }
+        assert!(
+            tiled[0]
+                .iter()
+                .all(|a| tiled[1].iter().all(|b| a.end() <= b.start())),
+            "contig chunk tiles must be disjoint: {tiled:?}"
+        );
+        let total_tiles: usize = tiled.iter().map(|c| c.len()).sum();
+        assert!(
+            total_tiles >= 2,
+            "a two-contig sweep performs one query per contig, got {total_tiles} tiles total"
+        );
+
+        // Indexed run now that the `.bai` exists.
+        let indexed = rows_of(&dir.path().join("out-indexed.tsv"));
+        assert_eq!(
+            streamed, indexed,
+            "indexed rows diverged from the streaming sweep across \
+            the per-contig queries"
+        );
+        let mut expected = Vec::new();
+        for _tid in 0..2 {
+            for b in 0..5 {
+                expected.push((1 + (N - 1) * STRIDE + b) as u64);
+            }
+        }
+        assert_eq!(
+            indexed
+                .iter()
+                .map(|r| r[1].parse::<u64>().unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+            "{indexed:?}"
+        );
+        assert!(
+            indexed.iter().any(|r| r[0] == "chr1") && indexed.iter().any(|r| r[0] == "chr2"),
+            "rows must come from both contigs' queries: {indexed:?}"
+        );
+    }
+
+    /// BGZF-block regression: the fixture is sized past the 64 KiB cap of one
+    /// BGZF block's compressed size (the file-size assert below proves ≥ 2
+    /// blocks without any special accessor), so the indexed cursor over the
+    /// contig's chunk tile must decode records across block boundaries.
+    /// Indexed `mpileup -r` output must still equal the streaming sweep's.
+    #[test]
+    fn indexed_sweep_reads_across_bgzf_block_boundaries() {
+        use noodles_core::Position;
+
+        // 3000 100-base reads, 4 kb apart. Deterministic xorshift bases,
+        // qualities and unique names keep deflate from shrinking the fixture.
+        const N: usize = 3000;
+        const STRIDE: usize = 4096;
+        let len = NonZeroUsize::try_from(N * STRIDE).unwrap();
+
+        use noodles_sam::header::record::value::map::header::{self as hd, tag};
+        let hd_map = noodles_sam::header::record::value::map::Map::<hd::Header>::builder()
+            .insert(tag::SORT_ORDER, hd::sort_order::COORDINATE)
+            .build()
+            .unwrap();
+        let hdr = Header::builder()
+            .set_header(hd_map)
+            .add_reference_sequence("chr1", Map::<ReferenceSequence>::new(len))
+            .build();
+
+        let records = (0..N)
+            .map(|i| {
+                let mut state = (i as u64 + 11).wrapping_mul(0x9E37_79B9_7F03_15);
+                let mut next = move || {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+                };
+                let seq: Vec<u8> = (0..100).map(|_| b"ACGT"[(next() & 3) as usize]).collect();
+                let quals: Vec<u8> = (0..100).map(|_| ((next() & 0x3f) + 30) as u8).collect();
+                RecordBuf::builder()
+                    .set_name(format!("q{i}"))
+                    .set_flags(Flags::default())
+                    .set_reference_sequence_id(0)
+                    .set_alignment_start(Position::try_from(1 + i * STRIDE).unwrap())
+                    .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 100)]))
+                    .set_sequence(Sequence::from(seq))
+                    .set_quality_scores(QualityScores::from(quals))
+                    .build()
+            })
+            .collect::<Vec<_>>();
+
+        let dir = tempfile::tempdir().unwrap();
+        let bam_path = dir.path().join("in0.bam");
+        write_bam(&bam_path, hdr.clone(), &records);
+
+        // One BGZF block's `BSIZE` — its compressed footprint, header/body
+        // included — is capped at 65536 bytes, so a larger file guarantees ≥ 2
+        // blocks. The high-entropy qualities (3000 * 100 random bytes) make
+        // the compressed size comfortably exceed the cap.
+        let file_size = std::fs::metadata(&bam_path).unwrap().len();
+        assert!(
+            file_size > 64 * 1024,
+            "fixture must hold >1 BGZF block, got {file_size} bytes"
+        );
+
+        // True streamed baseline first: with no `.bai` beside the input yet,
+        // `run` must take the whole-file sweep. Full rows are kept for the
+        // equality below. The index is created only after this call.
+        let regions = vec!["chr1:4096001-4100196".to_string()];
+        let rows_of = |out_path: &std::path::Path| -> Vec<Vec<String>> {
+            run(MpileupArgs {
+                inputs: vec![bam_path.clone()],
+                output: Some(out_path.to_path_buf()),
+                reference: None,
+                regions: regions.clone(),
+                min_mapq: 0,
+                min_baseq: 0,
+                max_depth: 8000,
+                all_positions: false,
+            })
+            .unwrap();
+            std::fs::read_to_string(out_path)
+                .unwrap()
+                .lines()
+                .map(|l| l.split('\t').map(String::from).collect())
+                .collect()
+        };
+        let streamed = rows_of(&dir.path().join("out-stream.tsv"));
+
+        // Index build + same direct query sanity as the sibling tests.
+        use noodles_bam as bam;
+        use noodles_csi::BinningIndex as _;
+        crate::index::run(crate::cli::IndexArgs {
+            input: bam_path.clone(),
+            output: None,
+            bai: true,
+            csi: false,
+            min_shift: 14,
+            depth: 5,
+            threads: 1,
+        })
+        .unwrap();
+        let index = bam::bai::fs::read(dir.path().join("in0.bam.bai")).unwrap();
+        let whole_contig = noodles_core::region::Interval::from(
+            Position::try_from(1).unwrap()..=Position::try_from(N * STRIDE).unwrap(),
+        );
+        let tiles = index.query(0, whole_contig).unwrap();
+        assert!(
+            !tiles.is_empty(),
+            "the contig's chunk tile list must not be empty"
+        );
+
+        // Indexed run now that the `.bai` exists.
+        let indexed = rows_of(&dir.path().join("out-indexed.tsv"));
+        assert_eq!(
+            streamed, indexed,
+            "indexed rows diverged from the streaming sweep across BGZF blocks"
+        );
+        assert_eq!(indexed.len(), 200, "{indexed:?}");
+        assert_eq!(indexed[0][1], "4096001");
+        assert_eq!(indexed[100][1], "4100097");
+        assert_eq!(indexed[199][1], "4100196");
     }
 }

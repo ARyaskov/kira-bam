@@ -219,7 +219,7 @@ fn bgzf_leading_bytes(path: &Path) -> [u8; 4] {
     out
 }
 
-fn detect_format<P: AsRef<Path>>(path: P) -> io::Result<InputFormat> {
+pub(crate) fn detect_format<P: AsRef<Path>>(path: P) -> io::Result<InputFormat> {
     let path = path.as_ref();
     let mut f = File::open(path)?;
     // Enough for the gzip header plus its extra field; BGZF's is 6 bytes.
@@ -324,6 +324,32 @@ pub struct OpenOptions {
     /// on already-decompressed streams.
     pub mmap: bool,
 }
+
+/// A streaming source of decoded alignment records for the pileup family.
+///
+/// The classic source is a whole-file [`BamReader`]; `mpileup -r` can
+/// substitute a per-contig random access over an index (the crate-internal
+/// `indexed` sibling module), so the sweep never touches contigs no region
+/// names.
+pub trait RecordSource {
+    /// Read the next record into `out`. `Ok(false)` at end of stream.
+    fn read_record_buf(&mut self, out: &mut RecordBuf) -> Result<bool>;
+}
+
+impl RecordSource for BamReader {
+    fn read_record_buf(&mut self, out: &mut RecordBuf) -> Result<bool> {
+        BamReader::read_record_buf(self, out)
+    }
+}
+
+impl<T: RecordSource + ?Sized> RecordSource for Box<T> {
+    fn read_record_buf(&mut self, out: &mut RecordBuf) -> Result<bool> {
+        (**self).read_record_buf(out)
+    }
+}
+
+/// Region-restricted random access over an indexed coordinate-sorted BAM.
+pub(crate) mod indexed;
 
 pub struct BamReader {
     inner: ReaderImpl,

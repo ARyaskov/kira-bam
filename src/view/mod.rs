@@ -5,20 +5,32 @@ use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::ViewArgs;
 use crate::io::{
-    BamReader, BamWriter, PgInfo, RecordSummary, append_pg, install_thread_pool,
+    BamReader, BamWriter, PgInfo, RecordSummary, WriteOptions, append_pg, install_thread_pool,
     is_record_level_error,
 };
 use crate::types::OutputFormat;
+
+/// `sort`'s thread-to-worker convention for BAM output: leave one core for the
+/// producing thread, clamp the BGZF deflate pool at 8. Applied to every `view`
+/// BAM write site (`-@` is the BGZF compression parallelism; SAM/CRAM ignore
+/// it).
+fn compression_workers(threads: usize) -> usize {
+    threads.saturating_sub(1).clamp(1, 8)
+}
 
 pub fn run(args: ViewArgs) -> Result<()> {
     install_thread_pool(args.threads);
 
     let fmt = resolve_fmt(&args);
+    let opts = WriteOptions {
+        compression_workers: compression_workers(args.threads),
+        compression_level: None,
+    };
 
     if args.regions.is_empty() {
-        return run_streaming(args, fmt);
+        return run_streaming(args, fmt, opts);
     }
-    run_regions(args, fmt)
+    run_regions(args, fmt, opts)
 }
 
 fn resolve_fmt(args: &ViewArgs) -> OutputFormat {
@@ -38,7 +50,7 @@ fn resolve_fmt(args: &ViewArgs) -> OutputFormat {
     }
 }
 
-fn run_streaming(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
+fn run_streaming(args: ViewArgs, fmt: OutputFormat, opts: WriteOptions) -> Result<()> {
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let mut header = reader.header().clone();
@@ -49,11 +61,12 @@ fn run_streaming(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
         return count_only_stream(&mut reader, &args, &exclude);
     }
 
-    let mut writer = BamWriter::create_with_reference(
+    let mut writer = BamWriter::create_with_options(
         args.output.as_deref(),
         header,
         fmt,
         args.reference.as_deref(),
+        opts,
     )
     .context("create output")?;
 
@@ -104,7 +117,7 @@ fn report_skipped(skipped: u64) {
     }
 }
 
-fn run_regions(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
+fn run_regions(args: ViewArgs, fmt: OutputFormat, opts: WriteOptions) -> Result<()> {
     let mut idx_reader = bam::io::indexed_reader::Builder::default()
         .build_from_path(&args.input)
         .context("open indexed BAM (region query needs .bai or .csi)")?;
@@ -121,11 +134,12 @@ fn run_regions(args: ViewArgs, fmt: OutputFormat) -> Result<()> {
         return Ok(());
     }
 
-    let mut writer = BamWriter::create_with_reference(
+    let mut writer = BamWriter::create_with_options(
         args.output.as_deref(),
         header.clone(),
         fmt,
         args.reference.as_deref(),
+        opts,
     )
     .context("create output")?;
     let want_header = matches!(
@@ -378,4 +392,73 @@ fn record_excluded(rec: &crate::io::Record, exclude: &[ExcludeRegion]) -> bool {
     exclude
         .iter()
         .any(|r| r.tid == tid && r_end >= r.start && r_start <= r.end)
+}
+
+#[cfg(test)]
+mod threads_tests {
+    use super::*;
+    use crate::io::BamReader;
+    use noodles_core::Position;
+    use noodles_sam::Header;
+    use noodles_sam::alignment::record::Flags;
+    use noodles_sam::alignment::record::cigar::Op;
+    use noodles_sam::alignment::record::cigar::op::Kind;
+    use noodles_sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+    use noodles_sam::header::record::value::{Map, map::ReferenceSequence};
+    use std::num::NonZeroUsize;
+
+    /// String together with `sort`'s `threads - 1, clamp 1..=8` convention.
+    #[test]
+    fn threads_map_to_bgzf_workers_like_sort() {
+        assert_eq!(compression_workers(0), 1);
+        assert_eq!(compression_workers(1), 1);
+        assert_eq!(compression_workers(4), 3);
+        assert_eq!(compression_workers(100), 8);
+    }
+
+    /// The option mapping actually reaches a real BGZF writer: a multi-worker
+    /// BAM round trip must lose nothing.
+    #[test]
+    fn threaded_bam_output_round_trips() {
+        let len = NonZeroUsize::try_from(1_000).unwrap();
+        let header = Header::builder()
+            .add_reference_sequence("chr1", Map::<ReferenceSequence>::new(len))
+            .build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.bam");
+
+        let mut w = BamWriter::create_with_options(
+            Some(&path),
+            header.clone(),
+            OutputFormat::Bam,
+            None::<&std::path::Path>,
+            WriteOptions {
+                compression_workers: 3,
+                compression_level: None,
+            },
+        )
+        .unwrap();
+        w.write_header().unwrap();
+        for i in 0..64 {
+            let rec = RecordBuf::builder()
+                .set_name(format!("r{i}"))
+                .set_flags(Flags::default())
+                .set_reference_sequence_id(0)
+                .set_alignment_start(Position::try_from(i + 1).unwrap())
+                .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 4)]))
+                .set_sequence(Sequence::from(b"ACGT".to_vec()))
+                .set_quality_scores(QualityScores::from(vec![30u8; 4]))
+                .build();
+            w.write_record_buf(&rec).unwrap();
+        }
+        w.finish().unwrap();
+
+        let mut reader = BamReader::open(&path).unwrap();
+        let mut rec = RecordBuf::default();
+        let mut n = 0;
+        while reader.read_record_buf(&mut rec).unwrap() {
+            n += 1;
+        }
+        assert_eq!(n, 64, "records lost in the threaded round trip");
+    }
 }

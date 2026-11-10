@@ -124,6 +124,7 @@ pub fn run(args: StatsArgs) -> Result<()> {
         let flags = u16::from(rec.flags());
         st.raw_total += 1;
         if (flags & FLAG_SECONDARY) != 0 || (flags & FLAG_SUPPLEMENTARY) != 0 {
+            st.filtered_out += 1;
             continue;
         }
         // BED filter (samtools issue #2172).
@@ -277,4 +278,169 @@ pub fn run(args: StatsArgs) -> Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::BamWriter;
+    use crate::types::OutputFormat;
+    use noodles_core::Position;
+    use noodles_sam::Header;
+    use noodles_sam::alignment::record::Flags;
+    use noodles_sam::alignment::record::cigar::Op;
+    use noodles_sam::alignment::record::cigar::op::Kind;
+    use noodles_sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+    use noodles_sam::header::record::value::{Map, map::ReferenceSequence};
+    use std::num::NonZeroUsize;
+
+    fn header() -> Header {
+        Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZeroUsize::try_from(1_000).unwrap()),
+            )
+            .build()
+    }
+
+    /// A 5 bp perfect match with explicit flags.
+    fn rec(name: &str, flags: Flags) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(flags)
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 5)]))
+            .set_sequence(Sequence::from(b"ACGTA".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; 5]))
+            .build()
+    }
+
+    /// `SN <label> value` counts from a full run over a BAM of `records`.
+    fn sn_counts(records: &[RecordBuf]) -> Vec<(String, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let bam = dir.path().join("in.bam");
+        let out = dir.path().join("out.txt");
+        {
+            let mut w = BamWriter::create(Some(&bam), header(), OutputFormat::Bam).unwrap();
+            w.write_header().unwrap();
+            for r in records {
+                w.write_record_buf(r).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        run(StatsArgs {
+            input: bam,
+            output: Some(out.clone()),
+            reference: None,
+            bed: None,
+            sample_name: None,
+            min_mapq: 0,
+            threads: 1,
+        })
+        .unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        text.lines()
+            .filter_map(|l| {
+                let mut f = l.split('\t');
+                match f.next() {
+                    Some("SN") => Some((
+                        f.next().unwrap().trim_end_matches(':').to_string(),
+                        f.next().unwrap().to_string(),
+                    )),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn secondary_and_supplementary_records_are_counted_as_filtered() {
+        let counts = sn_counts(&[
+            rec("r1", Flags::default()),
+            rec("r2", Flags::SECONDARY),
+            rec("r3", Flags::SUPPLEMENTARY),
+        ]);
+        let counter = |label: &str| {
+            counts
+                .iter()
+                .find(|(l, _)| l == label)
+                .map(|(_, v)| {
+                    v.parse::<u64>()
+                        .unwrap_or_else(|_| panic!("non-integer {label}: {v}"))
+                })
+                .unwrap_or_else(|| panic!("missing {label} line: {counts:?}"))
+        };
+        // All 3 records are raw; the 2 flagged ones are filtered and the
+        // summary `sequences` count only keeps the primary record.
+        assert_eq!(counter("raw total sequences"), 3, "{counts:?}");
+        assert_eq!(counter("filtered sequences"), 2, "{counts:?}");
+        assert_eq!(counter("sequences"), 1, "{counts:?}");
+    }
+
+    /// The documented reference contract, run without `-r`: the GC histogram
+    /// is unconditional and samtools' error-rate sections (FFQ/LRQ) are never
+    /// written — the help and README must keep saying exactly that.
+    #[test]
+    fn gc_is_emitted_without_a_reference_and_no_error_rate_section_exists() {
+        let counts = sn_counts(&[rec("r1", Flags::default())]);
+        assert!(
+            counts.iter().any(|(l, _)| l.contains("average MAPQ")),
+            "the run produced no SN summary: {counts:?}"
+        );
+
+        let raw = gc_report_text(&[rec("r1", Flags::default())]);
+        assert!(raw.lines().any(|l| l.starts_with("GCF\t")));
+        assert!(
+            !raw.lines()
+                .any(|l| l.starts_with("FFQ\t") || l.starts_with("LRQ\t")),
+            "an error-rate section was emitted: {raw:?}"
+        );
+    }
+
+    /// Full report text (SN/RL/IS/GCF/MAPQ lines) from one run, like
+    /// [`sn_counts`] but without the SN filter.
+    fn gc_report_text(records: &[RecordBuf]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let bam = dir.path().join("in.bam");
+        let out = dir.path().join("out.txt");
+        {
+            let mut w = BamWriter::create(Some(&bam), header(), OutputFormat::Bam).unwrap();
+            w.write_header().unwrap();
+            for r in records {
+                w.write_record_buf(r).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        run(StatsArgs {
+            input: bam,
+            output: Some(out.clone()),
+            reference: None,
+            bed: None,
+            sample_name: None,
+            min_mapq: 0,
+            threads: 1,
+        })
+        .unwrap();
+        std::fs::read_to_string(out).unwrap()
+    }
+
+    /// Pin the help text's truthfulness about `-r` — it must match the
+    /// behavior above (CRAM-only reference, unconditional GC, no error rate).
+    #[test]
+    fn stats_help_states_the_reference_contract() {
+        use clap::CommandFactory;
+        use std::fmt::Write as _;
+        let mut cmd = crate::cli::StatsArgs::command();
+        let mut text = String::new();
+        // `render_help`'s plain write is enough; no wall-of-text snapshot.
+        write!(text, "{}", cmd.render_long_help()).unwrap();
+        for needle in ["CRAM", "unconditional", "error-rate"] {
+            assert!(
+                text.contains(needle),
+                "stats help must mention {needle:?}; got:\n{text}"
+            );
+        }
+    }
 }

@@ -9,11 +9,15 @@ use crate::depth::{CursorMap, parse_regions};
 use crate::faidx::RefCache;
 use crate::io::{BamReader, RecordSource, indexed::IndexedInput};
 use crate::merge::{RgRenames, build_tid_maps, is_sorted_compatible, merge_headers};
-use crate::pileup::PileupIter;
+use crate::pileup::{Indel, ObsKind, PileupIter, PileupObs};
 use crate::sort::SortKind;
 use noodles_sam::Header;
 
 pub fn run(args: MpileupArgs) -> Result<()> {
+    // shortcut: no BAQ, no paired/mate-overlap removal, no `--reverse-del`,
+    // and no `--ff`/`--rf`/`-A`/`-C`/`-B`/`-s`/`--output-*` options — the
+    // samtools flag surface beyond the shared engine's fixed 0x704 default is
+    // not implemented.
     let inputs = &args.inputs;
     let readers = inputs
         .iter()
@@ -99,7 +103,7 @@ pub fn run(args: MpileupArgs) -> Result<()> {
         iters.push(PileupIter::new(source, args.min_mapq, args.min_baseq));
     }
     // Column buffer per input, reused across positions.
-    let mut cols: Vec<Vec<(u8, u8)>> = vec![Vec::new(); n];
+    let mut cols: Vec<Vec<PileupObs>> = vec![Vec::new(); n];
     // The position each input currently stands on, in union tid space.
     let mut heads: Vec<Option<(usize, usize)>> = Vec::with_capacity(n);
     for i in 0..n {
@@ -162,15 +166,21 @@ pub fn run(args: MpileupArgs) -> Result<()> {
             )?;
         }
         if cur_open && region_allows(&mut regions, name, mpos as u64) {
+            // `None` when no reference is loaded: without one samtools never
+            // prints `.` — the actual base letters, lowercased on the reverse
+            // strand, are the match notation there.
             let ref_base = match &mut refs {
                 Some(cache) => cache
                     .sequence(name)?
                     .and_then(|s| s.get(mpos.saturating_sub(1)))
-                    .copied()
-                    .unwrap_or(b'N'),
-                None => b'N',
+                    .copied(),
+                None => None,
             };
-            write!(out, "{name}\t{mpos}\t{}", ref_base as char)?;
+            write!(
+                out,
+                "{name}\t{mpos}\t{}",
+                ref_base.map(|b| b as char).unwrap_or('N')
+            )?;
             // Every input standing on this position contributes its own column;
             // inputs elsewhere are zero triplets, never re-ordered or merged.
             for (col, head) in cols.iter().zip(heads.iter()) {
@@ -220,7 +230,7 @@ fn next_col(
     it: &mut PileupIter,
     map: &[Option<usize>],
     input: &Path,
-    col: &mut Vec<(u8, u8)>,
+    col: &mut Vec<PileupObs>,
 ) -> Result<Option<(usize, usize)>> {
     it.next_column_into(col)?
         .map(|(tid, pos)| {
@@ -235,29 +245,104 @@ fn next_col(
         .transpose()
 }
 
-/// One sample's `depth bases quals` triplet with ref-base style markup
-/// (`.` for match), capped at the per-sample depth limit.
+/// One sample's `depth bases quals` triplet with the samtools positional
+/// markup: `^`+MAPQ at the read's first covered position, `$` at its last,
+/// `.`/`,` when the base matches the reference (only decidable with `-f`)
+/// against `ACGTN`/`acgtn` letters otherwise, `*` for deletions, `>`/`<` for
+/// reference skips and `+N<seq>`/`-N<seq>` indel text after the aligned base
+/// they follow. Marker and indel bytes take no observation slots: the depth
+/// count is the column's observation count. `max_depth` caps the column; 0
+/// removes the cap (`samtools mpileup -d 0`), 8000 by default otherwise.
 fn write_sample(
     out: &mut Box<dyn Write>,
-    ref_base: u8,
-    col: &[(u8, u8)],
+    ref_base: Option<u8>,
+    col: &[PileupObs],
     max_depth: usize,
 ) -> Result<()> {
-    let col = &col[..col.len().min(max_depth)];
+    let col = if max_depth == 0 {
+        col
+    } else {
+        &col[..col.len().min(max_depth)]
+    };
+    // shortcut: cap truncation keeps the first max_depth observations in
+    // record order; htslib's overflow-drop order is unverified, revisit with
+    // a deeper differential fixture.
+    if col.is_empty() {
+        // Reads cover the position but every observation failed `-Q` (or the
+        // column is otherwise empty): samtools' `0 * *` sentinel row.
+        write!(out, "\t0\t*\t*")?;
+        return Ok(());
+    }
     write!(out, "\t{}", col.len())?;
     write!(out, "\t")?;
-    for &(b, _) in col {
-        if b.eq_ignore_ascii_case(&ref_base) {
-            out.write_all(b".")?;
-        } else {
-            out.write_all(&[b.to_ascii_uppercase()])?;
+    for o in col {
+        // Read-start marker with the MAPQ byte, before the base character —
+        // samtools caps the rendered MAPQ at 126 (MAPQ 93+).
+        if o.is_start {
+            out.write_all(b"^")?;
+            out.write_all(&[o.mapq.saturating_add(33).min(126)])?;
+        }
+        match o.kind {
+            ObsKind::Base => {
+                // SEQ is reference-forward; only case changes with strand. A
+                // SAM `=` base (BAM nibble 0) is a reference match by
+                // definition: samtools renders it `.`/`,` with or without
+                // `-f`.
+                let c = if o.base == b'='
+                    || ref_base.is_some_and(|rb| o.base.eq_ignore_ascii_case(&rb))
+                {
+                    if o.reverse { b',' } else { b'.' }
+                } else if o.reverse {
+                    o.base.to_ascii_lowercase()
+                } else {
+                    o.base.to_ascii_uppercase()
+                };
+                out.write_all(&[c])?;
+            }
+            // Deletions print `*` on both strands by default (samtools'
+            // `--reverse-del` `#` is not implemented).
+            ObsKind::Deletion => {
+                out.write_all(b"*")?;
+            }
+            // The skip character was chosen at decode time by strand.
+            ObsKind::RefSkip => {
+                out.write_all(&[o.base])?;
+            }
+        }
+        match o.indel.as_deref() {
+            Some(Indel::Insertion(seq)) => {
+                write!(out, "+{}", seq.len())?;
+                for &b in seq.iter() {
+                    out.write_all(&[if o.reverse {
+                        b.to_ascii_lowercase()
+                    } else {
+                        b.to_ascii_uppercase()
+                    }])?;
+                }
+            }
+            // No reference inside the engine: deleted bases render as `N`,
+            // lowercased on the reverse strand, exactly like samtools without
+            // `-f`.
+            // shortcut: even with `-f` the deleted reference bases stay `N`
+            // filler — the engine does not carry the reference sequence;
+            // upgrade by passing the ref window into the engine.
+            Some(Indel::Deletion(len)) => {
+                write!(out, "-{len}")?;
+                for _ in 0..*len {
+                    out.write_all(&[if o.reverse { b'n' } else { b'N' }])?;
+                }
+            }
+            None => {}
+        }
+        if o.is_end {
+            out.write_all(b"$")?;
         }
     }
     // Quality column; saturating because the 0xFF "quality unavailable"
     // sentinel overflows a plain `+ 33`.
     write!(out, "\t")?;
-    for &(_, q) in col {
-        out.write_all(&[q.saturating_add(33).min(126)])?;
+    for o in col {
+        out.write_all(&[o.qual.saturating_add(33).min(126)])?;
     }
     Ok(())
 }
@@ -655,21 +740,31 @@ mod tests {
         assert_eq!(del[0], "chr1");
         assert_eq!(del[3], "1", "deletion contributes to depth: {rows:?}");
         assert_eq!(del[4], "*", "deletion is printed as `*`: {rows:?}");
-        assert_eq!(del[5], "!", "deletion carries quality 0: {rows:?}");
+        // htslib pileup entries for deletions carry the last consumed base's
+        // quality (30 here), not zero.
+        assert_eq!(
+            del[5], "?",
+            "deletion carries the preceding base quality: {rows:?}"
+        );
+        // The `-1` rides on the aligned base before the deletion; without a
+        // reference the deleted base renders as `N`.
+        let before = rows.iter().find(|r| r[1] == "11").unwrap();
+        assert_eq!(
+            before[4], "A-1N",
+            "deletion markup follows the aligned base: {rows:?}"
+        );
     }
 
     #[test]
-    fn base_below_min_baseq_does_not_inflate_depth() {
+    fn base_below_min_baseq_prints_the_zero_depth_sentinel_row() {
         let mut quals = vec![30u8; 5];
         quals[0] = 5;
         let rows = rows_multi(&[&[recq("r1", 10, &quals)]], &[header()], &[], false, 13).unwrap();
-        assert_eq!(
-            rows.len(),
-            4,
-            "pos 10 is unobserved, not depth 1 with a printed N: {rows:?}",
-        );
-        assert_eq!(rows[0][1], "11");
-        assert!(rows.iter().all(|r| r[3] == "1"), "{rows:?}");
+        // pos 10 keeps its read but the base fails `-Q 13`: samtools' `0 * *`
+        // sentinel row, never depth 1 with a printed N.
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert_eq!(&rows[0][1..6], &["10", "N", "0", "*", "*"], "{rows:?}");
+        assert!(rows[1..].iter().all(|r| r[3] == "1"), "{rows:?}");
     }
 
     /// A read jumping a reference skip: `2M 3N 2M` covering 10..=16.
@@ -690,18 +785,228 @@ mod tests {
     }
 
     #[test]
-    fn skipped_span_is_absent_from_depth_and_output() {
+    fn skipped_span_prints_refskip_and_counts_in_depth() {
         // 2M covers 10-11, the 3N skip spans 12-14, 2M covers 15-16. The
-        // skipped positions produce no rows without `-a` and contribute no
-        // deletion observations, unlike a D deletion.
+        // skipped positions are observations like deletions: forward strand
+        // renders `>`, depth counts them, and their quality is the last
+        // consumed base's.
         let rows = rows(&[rec_skip("r1", 10)], &[], false);
         let pos: Vec<u64> = rows.iter().map(|r| r[1].parse().unwrap()).collect();
-        assert_eq!(pos, vec![10, 11, 15, 16], "{rows:?}");
+        assert_eq!(pos, vec![10, 11, 12, 13, 14, 15, 16], "{rows:?}");
         assert!(rows.iter().all(|r| r[3] == "1"), "{rows:?}");
+        for r in rows
+            .iter()
+            .filter(|r| (12..=14).contains(&r[1].parse::<u64>().unwrap()))
+        {
+            assert_eq!(
+                r[4], ">",
+                "a reference skip renders `>` on the forward strand: {rows:?}"
+            );
+            assert_eq!(
+                r[5], "?",
+                "skip quality is the last consumed base's: {rows:?}"
+            );
+        }
         assert!(
             !rows.iter().any(|r| r[4] == "*"),
             "a skipped position must not print as a deletion: {rows:?}",
         );
+    }
+
+    /// A record with explicit flags, CIGAR, SEQ and qualities.
+    fn recfx(
+        name: &str,
+        flags: Flags,
+        start: usize,
+        cigar: &[Op],
+        seq: &[u8],
+        quals: &[u8],
+    ) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(flags)
+            .set_mapping_quality(noodles_sam::alignment::record::MappingQuality::new(30).unwrap())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar(Cigar::from(cigar.to_vec()))
+            .set_sequence(Sequence::from(seq.to_vec()))
+            .set_quality_scores(QualityScores::from(quals.to_vec()))
+            .build()
+    }
+
+    #[test]
+    fn reverse_read_prints_lowercase_with_start_and_end_markers() {
+        // MAPQ 30 renders `^?` (30+33) at the read's first covered position
+        // and `$` at its last; without a reference, reverse-strand bases
+        // print lowercase.
+        let r = recfx(
+            "r1",
+            Flags::REVERSE_COMPLEMENTED,
+            10,
+            &[Op::new(Kind::Match, 5)],
+            b"ACGTA",
+            &[30; 5],
+        );
+        let rows = rows(&[r], &[], false);
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert_eq!(
+            rows[0][4], "^?a",
+            "start marker + lowercase reverse base: {rows:?}"
+        );
+        assert_eq!(
+            rows[4][4], "a$",
+            "end marker on the last covered base: {rows:?}"
+        );
+        // One quality byte per observation: markers take no quality slots.
+        assert_eq!(rows[0][5], "?", "{rows:?}");
+        assert_eq!(rows[4][5], "?", "{rows:?}");
+    }
+
+    #[test]
+    fn insertion_markup_rides_on_the_preceding_base() {
+        // 3M 1I 3M at 10: the inserted C prints after the third base; the
+        // insertion itself is not an extra depth unit.
+        let cigar = vec![
+            Op::new(Kind::Match, 3),
+            Op::new(Kind::Insertion, 1),
+            Op::new(Kind::Match, 3),
+        ];
+        let fwd = recfx("f", Flags::default(), 10, &cigar, b"AAACAAA", &[30; 7]);
+        let out = rows(&[fwd], &[], false);
+        let ins = out.iter().find(|r| r[1] == "12").unwrap();
+        assert_eq!(
+            ins[4], "A+1C",
+            "forward insertion prints uppercase: {out:?}"
+        );
+        assert_eq!(
+            ins[3], "1",
+            "the insertion is not an extra depth unit: {out:?}"
+        );
+
+        let rev = recfx(
+            "r",
+            Flags::REVERSE_COMPLEMENTED,
+            10,
+            &cigar,
+            b"AAACAAA",
+            &[30; 7],
+        );
+        let out = rows(&[rev], &[], false);
+        let ins = out.iter().find(|r| r[1] == "12").unwrap();
+        assert_eq!(
+            ins[4], "a+1c",
+            "reverse insertion prints lowercase: {out:?}"
+        );
+    }
+
+    #[test]
+    fn deletion_markup_renders_n_without_a_reference() {
+        // 2M 1D 3M at 10: `-1` follows the aligned base before the deletion
+        // and the deleted position prints `*`. Without `-f` the deleted
+        // reference base renders `N`, lowercased on the reverse strand.
+        let cigar = vec![
+            Op::new(Kind::Match, 2),
+            Op::new(Kind::Deletion, 1),
+            Op::new(Kind::Match, 3),
+        ];
+        let fwd = recfx("f", Flags::default(), 10, &cigar, b"AAAAA", &[30; 5]);
+        let out = rows(&[fwd], &[], false);
+        let d = out.iter().find(|r| r[1] == "11").unwrap();
+        assert_eq!(d[4], "A-1N", "{out:?}");
+        let star = out.iter().find(|r| r[1] == "12").unwrap();
+        assert_eq!(star[4], "*", "{out:?}");
+
+        let rev = recfx(
+            "r",
+            Flags::REVERSE_COMPLEMENTED,
+            10,
+            &cigar,
+            b"AAAAA",
+            &[30; 5],
+        );
+        let out = rows(&[rev], &[], false);
+        let d = out.iter().find(|r| r[1] == "11").unwrap();
+        assert_eq!(
+            d[4], "a-1n",
+            "reverse deletion renders lowercase n: {out:?}"
+        );
+        let star = out.iter().find(|r| r[1] == "12").unwrap();
+        assert_eq!(star[4], "*", "{out:?}");
+    }
+
+    #[test]
+    fn default_excluded_flags_never_reach_the_column() {
+        // SECONDARY|QCFAIL|DUP|UNMAP are dropped by the shared engine
+        // (samtools `--ff` default); supplementary (0x800) stays.
+        let mk = |name: &str, flags: Flags| {
+            recfx(
+                name,
+                flags,
+                10,
+                &[Op::new(Kind::Match, 5)],
+                b"AAAAA",
+                &[30; 5],
+            )
+        };
+        let rows = rows(
+            &[
+                mk("sec", Flags::SECONDARY),
+                mk("qcf", Flags::QC_FAIL),
+                mk("dup", Flags::DUPLICATE),
+                mk("unm", Flags::UNMAPPED),
+                mk("sup", Flags::SUPPLEMENTARY),
+            ],
+            &[],
+            false,
+        );
+        assert_eq!(
+            rows.len(),
+            5,
+            "only the supplementary read piles up: {rows:?}"
+        );
+        assert!(rows.iter().all(|r| r[3] == "1"), "{rows:?}");
+    }
+
+    /// Run a single-input mpileup with an explicit depth cap.
+    fn run_mpileup(records: &[RecordBuf], max_depth: u32) -> Vec<Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.bam");
+        write_bam(&path, header(), records);
+        let out = dir.path().join("out.tsv");
+        run(MpileupArgs {
+            inputs: vec![path],
+            output: Some(out.clone()),
+            reference: None,
+            regions: vec![],
+            min_mapq: 0,
+            min_baseq: 0,
+            max_depth,
+            all_positions: false,
+        })
+        .unwrap();
+        std::fs::read_to_string(out)
+            .unwrap()
+            .lines()
+            .map(|l| l.split('\t').map(String::from).collect())
+            .collect()
+    }
+
+    #[test]
+    fn zero_max_depth_removes_the_cap() {
+        // Three stacked reads: `-d 0` must not truncate the column (the old
+        // `col[..min(len, 0)]` emptied every row), while `-d 1` keeps the
+        // per-sample cap.
+        let reads = [rec("a", 0, 10), rec("b", 0, 10), rec("c", 0, 10)];
+        let d0 = run_mpileup(&reads, 0);
+        assert_eq!(d0[0][3], "3", "-d 0 must not truncate: {d0:?}");
+        assert_eq!(
+            d0[0][5].len(),
+            3,
+            "one quality byte per observation: {d0:?}"
+        );
+        let d1 = run_mpileup(&reads, 1);
+        assert_eq!(d1[0][3], "1", "-d 1 truncates the column: {d1:?}");
+        assert_eq!(d1[0][5].len(), 1, "{d1:?}");
     }
 
     /// Records written as one BAM without an index run through the streaming

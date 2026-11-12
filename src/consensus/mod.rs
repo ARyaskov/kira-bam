@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::ConsensusArgs;
 use crate::io::BamReader;
-use crate::pileup::PileupIter;
+use crate::pileup::{ObsKind, PileupIter, PileupObs};
 
 pub fn run(args: ConsensusArgs) -> Result<()> {
     let reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
@@ -34,7 +34,7 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
     let mut last_pos: usize = 0;
     let mut line_pos: usize = 0;
 
-    let mut col: Vec<(u8, u8)> = Vec::new();
+    let mut col: Vec<PileupObs> = Vec::new();
     while let Some((tid, pos)) = pileup.next_column_into(&mut col)? {
         if current_tid != Some(tid) {
             if let Some(prev) = current_tid {
@@ -75,10 +75,16 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
             write_base(&mut out, b'N', &mut line_pos, args.line_width)?;
             last_pos += 1;
         }
-        if col.len() > args.max_depth as usize {
-            col.truncate(args.max_depth as usize);
-        }
-        let base = majority(&col, args.call_fraction);
+        // `-d` is the samtools consensus MINIMUM depth: below it the
+        // position stays `N`; 0 disables the minimum entirely.
+        // shortcut: the depth gate counts every observation in `col.len()`,
+        // deletions and reference skips included — plausible but unconfirmed
+        // against samtools' own consensus depth.
+        let base = if (col.len() as u32) < args.min_depth {
+            b'N'
+        } else {
+            majority(&col, args.call_fraction)
+        };
         write_base(&mut out, base, &mut line_pos, args.line_width)?;
         last_pos = pos;
     }
@@ -116,10 +122,15 @@ fn write_base(out: &mut Box<dyn Write>, b: u8, line_pos: &mut usize, width: usiz
     Ok(())
 }
 
-fn majority(col: &[(u8, u8)], threshold: f32) -> u8 {
+fn majority(col: &[PileupObs], threshold: f32) -> u8 {
     let mut counts = [0u32; 6]; // A C G T N other
-    for &(b, _) in col {
-        let i = match b.to_ascii_uppercase() {
+    for o in col {
+        // Deletions (`*`) and reference skips (`>`/`<`) are depth, not
+        // callable bases: only aligned bases take part in the majority.
+        if o.kind != ObsKind::Base {
+            continue;
+        }
+        let i = match o.base.to_ascii_uppercase() {
             b'A' => 0,
             b'C' => 1,
             b'G' => 2,
@@ -187,15 +198,15 @@ mod tests {
     }
 
     /// Run consensus over a BAM of stacked reads and return the called bases.
-    fn consensus_bases(max_depth: u32, records: &[RecordBuf]) -> String {
-        consensus_for(header(), records, max_depth)
+    fn consensus_bases(min_depth: u32, records: &[RecordBuf]) -> String {
+        consensus_for(header(), records, min_depth)
             .lines()
             .skip(1)
             .collect::<String>()
     }
 
     /// The full FASTA text: every `>` sequence line plus the wrapped calls.
-    fn consensus_for(header: Header, records: &[RecordBuf], max_depth: u32) -> String {
+    fn consensus_for(header: Header, records: &[RecordBuf], min_depth: u32) -> String {
         let dir = tempfile::tempdir().unwrap();
         let bam = dir.path().join("in.bam");
         let fasta = dir.path().join("out.fa");
@@ -213,7 +224,7 @@ mod tests {
             output: Some(fasta.clone()),
             min_mapq: 0,
             min_baseq: 0,
-            max_depth,
+            min_depth,
             call_fraction: 0.5,
             line_width: 60,
             reference: None,
@@ -224,25 +235,58 @@ mod tests {
     }
 
     #[test]
-    fn max_depth_caps_the_column_before_the_call() {
-        // The first read deep calls `C`. Without the cap the column is 2 deep
-        // C vs T, a tie, and this base call flipped; with `-d 1` the cap makes
-        // the call follow the surviving read.
-        let bases = consensus_bases(1, &[read("r1", b"CCCCC"), read("r2", b"TTTTT")]);
+    fn depth_below_min_depth_stays_n() {
+        // Two stacked reads: `-d 3` is above the observed depth 2, so every
+        // covered position stays N; `-d 2` calls the majority.
+        let reads = [read("r1", b"CCCCC"), read("r2", b"CCCCC")];
         assert_eq!(
-            bases,
-            format!("{}{}", "CCCCC", "N".repeat(995)),
-            "call must reflect -d 1, not the tie: {bases:?}",
+            consensus_bases(3, &reads),
+            format!("{}{}", "N".repeat(5), "N".repeat(995)),
+            "observed depth 2 below -d 3 must stay N",
+        );
+        assert_eq!(
+            consensus_bases(2, &reads),
+            format!("{}{}", "C".repeat(5), "N".repeat(995)),
+            "observed depth 2 meets -d 2: {reads:?}",
         );
     }
 
     #[test]
-    fn zero_depth_calls_every_position_n() {
-        let bases = consensus_bases(0, &[read("r1", b"ACGTA"), read("r2", b"ACGTA")]);
+    fn zero_min_depth_never_gates_the_call() {
+        // `-d 0` disables the minimum: single coverage still calls its base.
+        let bases = consensus_bases(0, &[read("r1", b"ACGTA")]);
         assert_eq!(
             bases,
-            "N".repeat(1_000),
-            "an empty capped column must call N: {bases:?}",
+            format!("{}{}", "ACGTA", "N".repeat(995)),
+            "with no minimum a 1-deep column must call: {bases:?}",
+        );
+    }
+
+    #[test]
+    fn deletions_and_skips_are_not_callable_bases() {
+        // r1 covers 1..=5 with C; r2 deletes reference base 3 and skips
+        // reference base 4. The column depths still count them (2 and 2), so
+        // `-d 1` passes the minimum — but the majority must come from the
+        // aligned base alone, not from `*`/`>` observations.
+        let r2 = RecordBuf::builder()
+            .set_name("r2")
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_cigar(Cigar::from(vec![
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Skip, 1),
+                Op::new(Kind::Match, 1),
+            ]))
+            .set_sequence(Sequence::from(b"CCC".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; 3]))
+            .build();
+        let bases = consensus_bases(1, &[read("r1", b"CCCCC"), r2]);
+        assert_eq!(
+            bases,
+            format!("{}{}", "CCCCC", "N".repeat(995)),
+            "deletion and skip observations must not outvote the aligned base",
         );
     }
 
@@ -255,7 +299,7 @@ mod tests {
                 Map::<ReferenceSequence>::new(NonZeroUsize::try_from(8).unwrap()),
             )
             .build();
-        let text = consensus_for(len, &[read("r1", b"CCCCC")], 8_000);
+        let text = consensus_for(len, &[read("r1", b"CCCCC")], 1);
         assert_eq!(text, ">chr1\nCCCCCNNN\n");
     }
 
@@ -269,7 +313,7 @@ mod tests {
                 Map::<ReferenceSequence>::new(NonZeroUsize::try_from(60).unwrap()),
             )
             .build();
-        let text = consensus_for(all_n, &[], 8_000);
+        let text = consensus_for(all_n, &[], 1);
         assert_eq!(text, format!(">chr1\n{}\n", "N".repeat(60)));
 
         // Covered with LN 65 (multiple of width plus 5 calls): the wrapped
@@ -281,7 +325,7 @@ mod tests {
                 Map::<ReferenceSequence>::new(NonZeroUsize::try_from(65).unwrap()),
             )
             .build();
-        let text = consensus_for(covered, &[read("r1", b"CCCCC")], 8_000);
+        let text = consensus_for(covered, &[read("r1", b"CCCCC")], 1);
         assert_eq!(
             text,
             format!(
@@ -305,7 +349,7 @@ mod tests {
                 Map::<ReferenceSequence>::new(NonZeroUsize::try_from(6).unwrap()),
             )
             .build();
-        let text = consensus_for(header, &[read("r1", b"CCCCC")], 8_000);
+        let text = consensus_for(header, &[read("r1", b"CCCCC")], 1);
         assert_eq!(text, ">chr1\nCCCCCNNNNN\n>chr2\nNNNNNN\n");
     }
 
@@ -319,7 +363,7 @@ mod tests {
                 Map::<ReferenceSequence>::new(NonZeroUsize::try_from(8).unwrap()),
             )
             .build();
-        let text = consensus_for(len, &[], 8_000);
+        let text = consensus_for(len, &[], 1);
         assert_eq!(text, ">chr1\nNNNNNNNN\n");
     }
 }

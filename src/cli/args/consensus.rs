@@ -20,9 +20,11 @@ pub struct ConsensusArgs {
     #[arg(short = 'Q', long = "min-baseq", default_value_t = 13)]
     pub min_baseq: u8,
 
-    /// Maximum pileup depth per position (samtools issue #2238).
-    #[arg(short = 'd', long = "max-depth", default_value_t = 8000)]
-    pub max_depth: u32,
+    /// Minimum observed depth to call a base (samtools consensus `-d`).
+    /// Positions with fewer observations are emitted as `N`. 0 disables the
+    /// minimum.
+    #[arg(short = 'd', long = "min-depth", default_value_t = 1)]
+    pub min_depth: u32,
 
     /// Threshold fraction for majority call (0.5–1.0). Below this → N.
     #[arg(long = "call-fraction", default_value_t = 0.5)]

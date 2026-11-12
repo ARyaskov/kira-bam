@@ -23,8 +23,8 @@
 //!   the standard `fixmate -m | sort` pipeline both tools require).
 //! * `calmd` — identical MD/NM tag values (tag order is allowed to differ).
 //! * `mpileup` — CHROM/POS/REF plus every sample's depth/bases/quals triplet
-//!   after folding samtools' `^`/`$`/strand boundary markup (kira omits that
-//!   markup, and the fixture is deliberately indel-free).
+//!   after the normalizer folds the `^`/`$`/strand markup both tools now
+//!   emit identically (the fixture is deliberately indel-free).
 //! * CRAM round-trip — identical mandatory fields (cols 1–11) after decode.
 //! * `depth -a -r` — byte-identical output on the shared flag subset (no
 //!   `-aa`/`-J`/`-d`/`-s` and no paired/secondary/duplicate reads), plus an
@@ -872,9 +872,10 @@ fn coverage_baseq_mapq_filters_exact_ungated() {
 /// Parse one sample's `depth bases quals` triplet into normalized
 /// `depth bases quals`, or a description of what could not be represented.
 ///
-/// Samtools can emit markup kira omits: the read-start `^` followed by exactly
-/// one mapping-quality byte, the read-end `$`, and strand notation (`,`, and
-/// lowercase letters, for reverse-strand observations). Those marker bytes take
+/// kira now emits the same positional markup as samtools: the read-start `^`
+/// followed by exactly one mapping-quality byte, the read-end `$`, and strand
+/// notation (`,`, and lowercase letters, for reverse-strand observations).
+/// The normalizer canonicalizes BOTH tools' output: those marker bytes take
 /// no base or quality slot, so they are folded away while the retained bases
 /// keep their pairing order with the quality bytes. Zero coverage is the exact
 /// `0 * *` sentinel. Indel (`+`/`-`) and deletion/ref-skip (`*#<>`) tokens are
@@ -994,8 +995,8 @@ fn mpileup_normalizer_strips_read_start_and_end_markers() {
 
 #[test]
 fn mpileup_normalizer_normalizes_strand_notation() {
-    // samtools marks reverse-strand matches with `,` and mismatches lowercase;
-    // kira only ever emits `.` and uppercase letters.
+    // Both tools mark reverse-strand matches with `,` and mismatches
+    // lowercase; the normalizer canonicalizes either shape.
     let (d, b, q) = mpileup_sample_projection("5", ",ACac", "!!!!!").unwrap();
     assert_eq!(
         (d.as_str(), b.as_str(), q.as_str()),

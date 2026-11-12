@@ -1,13 +1,23 @@
 //! Streaming pileup over a coordinate-sorted BAM.
 //!
-//! Yields `(tid, pos, [(base, qual)])` in genomic order, keeping a sliding window
-//! of active reads keyed by alignment end. A position's observations are the
-//! bases at or above `min_baseq` plus deletions as `*` (q 0): deletions count
-//! toward depth instead of being dropped. Bases below `min_baseq` are not
-//! observed at all — never an inflating `N`. Nothing allocates per position or per
+//! Yields `(tid, pos, [PileupObs])` in genomic order, keeping a sliding window
+//! of active reads keyed by alignment end. A position's observations are one
+//! per overlapping read, carrying the markup samtools mpileup renders:
+//! strand (0x10), the read's MAPQ for the `^` marker at its first covered
+//! position, an end flag for `$`, the base kind (aligned base, deletion `*`,
+//! reference skip `>`/`<`) and an optional `+N<seq>`/`-N<seq>` indel riding on
+//! the aligned base it follows. Bases below `min_baseq` are not observed at
+//! all — never an inflating `N` — but a position whose every observation was
+//! filtered still yields an empty column, which mpileup renders as the
+//! `0 * *` sentinel row. Reads with the samtools default exclusion
+//! mask UNMAP|SECONDARY|QCFAIL|DUP (0x704; supplementary 0x800 retained) never
+//! enter the window. Nothing allocates per position or per
 //! record in steady state: the column goes into a caller-owned buffer, decode
 //! buffers are recycled as reads leave the window, and one record buffer is
 //! reused throughout.
+//!
+//! SEQ is stored reference-forward in BAM, so no complementing is done: only
+//! case and punctuation change with strand, exactly like samtools.
 
 use anyhow::Result;
 use noodles_sam::alignment::RecordBuf;
@@ -15,13 +25,63 @@ use noodles_sam::alignment::record::cigar::op::Kind;
 
 use crate::io::RecordSource;
 
-pub type PileupColumn = (usize, usize, Vec<(u8, u8)>);
+/// One observation in a pileup column: one read at one reference position,
+/// with everything the samtools read-bases/qualities rendering needs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PileupObs {
+    /// Base from SEQ, reference-forward. For deletions this is `b'*'`; for
+    /// reference skips `b'>'`/`b'<'` by strand. `0` is the filtered sentinel:
+    /// the slot keeps per-reference offsets aligned but is not an observation.
+    pub base: u8,
+    pub qual: u8,
+    /// The read's MAPQ, printed after `^` at the read's first covered
+    /// position.
+    pub mapq: u8,
+    /// Reverse strand (flag 0x10): bases print lowercase, skips as `<`.
+    pub reverse: bool,
+    /// First covered position of this alignment: renders `^`+MAPQ.
+    pub is_start: bool,
+    /// Last covered position of this alignment: renders `$`.
+    pub is_end: bool,
+    /// What the read does at this position.
+    pub kind: ObsKind,
+    /// Insertion/deletion event attached to this observation
+    /// (`+N<seq>`/`-N<seq>`); `None` almost everywhere. One per observation,
+    /// like htslib's single per-entry indel field.
+    pub indel: Option<Box<Indel>>,
+}
+
+/// An indel event rendered after the base character of the observation it is
+/// attached to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Indel {
+    /// `+N<seq>`: the read's inserted SEQ bases in read order.
+    Insertion(Box<[u8]>),
+    /// `-N`: `N` deleted reference bases. Rendered `N`/`n` by strand — the
+    /// samtools no-reference rendering, which is all we can produce without
+    /// reading the reference inside the engine.
+    Deletion(usize),
+}
+
+/// What a read does at a reference position.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ObsKind {
+    /// An aligned base (M/=/X) or the filtered sentinel slot.
+    #[default]
+    Base,
+    /// A deleted reference base: `*`.
+    Deletion,
+    /// A CIGAR N reference skip: `>` forward, `<` reverse.
+    RefSkip,
+}
+
+pub type PileupColumn = (usize, usize, Vec<PileupObs>);
 
 #[derive(Debug, Default)]
 pub struct ActiveRead {
     pub end: usize,
-    /// Per-reference-position `(base, qual)` from this read's alignment start.
-    pub bases: Vec<(u8, u8)>,
+    /// Per-reference-position observation from this read's alignment start.
+    pub bases: Vec<PileupObs>,
     /// 1-based reference start.
     pub ref_start: usize,
 }
@@ -30,7 +90,7 @@ pub struct PileupIter {
     reader: Box<dyn RecordSource>,
     active: Vec<ActiveRead>,
     /// Decode buffers of reads that left the window.
-    free: Vec<Vec<(u8, u8)>>,
+    free: Vec<Vec<PileupObs>>,
     /// The record buffer, reused for every read.
     cur: RecordBuf,
     /// `cur` belongs to a later position or contig and must not be read over.
@@ -91,7 +151,7 @@ impl PileupIter {
     }
 
     /// Write the next column into `col` (cleared first), returning its position.
-    pub fn next_column_into(&mut self, col: &mut Vec<(u8, u8)>) -> Result<Option<(usize, usize)>> {
+    pub fn next_column_into(&mut self, col: &mut Vec<PileupObs>) -> Result<Option<(usize, usize)>> {
         loop {
             // Pull in records that start at or before current_pos for current_tid.
             // Exits either at EOF or having parked one record via `hold`.
@@ -100,7 +160,12 @@ impl PileupIter {
                     break;
                 }
                 let flags = u16::from(self.cur.flags());
-                if (flags & 0x4) != 0 {
+                // samtools mpileup's default exclusion: UNMAP is always
+                // dropped and `--ff` defaults to SECONDARY|QCFAIL|DUP, i.e.
+                // the 0x704 mask; SUPPLEMENTARY (0x800) is retained. Hardcoded
+                // in the shared engine — the flag set mpileup and consensus
+                // are built around.
+                if (flags & 0x704) != 0 {
                     continue;
                 }
                 if let Some(mq) = self.cur.mapping_quality()
@@ -179,20 +244,23 @@ impl PileupIter {
             for a in &self.active {
                 let offset = pos as i64 - a.ref_start as i64;
                 if offset >= 0 && (offset as usize) < a.bases.len() {
-                    let (b, q) = a.bases[offset as usize];
-                    // A deletion (`*`) is an observation: depth counts it and
-                    // mpileup prints it. Only the filtered sentinel is dropped.
-                    if b != 0 {
-                        col.push((b, q));
+                    let obs = &a.bases[offset as usize];
+                    // Deletions (`*`) and reference skips (`>`/`<`) are
+                    // observations too: they count toward depth and render in
+                    // the column, exactly like htslib's pileup. Only the
+                    // filtered sentinel is dropped.
+                    if obs.base != 0 {
+                        col.push(obs.clone());
                     }
                 }
             }
 
-            if !col.is_empty() {
-                return Ok(Some((tid, pos)));
-            }
-            // Every surviving observation here was below -Q. The window
+            // Reads cover this position. When every observation failed `-Q`
+            // the column stays empty and the caller renders samtools' `0 * *`
+            // sentinel row — a genuinely uncovered position never reaches
+            // here, because the window-drain jump above skips it. The window
             // shrinks as `pos` advances, so this cannot spin.
+            return Ok(Some((tid, pos)));
         }
     }
 
@@ -214,22 +282,43 @@ impl PileupIter {
     }
 }
 
-/// Expand a record into per-reference-position `(base, qual)`, reusing `buf`.
+/// Expand a record into per-reference-position observations, reusing `buf`.
 /// Returns the buffer in `Err` when the record has no start.
 fn decode_active(
     rec: &RecordBuf,
     min_baseq: u8,
-    mut buf: Vec<(u8, u8)>,
-) -> std::result::Result<ActiveRead, Vec<(u8, u8)>> {
+    mut buf: Vec<PileupObs>,
+) -> std::result::Result<ActiveRead, Vec<PileupObs>> {
     let Some(start) = rec.alignment_start() else {
         return Err(buf);
     };
     let start = usize::from(start);
     let seq = rec.sequence().as_ref();
     let quals = rec.quality_scores().as_ref();
+    let reverse = (u16::from(rec.flags()) & 0x10) != 0;
+    // noodles maps the MAPQ-255 "unavailable" marker to `None`; samtools
+    // renders it as the 126 cap (`~`), never as 0.
+    let mapq = rec.mapping_quality().map(u8::from).unwrap_or(255);
+    // Total reference-consuming length (M/=/X/D/N): the read's last covered
+    // position, where the `$` marker goes.
+    let mut ref_len = 0usize;
+    for op in rec.cigar().as_ref().iter() {
+        match op.kind() {
+            Kind::Match
+            | Kind::SequenceMatch
+            | Kind::SequenceMismatch
+            | Kind::Deletion
+            | Kind::Skip => ref_len += op.len(),
+            _ => {}
+        }
+    }
     buf.clear();
     let mut read_idx = 0usize;
     let mut ref_idx = 0usize; // 0-based from `start`
+    // shortcut: CIGARs that start with D/I, and reads whose first or last
+    // covered base fails `-Q`, keep the marker/indel placement implemented
+    // here; it matches htslib's entry semantics but is unverified against a
+    // differential oracle for those exact edges.
     for op in rec.cigar().as_ref().iter() {
         let len = op.len();
         match op.kind() {
@@ -244,46 +333,136 @@ fn decode_active(
                     } else {
                         0
                     };
-                    if q >= min_baseq {
-                        buf.push((b, q));
-                    } else {
+                    let mut obs = PileupObs {
+                        base: b,
+                        qual: q,
+                        mapq,
+                        reverse,
+                        // `^` sits on the read's first covered position and
+                        // `$` on its last; a filtered slot drops the marker
+                        // with it, like a samtools entry failing `-Q`.
+                        is_start: ref_idx == 0,
+                        is_end: ref_idx + 1 == ref_len,
+                        kind: ObsKind::Base,
+                        indel: None,
+                    };
+                    if q < min_baseq {
                         // Not observed: the filtered base must neither inflate
-                        // depth as an N nor appear in the column. The `\0`
+                        // depth as an N nor appear in the column. The `base 0`
                         // sentinel is skipped when the column is built; the
                         // slot keeps per-reference offsets aligned.
-                        buf.push((0, 0));
+                        obs.base = 0;
                     }
+                    buf.push(obs);
                     read_idx += 1;
                     ref_idx += 1;
                 }
             }
-            Kind::Insertion | Kind::SoftClip => {
+            Kind::Insertion => {
+                // `+N<seq>` rides on the observation of the aligned base
+                // immediately before the I op. If that base was filtered, the
+                // insertion vanishes with it — a samtools entry failing `-Q`
+                // takes its indel markup along. Attached to whatever the last
+                // emitted observation is (even a `*`), one indel per
+                // observation like htslib.
+                let mut ins = Vec::with_capacity(len);
+                for _ in 0..len {
+                    ins.push(seq.get(read_idx).copied().unwrap_or(b'N'));
+                    read_idx += 1;
+                }
+                if let Some(last) = buf.last_mut()
+                    && last.base != 0
+                {
+                    last.indel = Some(Box::new(Indel::Insertion(ins.into_boxed_slice())));
+                }
+            }
+            Kind::SoftClip => {
                 read_idx += len;
             }
             Kind::Deletion => {
+                // `-N` rides on the observation immediately before the D op;
+                // the deleted positions themselves are `*` observations.
+                if let Some(last) = buf.last_mut()
+                    && last.base != 0
+                {
+                    last.indel = Some(Box::new(Indel::Deletion(len)));
+                }
+                // Deleted entries carry the last consumed base's quality —
+                // htslib's pileup keeps the query position parked on it.
+                let q = last_consumed_qual(quals, read_idx);
                 for _ in 0..len {
-                    buf.push((b'*', 0));
+                    buf.push(obs_with_strand(
+                        if q < min_baseq { 0 } else { b'*' },
+                        q,
+                        mapq,
+                        reverse,
+                        ref_idx == 0,
+                        ref_idx + 1 == ref_len,
+                        ObsKind::Deletion,
+                    ));
                     ref_idx += 1;
                 }
             }
             Kind::Skip => {
+                // A reference skip (CIGAR N) is an observation like a
+                // deletion: it counts toward depth and renders `>`/`<` by
+                // strand — never a deletion `*`.
+                let q = last_consumed_qual(quals, read_idx);
+                let base = if reverse { b'<' } else { b'>' };
                 for _ in 0..len {
-                    // A skipped reference span is not an observation: it must
-                    // not inflate depth or print as a deletion. The `\0`
-                    // sentinel keeps per-reference offsets aligned.
-                    buf.push((0, 0));
+                    buf.push(obs_with_strand(
+                        if q < min_baseq { 0 } else { base },
+                        q,
+                        mapq,
+                        reverse,
+                        ref_idx == 0,
+                        ref_idx + 1 == ref_len,
+                        ObsKind::RefSkip,
+                    ));
                     ref_idx += 1;
                 }
             }
             Kind::HardClip | Kind::Pad => {}
         }
     }
-    let end = start + ref_idx.saturating_sub(1);
+    let end = start + ref_len.saturating_sub(1);
     Ok(ActiveRead {
         end,
         bases: buf,
         ref_start: start,
     })
+}
+
+/// Quality of the last consumed query base — what htslib's pileup entries for
+/// deletions and reference skips carry (the query position does not advance
+/// across D/N). Zero when nothing was consumed yet.
+fn last_consumed_qual(quals: &[u8], read_idx: usize) -> u8 {
+    if read_idx > 0 && read_idx - 1 < quals.len() {
+        quals[read_idx - 1]
+    } else {
+        0
+    }
+}
+
+fn obs_with_strand(
+    base: u8,
+    qual: u8,
+    mapq: u8,
+    reverse: bool,
+    is_start: bool,
+    is_end: bool,
+    kind: ObsKind,
+) -> PileupObs {
+    PileupObs {
+        base,
+        qual,
+        mapq,
+        reverse,
+        is_start,
+        is_end,
+        kind,
+        indel: None,
+    }
 }
 
 #[cfg(test)]
@@ -486,12 +665,23 @@ mod tests {
     fn deletion_counts_as_depth_and_stays_in_the_column() {
         let cols = observed(&[read_del("r1", 0, 10, &[30; 5])], 0);
         // The deleted reference position (12) still yields a column and the
-        // deletion is one observation, not a dropped read.
+        // deletion is one observation, not a dropped read. It carries the
+        // last consumed base's quality, like an htslib pileup entry.
         let del = cols
             .iter()
             .find(|&&(_, p, _)| p == 12)
             .expect("deletion column missing");
-        assert_eq!(del.2, vec![(b'*', 0)], "{cols:?}");
+        assert_eq!(
+            del.2,
+            vec![PileupObs {
+                base: b'*',
+                qual: 30,
+                mapq: 255,
+                kind: ObsKind::Deletion,
+                ..Default::default()
+            }],
+            "{cols:?}"
+        );
         assert_eq!(cols.len(), 6, "one observation per ref position: {cols:?}");
     }
 
@@ -514,44 +704,154 @@ mod tests {
 
     #[test]
     fn base_below_min_baseq_is_not_an_n_or_a_depth_observation() {
-        // Qual 5 with -Q 13: pos 10 has no observation at all (depth 0, no
-        // N), so the sweep produces no column there — never `[(N, 1)]`.
+        // Qual 5 with -Q 13: pos 10 keeps its read but every observation is
+        // filtered, so it yields an EMPTY column (depth 0) — the caller
+        // renders samtools' `0 * *` row — never `[(N, 1)]`. The filtered
+        // first slot also takes the `^` marker with it, exactly like a
+        // samtools entry failing `-Q`.
         let mut quals = vec![30u8; 5];
         quals[0] = 5;
         let cols = observed(&[readq("r1", 0, 10, &quals)], 13);
         assert_eq!(
             cols,
             vec![
-                (0, 11, vec![(b'A', 30)]),
-                (0, 12, vec![(b'A', 30)]),
-                (0, 13, vec![(b'A', 30)]),
-                (0, 14, vec![(b'A', 30)]),
+                (0, 10, vec![]),
+                (0, 11, vec![base_obs(b'A', 30)]),
+                (0, 12, vec![base_obs(b'A', 30)]),
+                (0, 13, vec![base_obs(b'A', 30)]),
+                (
+                    0,
+                    14,
+                    vec![PileupObs {
+                        base: b'A',
+                        qual: 30,
+                        mapq: 255,
+                        is_end: true,
+                        ..Default::default()
+                    }]
+                ),
             ],
             "{cols:?}",
         );
     }
 
     #[test]
-    fn sequence_skip_is_absent_from_depth_and_never_a_deletion() {
+    fn reference_skip_is_an_observation_never_a_deletion() {
         // 2M covers 10-11, the 3N skip spans 12-14, 2M covers 15-16. The skip
-        // contributes nothing: no columns 12-14, no `*` observation, and the
-        // flanking matches keep their exact reference offsets.
+        // is an observation like a deletion: it yields columns with `>`
+        // (forward strand), counts toward depth, and carries the last
+        // consumed base's quality. `^` sits on the first covered position
+        // (10) and `$` on the last (16).
         let cols = observed(&[read_skip("r1", 0, 10)], 0);
         assert_eq!(
             cols,
             vec![
-                (0, 10, vec![(b'A', 30)]),
-                (0, 11, vec![(b'A', 30)]),
-                (0, 15, vec![(b'A', 30)]),
-                (0, 16, vec![(b'A', 30)]),
+                (
+                    0,
+                    10,
+                    vec![PileupObs {
+                        base: b'A',
+                        qual: 30,
+                        mapq: 255,
+                        is_start: true,
+                        ..Default::default()
+                    }]
+                ),
+                (0, 11, vec![base_obs(b'A', 30)]),
+                (
+                    0,
+                    12,
+                    vec![PileupObs {
+                        base: b'>',
+                        qual: 30,
+                        mapq: 255,
+                        kind: ObsKind::RefSkip,
+                        ..Default::default()
+                    }]
+                ),
+                (
+                    0,
+                    13,
+                    vec![PileupObs {
+                        base: b'>',
+                        qual: 30,
+                        mapq: 255,
+                        kind: ObsKind::RefSkip,
+                        ..Default::default()
+                    }]
+                ),
+                (
+                    0,
+                    14,
+                    vec![PileupObs {
+                        base: b'>',
+                        qual: 30,
+                        mapq: 255,
+                        kind: ObsKind::RefSkip,
+                        ..Default::default()
+                    }]
+                ),
+                (0, 15, vec![base_obs(b'A', 30)]),
+                (
+                    0,
+                    16,
+                    vec![PileupObs {
+                        base: b'A',
+                        qual: 30,
+                        mapq: 255,
+                        is_end: true,
+                        ..Default::default()
+                    }]
+                ),
             ],
-            "skip span must not yield columns or `*` observations: {cols:?}",
+            "the skip span must render `>` observations, one per position: {cols:?}",
         );
         assert!(
             !cols
                 .iter()
-                .any(|(_, _, c)| c.iter().any(|&(b, _)| b == b'*')),
+                .any(|(_, _, c)| c.iter().any(|o| o.base == b'*')),
             "no skipped position may print as a deletion: {cols:?}",
         );
+    }
+
+    fn base_obs(base: u8, qual: u8) -> PileupObs {
+        PileupObs {
+            base,
+            qual,
+            // Reads without a MAPQ field carry the 255 "unavailable" marker.
+            mapq: 255,
+            ..Default::default()
+        }
+    }
+
+    /// Reads carrying the samtools default exclusion mask must never reach
+    /// the window; supplementary (0x800) must.
+    #[test]
+    fn default_excluded_flags_are_dropped_and_supplementary_is_kept() {
+        use noodles_sam::alignment::record::Flags;
+        let mk = |name: &str, flags: Flags| {
+            RecordBuf::builder()
+                .set_name(name)
+                .set_flags(flags)
+                .set_reference_sequence_id(0)
+                .set_alignment_start(Position::try_from(10).unwrap())
+                .set_cigar(Cigar::from(vec![Op::new(Kind::Match, 5)]))
+                .set_sequence(Sequence::from(b"ACGTA".to_vec()))
+                .set_quality_scores(QualityScores::from(vec![30u8; 5]))
+                .build()
+        };
+        let cols = columns(&[
+            mk("sec", Flags::SECONDARY),
+            mk("qcfail", Flags::QC_FAIL),
+            mk("dup", Flags::DUPLICATE),
+            mk("unmap", Flags::UNMAPPED),
+            mk("supp", Flags::SUPPLEMENTARY),
+        ]);
+        assert_eq!(
+            cols.len(),
+            5,
+            "only the supplementary read piles up: {cols:?}"
+        );
+        assert!(cols.iter().all(|&(_, _, d)| d == 1), "{cols:?}");
     }
 }

@@ -191,16 +191,23 @@ kira-bam tview     -p chr:pos [-w INT] [-d INT] [--no-color] in.indexed.bam [ref
 
 - **`mpileup`** — classic pileup text. `-f` supplies the reference column, `-r`
   (repeatable) restricts to regions, `-d` caps depth per position (default
-  8000), `-Q` defaults to 13. `-r` bounds every row, covered or zero-filled;
-  `-a` emits every position including zero-coverage ones, from the start to the
-  end (or the `-r` span) of each reference sequence that has reads — reference
-  sequences without reads stay absent even if a region names them. Multiple
-  input BAMs each add their own depth/bases/quality triplet, in the order the
-  files are given; a position is emitted when any input covers it, and an
-  input lacking coverage there contributes a `0 * *` triplet.
-- **`consensus`** — majority-call consensus as FASTA. `--call-fraction` is the
-  fraction a base must reach to be called (default 0.5, below it becomes `N`),
-  `--line-width` the FASTA wrap (default 60). Input must be coordinate-sorted.
+  8000, `0` removes the cap), `-Q` defaults to 13. Reads with
+  UNMAP|SECONDARY|QCFAIL|DUP flags are excluded by default (samtools
+  `--ff` default; supplementary alignments are retained). `-r` bounds every
+  row, covered or zero-filled; `-a` emits every position including
+  zero-coverage ones, from the start to the end (or the `-r` span) of each
+  reference sequence that has reads — reference sequences without reads stay
+  absent even if a region names them. Multiple input BAMs each add their own
+  depth/bases/quality triplet, in the order the files are given; a position is
+  emitted when any input covers it (a position whose reads all fail `-Q` gets
+  a `0 * *` row), and an input lacking coverage there contributes a `0 * *`
+  triplet.
+- **`consensus`** — majority-call consensus as FASTA. `-d`/`--min-depth` is
+  the minimum observed depth to call a base (default 1; positions with fewer
+  observations become `N`, `0` disables the minimum), `--call-fraction` is the
+  fraction a base must reach to be called (default 0.5, below it becomes
+  `N`), `--line-width` the FASTA wrap (default 60). Input must be
+  coordinate-sorted.
 - **`tview`** — non-interactive text alignment viewer: prints a fixed-width pile
   around `-p chr:pos` (samtools `tview -d T` style), `-w` bases wide and at most
   `-d` reads deep. `--no-color` suppresses the ANSI escapes.

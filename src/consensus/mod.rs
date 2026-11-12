@@ -76,11 +76,13 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
             last_pos += 1;
         }
         // `-d` is the samtools consensus MINIMUM depth: below it the
-        // position stays `N`; 0 disables the minimum entirely.
-        // shortcut: the depth gate counts every observation in `col.len()`,
-        // deletions and reference skips included — plausible but unconfirmed
-        // against samtools' own consensus depth.
-        let base = if (col.len() as u32) < args.min_depth {
+        // position stays `N`; 0 disables the minimum entirely. Like
+        // bam_consensus.c, the gate counts the column after `-Q` filtering
+        // (the engine already dropped those entries), with reference skips
+        // excluded (`ref_skip` entries are skipped before `depth++`) but
+        // deletions still counting as observations.
+        let depth = col.iter().filter(|o| o.kind != ObsKind::RefSkip).count() as u32;
+        let base = if depth < args.min_depth {
             b'N'
         } else {
             majority(&col, args.call_fraction)
@@ -287,6 +289,39 @@ mod tests {
             bases,
             format!("{}{}", "CCCCC", "N".repeat(995)),
             "deletion and skip observations must not outvote the aligned base",
+        );
+    }
+
+    #[test]
+    fn refskip_excluded_from_min_depth_but_deletions_count() {
+        // r1 covers 1..=5 with C at depth 1; r2 deletes reference base 3 and
+        // skips reference base 4. With `-d 2`: position 3 counts the
+        // deletion (depth 2, call C), position 4 loses the refskip
+        // (depth 1 < 2, stays N) — bam_consensus.c skips ref_skip entries
+        // before `depth++` but deletions still count.
+        let r2 = RecordBuf::builder()
+            .set_name("r2")
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(1).unwrap())
+            .set_cigar(Cigar::from(vec![
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Skip, 1),
+                Op::new(Kind::Match, 1),
+            ]))
+            .set_sequence(Sequence::from(b"CCT".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![30u8; 3]))
+            .build();
+        let bases = consensus_bases(2, &[read("r1", b"CCCCC"), r2]);
+        // The discriminating calls: 3 = C (deletion counts, gate passes) and
+        // 4 = N (refskip excluded, depth 1 < 2). Position 5 is a C/T tie at
+        // fraction 0.5, which `--call-fraction 0.5` calls on the later
+        // maximum (T).
+        assert_eq!(
+            bases,
+            format!("CCCNT{}", "N".repeat(995)),
+            "deletions count toward `-d`, refskips do not: {bases:?}",
         );
     }
 

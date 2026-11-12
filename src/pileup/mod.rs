@@ -5,8 +5,9 @@
 //! per overlapping read, carrying the markup samtools mpileup renders:
 //! strand (0x10), the read's MAPQ for the `^` marker at its first covered
 //! position, an end flag for `$`, the base kind (aligned base, deletion `*`,
-//! reference skip `>`/`<`) and an optional `+N<seq>`/`-N<seq>` indel riding on
-//! the aligned base it follows. Bases below `min_baseq` are not observed at
+//! reference skip `>`/`<`) and an optional `+N<seq>` insertion and/or `-N`
+//! deletion riding on the aligned base it follows, rendered insertion first.
+//! Bases below `min_baseq` are not observed at
 //! all — never an inflating `N` — but a position whose every observation was
 //! filtered still yields an empty column, which mpileup renders as the
 //! `0 * *` sentinel row. Reads with the samtools default exclusion
@@ -45,22 +46,14 @@ pub struct PileupObs {
     pub is_end: bool,
     /// What the read does at this position.
     pub kind: ObsKind,
-    /// Insertion/deletion event attached to this observation
-    /// (`+N<seq>`/`-N<seq>`); `None` almost everywhere. One per observation,
-    /// like htslib's single per-entry indel field.
-    pub indel: Option<Box<Indel>>,
-}
-
-/// An indel event rendered after the base character of the observation it is
-/// attached to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Indel {
-    /// `+N<seq>`: the read's inserted SEQ bases in read order.
-    Insertion(Box<[u8]>),
-    /// `-N`: `N` deleted reference bases. Rendered `N`/`n` by strand — the
-    /// samtools no-reference rendering, which is all we can produce without
-    /// reading the reference inside the engine.
-    Deletion(usize),
+    /// `+N<seq>` attached to this observation: the read's inserted SEQ bases,
+    /// `None` almost everywhere.
+    pub ins: Option<Box<[u8]>>,
+    /// `-N` attached to this observation: `N` deleted reference bases follow
+    /// the insertion text — a compound I+D on one entry renders
+    /// `+N<ins>-N<del>`, insertion first, exactly like htslib's single
+    /// per-entry indel field. `None` almost everywhere.
+    pub del_len: Option<usize>,
 }
 
 /// What a read does at a reference position.
@@ -344,7 +337,8 @@ fn decode_active(
                         is_start: ref_idx == 0,
                         is_end: ref_idx + 1 == ref_len,
                         kind: ObsKind::Base,
-                        indel: None,
+                        ins: None,
+                        del_len: None,
                     };
                     if q < min_baseq {
                         // Not observed: the filtered base must neither inflate
@@ -373,7 +367,7 @@ fn decode_active(
                 if let Some(last) = buf.last_mut()
                     && last.base != 0
                 {
-                    last.indel = Some(Box::new(Indel::Insertion(ins.into_boxed_slice())));
+                    last.ins = Some(ins.into_boxed_slice());
                 }
             }
             Kind::SoftClip => {
@@ -385,11 +379,14 @@ fn decode_active(
                 if let Some(last) = buf.last_mut()
                     && last.base != 0
                 {
-                    last.indel = Some(Box::new(Indel::Deletion(len)));
+                    last.del_len = Some(len);
                 }
-                // Deleted entries carry the last consumed base's quality —
-                // htslib's pileup keeps the query position parked on it.
-                let q = last_consumed_qual(quals, read_idx);
+                // Deleted and skipped entries carry the quality of the base
+                // AFTER the D/N — resolve_cigar2 advances the query position
+                // only on M/=/X, so it lands there — and 0 when the read has
+                // no following base; bam_plcmd.c applies `-Q` to them like
+                // every other entry.
+                let q = following_base_qual(quals, read_idx);
                 for _ in 0..len {
                     buf.push(obs_with_strand(
                         if q < min_baseq { 0 } else { b'*' },
@@ -407,7 +404,7 @@ fn decode_active(
                 // A reference skip (CIGAR N) is an observation like a
                 // deletion: it counts toward depth and renders `>`/`<` by
                 // strand — never a deletion `*`.
-                let q = last_consumed_qual(quals, read_idx);
+                let q = following_base_qual(quals, read_idx);
                 let base = if reverse { b'<' } else { b'>' };
                 for _ in 0..len {
                     buf.push(obs_with_strand(
@@ -433,15 +430,12 @@ fn decode_active(
     })
 }
 
-/// Quality of the last consumed query base — what htslib's pileup entries for
-/// deletions and reference skips carry (the query position does not advance
-/// across D/N). Zero when nothing was consumed yet.
-fn last_consumed_qual(quals: &[u8], read_idx: usize) -> u8 {
-    if read_idx > 0 && read_idx - 1 < quals.len() {
-        quals[read_idx - 1]
-    } else {
-        0
-    }
+/// Quality of the query base following a D/N — what htslib's pileup entries
+/// for deletions and reference skips carry (`resolve_cigar2` keeps `qpos`
+/// there; only M/=/X advance it). Zero when the read has no following base,
+/// which `-Q` then filters out like any other entry.
+fn following_base_qual(quals: &[u8], read_idx: usize) -> u8 {
+    quals.get(read_idx).copied().unwrap_or(0)
 }
 
 fn obs_with_strand(
@@ -461,7 +455,8 @@ fn obs_with_strand(
         is_start,
         is_end,
         kind,
-        indel: None,
+        ins: None,
+        del_len: None,
     }
 }
 
@@ -661,12 +656,82 @@ mod tests {
             .build()
     }
 
+    /// A `1M 1D 1M` read with explicit per-base qualities.
+    fn read_del_mdm(name: &str, quals: &[u8]) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(10).unwrap())
+            .set_cigar(Cigar::from(vec![
+                Op::new(Kind::Match, 1),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Match, 1),
+            ]))
+            .set_sequence(Sequence::from(b"AG".to_vec()))
+            .set_quality_scores(QualityScores::from(quals.to_vec()))
+            .build()
+    }
+
+    #[test]
+    fn deletion_entry_carries_the_following_base_quality_and_passes_q() {
+        // resolve_cigar2 keeps the query position on the base AFTER the D,
+        // and bam_plcmd.c applies `-Q` to the `*` entry like every other:
+        // quals [40, 10] with -Q 13 drop the deletion at position 11, while
+        // the aligned bases (40) survive at 10 and 12.
+        let cols = observed(&[read_del_mdm("r1", &[40, 10])], 13);
+        let del = cols
+            .iter()
+            .find(|&&(_, p, _)| p == 11)
+            .expect("the read still spans the deleted position");
+        assert!(del.2.is_empty(), "qual 10 < 13 must drop the `*`: {cols:?}");
+        // Same read without -Q: the `*` stays and carries the following
+        // base's quality 10 (`K` = 10+33 in the quality column).
+        let cols = observed(&[read_del_mdm("r1", &[40, 10])], 0);
+        let del = cols.iter().find(|&&(_, p, _)| p == 11).unwrap();
+        assert_eq!(del.2[0].base, b'*', "{cols:?}");
+        assert_eq!(del.2[0].qual, 10, "following base's quality: {cols:?}");
+    }
+
+    #[test]
+    fn trailing_deletion_has_no_following_base_so_zero_quality() {
+        // A D at the very end of the read: htslib's `qpos < l_qseq` bound
+        // yields quality 0, which `-Q 13` filters out; without -Q the `*`
+        // entry survives with quality 0 (`!` in the quality column).
+        let r = RecordBuf::builder()
+            .set_name("r")
+            .set_flags(Flags::default())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(10).unwrap())
+            .set_cigar(Cigar::from(vec![
+                Op::new(Kind::Match, 1),
+                Op::new(Kind::Deletion, 1),
+            ]))
+            .set_sequence(Sequence::from(b"A".to_vec()))
+            .set_quality_scores(QualityScores::from(vec![40]))
+            .build();
+        let cols = observed(&[r.clone()], 13);
+        let del = cols
+            .iter()
+            .find(|&&(_, p, _)| p == 11)
+            .expect("the read still spans the deleted position");
+        assert!(del.2.is_empty(), "qual 0 < 13 must drop the `*`: {cols:?}");
+        let cols = observed(&[r], 0);
+        let del = cols.iter().find(|&&(_, p, _)| p == 11).unwrap();
+        assert_eq!(del.2[0].base, b'*', "{cols:?}");
+        assert_eq!(
+            del.2[0].qual, 0,
+            "no following base means quality 0: {cols:?}"
+        );
+    }
+
     #[test]
     fn deletion_counts_as_depth_and_stays_in_the_column() {
         let cols = observed(&[read_del("r1", 0, 10, &[30; 5])], 0);
         // The deleted reference position (12) still yields a column and the
         // deletion is one observation, not a dropped read. It carries the
-        // last consumed base's quality, like an htslib pileup entry.
+        // quality of the base following the D, like an htslib pileup entry
+        // (resolve_cigar2 keeps the query position there).
         let del = cols
             .iter()
             .find(|&&(_, p, _)| p == 12)
@@ -739,8 +804,8 @@ mod tests {
     fn reference_skip_is_an_observation_never_a_deletion() {
         // 2M covers 10-11, the 3N skip spans 12-14, 2M covers 15-16. The skip
         // is an observation like a deletion: it yields columns with `>`
-        // (forward strand), counts toward depth, and carries the last
-        // consumed base's quality. `^` sits on the first covered position
+        // (forward strand), counts toward depth, and carries the quality of
+        // the base following the skip. `^` sits on the first covered position
         // (10) and `$` on the last (16).
         let cols = observed(&[read_skip("r1", 0, 10)], 0);
         assert_eq!(

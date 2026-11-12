@@ -189,7 +189,9 @@ kira-bam consensus [-q INT] [-Q INT] [-d INT] [--call-fraction F] [--line-width 
 kira-bam tview     -p chr:pos [-w INT] [-d INT] [--no-color] in.indexed.bam [ref.fa]
 ```
 
-- **`mpileup`** — classic pileup text. `-f` supplies the reference column, `-r`
+- **`mpileup`** — classic pileup text. `-f` supplies the reference column and
+  the real deleted reference bases in `-N` deletion markup (`N` filler
+  without one, lowercase on the reverse strand), `-r`
   (repeatable) restricts to regions, `-d` caps depth per position (default
   8000, `0` removes the cap), `-Q` defaults to 13. Reads with
   UNMAP|SECONDARY|QCFAIL|DUP flags are excluded by default (samtools

@@ -9,7 +9,7 @@ use crate::depth::{CursorMap, parse_regions};
 use crate::faidx::RefCache;
 use crate::io::{BamReader, RecordSource, indexed::IndexedInput};
 use crate::merge::{RgRenames, build_tid_maps, is_sorted_compatible, merge_headers};
-use crate::pileup::{Indel, ObsKind, PileupIter, PileupObs};
+use crate::pileup::{ObsKind, PileupIter, PileupObs};
 use crate::sort::SortKind;
 use noodles_sam::Header;
 
@@ -168,24 +168,25 @@ pub fn run(args: MpileupArgs) -> Result<()> {
         if cur_open && region_allows(&mut regions, name, mpos as u64) {
             // `None` when no reference is loaded: without one samtools never
             // prints `.` — the actual base letters, lowercased on the reverse
-            // strand, are the match notation there.
-            let ref_base = match &mut refs {
-                Some(cache) => cache
-                    .sequence(name)?
-                    .and_then(|s| s.get(mpos.saturating_sub(1)))
-                    .copied(),
+            // strand, are the match notation there. The full cached contig
+            // (one at a time) also feeds the `-N` deletion markup below.
+            let ref_seq = match &mut refs {
+                Some(cache) => cache.sequence(name)?,
                 None => None,
             };
             write!(
                 out,
                 "{name}\t{mpos}\t{}",
-                ref_base.map(|b| b as char).unwrap_or('N')
+                ref_seq
+                    .and_then(|s| s.get(mpos.saturating_sub(1)))
+                    .map(|b| *b as char)
+                    .unwrap_or('N')
             )?;
             // Every input standing on this position contributes its own column;
             // inputs elsewhere are zero triplets, never re-ordered or merged.
             for (col, head) in cols.iter().zip(heads.iter()) {
                 if *head == Some(key) {
-                    write_sample(&mut out, ref_base, col, args.max_depth as usize)?;
+                    write_sample(&mut out, ref_seq, mpos, col, args.max_depth as usize)?;
                 } else {
                     write!(out, "\t0\t*\t*")?;
                 }
@@ -249,13 +250,17 @@ fn next_col(
 /// markup: `^`+MAPQ at the read's first covered position, `$` at its last,
 /// `.`/`,` when the base matches the reference (only decidable with `-f`)
 /// against `ACGTN`/`acgtn` letters otherwise, `*` for deletions, `>`/`<` for
-/// reference skips and `+N<seq>`/`-N<seq>` indel text after the aligned base
-/// they follow. Marker and indel bytes take no observation slots: the depth
-/// count is the column's observation count. `max_depth` caps the column; 0
-/// removes the cap (`samtools mpileup -d 0`), 8000 by default otherwise.
+/// reference skips and `+N<seq>`/`-N` indel text after the aligned base they
+/// follow — a compound I+D renders `+N<ins>-N<del>`, insertion first. With
+/// `-f` the deletion markup carries the real deleted reference bases
+/// (`N` filler without one); lowercase on the reverse strand throughout.
+/// Marker and indel bytes take no observation slots: the depth count is the
+/// column's observation count. `max_depth` caps the column; 0 removes the cap
+/// (`samtools mpileup -d 0`), 8000 by default otherwise.
 fn write_sample(
     out: &mut Box<dyn Write>,
-    ref_base: Option<u8>,
+    ref_seq: Option<&[u8]>,
+    pos: usize,
     col: &[PileupObs],
     max_depth: usize,
 ) -> Result<()> {
@@ -273,6 +278,8 @@ fn write_sample(
         write!(out, "\t0\t*\t*")?;
         return Ok(());
     }
+    // The reference base at this column decides `.`/`,`.
+    let ref_base = ref_seq.and_then(|s| s.get(pos.saturating_sub(1))).copied();
     write!(out, "\t{}", col.len())?;
     write!(out, "\t")?;
     for o in col {
@@ -309,30 +316,36 @@ fn write_sample(
                 out.write_all(&[o.base])?;
             }
         }
-        match o.indel.as_deref() {
-            Some(Indel::Insertion(seq)) => {
-                write!(out, "+{}", seq.len())?;
-                for &b in seq.iter() {
-                    out.write_all(&[if o.reverse {
-                        b.to_ascii_lowercase()
-                    } else {
-                        b.to_ascii_uppercase()
-                    }])?;
-                }
+        // htslib renders a compound I+D on one entry as `+N<seq>-N<seq>`,
+        // insertion first (bam_plp_insertion_mod: cigar 1M2I1D gives
+        // `T+2AA-1C` style output).
+        if let Some(seq) = &o.ins {
+            write!(out, "+{}", seq.len())?;
+            for &b in seq.iter() {
+                out.write_all(&[if o.reverse {
+                    b.to_ascii_lowercase()
+                } else {
+                    b.to_ascii_uppercase()
+                }])?;
             }
-            // No reference inside the engine: deleted bases render as `N`,
-            // lowercased on the reverse strand, exactly like samtools without
-            // `-f`.
-            // shortcut: even with `-f` the deleted reference bases stay `N`
-            // filler — the engine does not carry the reference sequence;
-            // upgrade by passing the ref window into the engine.
-            Some(Indel::Deletion(len)) => {
-                write!(out, "-{len}")?;
-                for _ in 0..*len {
-                    out.write_all(&[if o.reverse { b'n' } else { b'N' }])?;
-                }
+        }
+        if let Some(len) = o.del_len {
+            write!(out, "-{len}")?;
+            // With `-f` the deleted reference bases print from the reference,
+            // one per deleted base starting right after this column (samtools
+            // 1.25 bam_plcmd.c: `ref[pos+i]`, `N` filler past the contig
+            // end); without one it is all `N` — the man page's `-3NNN` case.
+            for k in 1..=len {
+                let c = ref_seq
+                    .and_then(|s| s.get((pos - 1) + k))
+                    .copied()
+                    .unwrap_or(b'N');
+                out.write_all(&[if o.reverse {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                }])?;
             }
-            None => {}
         }
         if o.is_end {
             out.write_all(b"$")?;
@@ -740,8 +753,8 @@ mod tests {
         assert_eq!(del[0], "chr1");
         assert_eq!(del[3], "1", "deletion contributes to depth: {rows:?}");
         assert_eq!(del[4], "*", "deletion is printed as `*`: {rows:?}");
-        // htslib pileup entries for deletions carry the last consumed base's
-        // quality (30 here), not zero.
+        // htslib pileup entries for deletions carry the quality of the base
+        // following the D (30 here), not zero.
         assert_eq!(
             del[5], "?",
             "deletion carries the preceding base quality: {rows:?}"
@@ -788,8 +801,8 @@ mod tests {
     fn skipped_span_prints_refskip_and_counts_in_depth() {
         // 2M covers 10-11, the 3N skip spans 12-14, 2M covers 15-16. The
         // skipped positions are observations like deletions: forward strand
-        // renders `>`, depth counts them, and their quality is the last
-        // consumed base's.
+        // renders `>`, depth counts them, and their quality is the following
+        // base's (resolve_cigar2 keeps the query position there).
         let rows = rows(&[rec_skip("r1", 10)], &[], false);
         let pos: Vec<u64> = rows.iter().map(|r| r[1].parse().unwrap()).collect();
         assert_eq!(pos, vec![10, 11, 12, 13, 14, 15, 16], "{rows:?}");
@@ -802,10 +815,7 @@ mod tests {
                 r[4], ">",
                 "a reference skip renders `>` on the forward strand: {rows:?}"
             );
-            assert_eq!(
-                r[5], "?",
-                "skip quality is the last consumed base's: {rows:?}"
-            );
+            assert_eq!(r[5], "?", "skip quality is the following base's: {rows:?}");
         }
         assert!(
             !rows.iter().any(|r| r[4] == "*"),
@@ -932,6 +942,128 @@ mod tests {
         );
         let star = out.iter().find(|r| r[1] == "12").unwrap();
         assert_eq!(star[4], "*", "{out:?}");
+    }
+
+    #[test]
+    fn compound_insertion_then_deletion_renders_both() {
+        // 1M1I1D1M: htslib renders the compound indel on one entry as
+        // `+N<seq>-N<seq>`, insertion first — a single indel slot would lose
+        // the insertion here. No reference, so the deleted base is `N`.
+        let r = recfx(
+            "f",
+            Flags::default(),
+            10,
+            &[
+                Op::new(Kind::Match, 1),
+                Op::new(Kind::Insertion, 1),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Match, 1),
+            ],
+            b"ACC",
+            &[30; 3],
+        );
+        let out = rows(&[r], &[], false);
+        let d = out.iter().find(|r| r[1] == "10").unwrap();
+        assert_eq!(
+            d[4], "^?A+1C-1N",
+            "insertion first, then the deletion: {out:?}"
+        );
+    }
+
+    #[test]
+    fn deletion_entry_fails_min_baseq_when_the_following_base_is_low() {
+        // The `*` entry carries the FOLLOWING base's quality and `-Q` applies
+        // to it like every entry: quals [40,10] with -Q 13 drop the deletion
+        // at position 11 (the base itself at 12 fails too).
+        let r = recfx(
+            "r",
+            Flags::default(),
+            10,
+            &[
+                Op::new(Kind::Match, 1),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Match, 1),
+            ],
+            b"AG",
+            &[40, 10],
+        );
+        let rows = rows_multi(&[&[r]], &[header()], &[], false, 13).unwrap();
+        let del = rows.iter().find(|r| r[1] == "11").unwrap();
+        assert_eq!(&del[3..6], &["0", "*", "*"], "{rows:?}");
+        // Without -Q the entry stays: depth 1, `*`, and the quality column
+        // carries the following base's quality 10 (`+` = 10+33).
+        let r2 = recfx(
+            "r",
+            Flags::default(),
+            10,
+            &[
+                Op::new(Kind::Match, 1),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Match, 1),
+            ],
+            b"AG",
+            &[40, 10],
+        );
+        let rows = rows_multi(&[&[r2]], &[header()], &[], false, 0).unwrap();
+        let del = rows.iter().find(|r| r[1] == "11").unwrap();
+        assert_eq!(del[3], "1", "{rows:?}");
+        assert_eq!(del[4], "*", "{rows:?}");
+        assert_eq!(
+            del[5], "+",
+            "following base quality 10 prints `+` (10+33): {rows:?}"
+        );
+    }
+
+    /// A reference FASTA with C at 1-based position 12, the base the
+    /// `rec_del` fixture deletes.
+    fn write_fasta(path: &std::path::Path) {
+        let mut seq = vec![b'A'; 100];
+        seq[11] = b'C';
+        let mut s = String::from(">chr1\n");
+        s.push_str(&String::from_utf8(seq).unwrap());
+        s.push('\n');
+        std::fs::write(path, s).unwrap();
+    }
+
+    #[test]
+    fn deletion_markup_prints_the_reference_bases_with_f() {
+        // samtools 1.25 bam_plcmd.c: with `-f`, the `-N` markup carries the
+        // real deleted reference bases (C at position 12 here); the `N`
+        // filler is the no-`-f` rendering only. The differential oracle
+        // harness has no reference fixture, so this is a focused unit test —
+        // disclosed gap in the F1 coverage.
+        let dir = tempfile::tempdir().unwrap();
+        let fasta = dir.path().join("ref.fa");
+        write_fasta(&fasta);
+        let bam = dir.path().join("in.bam");
+        write_bam(&bam, header(), &[rec_del("r1", 10)]);
+        let out = dir.path().join("out.tsv");
+        run(MpileupArgs {
+            inputs: vec![bam],
+            output: Some(out.clone()),
+            reference: Some(fasta),
+            regions: vec![],
+            min_mapq: 0,
+            min_baseq: 0,
+            max_depth: 8000,
+            all_positions: false,
+        })
+        .unwrap();
+        let rows: Vec<Vec<String>> = std::fs::read_to_string(out)
+            .unwrap()
+            .lines()
+            .map(|l| l.split('\t').map(String::from).collect())
+            .collect();
+        // The reference column itself comes from the FASTA too. With `-f`
+        // the read base matching the reference prints `.`, so the markup is
+        // `.-1C`, not `A-1C`.
+        let star = rows.iter().find(|r| r[1] == "12").unwrap();
+        assert_eq!(star[2], "C", "reference column uses the FASTA: {rows:?}");
+        let before = rows.iter().find(|r| r[1] == "11").unwrap();
+        assert_eq!(
+            before[4], ".-1C",
+            "the deleted reference base, not N filler: {rows:?}"
+        );
     }
 
     #[test]

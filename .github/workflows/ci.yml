@@ -84,4 +84,4 @@ jobs:
       - name: Test (golden, byte-compat)
         env:
           KIRA_BAM_SAMTOOLS: /usr/bin/samtools
-        run: cargo test --test golden -- --nocapture
+        run: cargo test --test golden --test mpileup_markup -- --nocapture

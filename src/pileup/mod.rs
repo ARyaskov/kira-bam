@@ -12,13 +12,21 @@
 //! filtered still yields an empty column, which mpileup renders as the
 //! `0 * *` sentinel row. Reads with the samtools default exclusion
 //! mask UNMAP|SECONDARY|QCFAIL|DUP (0x704; supplementary 0x800 retained) never
-//! enter the window. Nothing allocates per position or per
-//! record in steady state: the column goes into a caller-owned buffer, decode
-//! buffers are recycled as reads leave the window, and one record buffer is
-//! reused throughout.
+//! enter the window. A read's retained state is compact: read-level metadata
+//! (MAPQ, strand, covered span) is stored once, aligned bases and qualities
+//! are kept one byte each (bounded by the read, not the reference span), and
+//! each `D`/`N` span is a single template (kind, quality, indel markup) plus a
+//! length, expanded into a transient [`PileupObs`] only at the column that
+//! covers it — a 50 kb reference skip costs one run, not 50 000 observations.
+//! Nothing allocates per position in steady state: the column goes into a
+//! caller-owned buffer, decode buffers are recycled as reads leave the window
+//! (bounded by an explicit free-pool policy), and one record buffer is reused
+//! throughout.
 //!
 //! SEQ is stored reference-forward in BAM, so no complementing is done: only
 //! case and punctuation change with strand, exactly like samtools.
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use noodles_sam::alignment::RecordBuf;
@@ -47,8 +55,9 @@ pub struct PileupObs {
     /// What the read does at this position.
     pub kind: ObsKind,
     /// `+N<seq>` attached to this observation: the read's inserted SEQ bases,
-    /// `None` almost everywhere.
-    pub ins: Option<Box<[u8]>>,
+    /// `None` almost everywhere. Shared with the read's retained run, so
+    /// materializing a column is a cheap `Arc` clone, not a per-column copy.
+    pub ins: Option<Arc<[u8]>>,
     /// `-N` attached to this observation: `N` deleted reference bases follow
     /// the insertion text — a compound I+D on one entry renders
     /// `+N<ins>-N<del>`, insertion first, exactly like htslib's single
@@ -70,20 +79,107 @@ pub enum ObsKind {
 
 pub type PileupColumn = (usize, usize, Vec<PileupObs>);
 
+/// Bounds on the decode-buffer free pool (see [`recycle`]). A
+/// deep/high-coverage region retires many reads at once; without a cap the
+/// pool would pin every retired read's buffers for the rest of the run.
+const FREE_MAX_COUNT: usize = 64;
+const FREE_MAX_BUF_BYTES: usize = 1 << 20; // 1 MiB per pooled buffer
+
+/// A compact reference-consuming run: one M/=/X, D or N span. Long spans are
+/// stored as a single template plus length and expanded into a transient
+/// [`PileupObs`] only at the column that covers them.
+#[derive(Debug)]
+struct Run {
+    /// 0-based reference offset from the read's start where this run begins.
+    start: usize,
+    /// Reference bases this run consumes.
+    len: usize,
+    kind: RunKind,
+    /// `+N`/`-N` indel markup riding on this run's LAST observation (the
+    /// base the following I/D op attaches to). `None` almost everywhere.
+    end_ins: Option<Arc<[u8]>>,
+    end_del_len: Option<usize>,
+}
+
+#[derive(Debug)]
+enum RunKind {
+    /// M/=/X: aligned bases at `seq`/`qual` offsets `base_off .. base_off+len`.
+    Match { base_off: usize },
+    /// D: `*` entries carrying the quality of the base after the deletion.
+    Del { qual: u8 },
+    /// N: `>`/`<` entries carrying the quality of the base after the skip.
+    Skip { qual: u8 },
+}
+
 #[derive(Debug, Default)]
 pub struct ActiveRead {
     pub end: usize,
-    /// Per-reference-position observation from this read's alignment start.
-    pub bases: Vec<PileupObs>,
     /// 1-based reference start.
     pub ref_start: usize,
+    /// Read-level metadata, stored once per read instead of once per position.
+    mapq: u8,
+    reverse: bool,
+    /// Total reference-consuming length (M/=/X/D/N) — the read's covered
+    /// span — for the `$` marker and retirement.
+    ref_len: usize,
+    /// Full SEQ in query order, including inserted and clipped bases.
+    seq: Vec<u8>,
+    /// Quality scores in query order; empty when the record has none.
+    qual: Vec<u8>,
+    /// Compact reference-consuming runs in order.
+    runs: Vec<Run>,
+}
+
+impl ActiveRead {
+    /// The transient observation at reference offset `off` (0-based from the
+    /// read's start), or `None` when no run covers it or the base fails `-Q`.
+    fn observe(&self, off: usize, min_baseq: u8) -> Option<PileupObs> {
+        let i = self.runs.partition_point(|r| r.start <= off);
+        let run = self.runs.get(i.checked_sub(1)?)?;
+        if off >= run.start + run.len {
+            // A SEQ shorter than the CIGAR's M span leaves no run here.
+            return None;
+        }
+        let last = off + 1 == run.start + run.len;
+        let (base, qual, kind) = match run.kind {
+            RunKind::Match { base_off } => {
+                let qi = base_off + (off - run.start);
+                let b = *self.seq.get(qi)?;
+                let q = self.qual.get(qi).copied().unwrap_or(0);
+                (if q < min_baseq { 0 } else { b }, q, ObsKind::Base)
+            }
+            RunKind::Del { qual } => (
+                if qual < min_baseq { 0 } else { b'*' },
+                qual,
+                ObsKind::Deletion,
+            ),
+            RunKind::Skip { qual } => {
+                let b = if self.reverse { b'<' } else { b'>' };
+                (if qual < min_baseq { 0 } else { b }, qual, ObsKind::RefSkip)
+            }
+        };
+        if base == 0 {
+            return None; // filtered: not an observation
+        }
+        Some(PileupObs {
+            base,
+            qual,
+            mapq: self.mapq,
+            reverse: self.reverse,
+            is_start: off == 0,
+            is_end: off + 1 == self.ref_len,
+            kind,
+            ins: if last { run.end_ins.clone() } else { None },
+            del_len: if last { run.end_del_len } else { None },
+        })
+    }
 }
 
 pub struct PileupIter {
     reader: Box<dyn RecordSource>,
     active: Vec<ActiveRead>,
     /// Decode buffers of reads that left the window.
-    free: Vec<Vec<PileupObs>>,
+    free: Vec<ActiveRead>,
     /// The record buffer, reused for every read.
     cur: RecordBuf,
     /// `cur` belongs to a later position or contig and must not be read over.
@@ -200,10 +296,10 @@ impl PileupIter {
                     self.hold(tid, start);
                     break;
                 }
-                let buf = self.free.pop().unwrap_or_default();
-                match decode_active(&self.cur, self.min_baseq, buf) {
-                    Ok(ar) => self.active.push(ar),
-                    Err(buf) => self.free.push(buf),
+                let mut ar = self.free.pop().unwrap_or_default();
+                match decode_active(&self.cur, &mut ar) {
+                    Ok(()) => self.active.push(ar),
+                    Err(()) => self.free.push(ar),
                 }
             }
 
@@ -236,14 +332,13 @@ impl PileupIter {
             col.clear();
             for a in &self.active {
                 let offset = pos as i64 - a.ref_start as i64;
-                if offset >= 0 && (offset as usize) < a.bases.len() {
-                    let obs = &a.bases[offset as usize];
+                if offset >= 0 {
                     // Deletions (`*`) and reference skips (`>`/`<`) are
                     // observations too: they count toward depth and render in
                     // the column, exactly like htslib's pileup. Only the
                     // filtered sentinel is dropped.
-                    if obs.base != 0 {
-                        col.push(obs.clone());
+                    if let Some(obs) = a.observe(offset as usize, self.min_baseq) {
+                        col.push(obs);
                     }
                 }
             }
@@ -268,22 +363,34 @@ impl PileupIter {
                 keep += 1;
             }
         }
-        for mut dead in self.active.drain(keep..) {
-            dead.bases.clear();
-            self.free.push(std::mem::take(&mut dead.bases));
+        for dead in self.active.drain(keep..) {
+            recycle(&mut self.free, dead);
         }
     }
 }
 
-/// Expand a record into per-reference-position observations, reusing `buf`.
-/// Returns the buffer in `Err` when the record has no start.
-fn decode_active(
-    rec: &RecordBuf,
-    min_baseq: u8,
-    mut buf: Vec<PileupObs>,
-) -> std::result::Result<ActiveRead, Vec<PileupObs>> {
+/// Recycle a retired read's buffers for the next record, dropping the whole
+/// buffer when the pool is full or the buffer is too large to pin.
+/// shortcut: the byte cap uses each buffer's current *capacity* (its peak
+/// read length), not the live length; revisit if reads longer than
+/// `FREE_MAX_BUF_BYTES` become the common case.
+fn recycle(free: &mut Vec<ActiveRead>, mut buf: ActiveRead) {
+    let bytes =
+        buf.seq.capacity() + buf.qual.capacity() + buf.runs.capacity() * std::mem::size_of::<Run>();
+    if bytes > FREE_MAX_BUF_BYTES || free.len() >= FREE_MAX_COUNT {
+        return; // drop: the Vecs (and any Arc ins bytes) are deallocated
+    }
+    buf.seq.clear();
+    buf.qual.clear();
+    buf.runs.clear();
+    free.push(buf);
+}
+
+/// Expand a record into compact per-read state in `ar`, reusing its buffers.
+/// Returns `Err(())` when the record has no alignment start (nothing filled).
+fn decode_active(rec: &RecordBuf, ar: &mut ActiveRead) -> std::result::Result<(), ()> {
     let Some(start) = rec.alignment_start() else {
-        return Err(buf);
+        return Err(());
     };
     let start = usize::from(start);
     let seq = rec.sequence().as_ref();
@@ -292,6 +399,7 @@ fn decode_active(
     // noodles maps the MAPQ-255 "unavailable" marker to `None`; samtools
     // renders it as the 126 cap (`~`), never as 0.
     let mapq = rec.mapping_quality().map(u8::from).unwrap_or(255);
+
     // Total reference-consuming length (M/=/X/D/N): the read's last covered
     // position, where the `$` marker goes.
     let mut ref_len = 0usize;
@@ -305,165 +413,121 @@ fn decode_active(
             _ => {}
         }
     }
-    buf.clear();
+
+    ar.seq.clear();
+    ar.seq.extend_from_slice(seq);
+    ar.qual.clear();
+    ar.qual.extend_from_slice(quals);
+    ar.runs.clear();
+
+    let ops = rec.cigar().as_ref();
     let mut read_idx = 0usize;
     let mut ref_idx = 0usize; // 0-based from `start`
+    let mut i = 0;
     // shortcut: CIGARs that start with D/I, and reads whose first or last
     // covered base fails `-Q`, keep the marker/indel placement implemented
     // here; it matches htslib's entry semantics but is unverified against a
     // differential oracle for those exact edges.
-    for op in rec.cigar().as_ref().iter() {
-        let len = op.len();
-        match op.kind() {
+    while i < ops.len() {
+        let kind = ops[i].kind();
+        let mut len = ops[i].len();
+        i += 1;
+        // htslib normalizes consecutive same-type I/D (1I1I→2I, 1D2D→3D);
+        // without the merge the second op would overwrite the first's markup.
+        if kind == Kind::Insertion || kind == Kind::Deletion {
+            while i < ops.len() && ops[i].kind() == kind {
+                len += ops[i].len();
+                i += 1;
+            }
+        }
+        match kind {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                for _ in 0..len {
-                    if read_idx >= seq.len() {
-                        break;
-                    }
-                    let b = seq[read_idx];
-                    let q = if read_idx < quals.len() {
-                        quals[read_idx]
-                    } else {
-                        0
-                    };
-                    let mut obs = PileupObs {
-                        base: b,
-                        qual: q,
-                        mapq,
-                        reverse,
-                        // `^` sits on the read's first covered position and
-                        // `$` on its last; a filtered slot drops the marker
-                        // with it, like a samtools entry failing `-Q`.
-                        is_start: ref_idx == 0,
-                        is_end: ref_idx + 1 == ref_len,
-                        kind: ObsKind::Base,
-                        ins: None,
-                        del_len: None,
-                    };
-                    if q < min_baseq {
-                        // Not observed: the filtered base must neither inflate
-                        // depth as an N nor appear in the column. The `base 0`
-                        // sentinel is skipped when the column is built; the
-                        // slot keeps per-reference offsets aligned.
-                        obs.base = 0;
-                    }
-                    buf.push(obs);
-                    read_idx += 1;
-                    ref_idx += 1;
+                // A SEQ shorter than the CIGAR's M span truncates the run; the
+                // tail of the span is left uncovered, exactly like the
+                // per-base loop it replaces.
+                let actual = if read_idx < seq.len() {
+                    (seq.len() - read_idx).min(len)
+                } else {
+                    0
+                };
+                if actual > 0 {
+                    ar.runs.push(Run {
+                        start: ref_idx,
+                        len: actual,
+                        kind: RunKind::Match { base_off: read_idx },
+                        end_ins: None,
+                        end_del_len: None,
+                    });
                 }
+                read_idx += actual;
+                ref_idx += actual;
             }
             Kind::Insertion => {
-                // `+N<seq>` rides on the observation of the aligned base
-                // immediately before the I op. If that base was filtered, the
-                // insertion vanishes with it — a samtools entry failing `-Q`
-                // takes its indel markup along. Attached to whatever the last
-                // emitted observation is (even a `*`), one indel per
-                // observation like htslib.
-                let mut ins = Vec::with_capacity(len);
-                for _ in 0..len {
-                    ins.push(seq.get(read_idx).copied().unwrap_or(b'N'));
-                    read_idx += 1;
+                // `+N<seq>` rides on the last emitted observation; a missing
+                // inserted base renders `N` like the per-base loop.
+                if let Some(last) = ar.runs.last_mut() {
+                    last.end_ins = Some(ins_arc(seq, read_idx, len));
                 }
-                if let Some(last) = buf.last_mut()
-                    && last.base != 0
-                {
-                    last.ins = Some(ins.into_boxed_slice());
-                }
+                read_idx += len;
             }
             Kind::SoftClip => {
                 read_idx += len;
             }
             Kind::Deletion => {
                 // `-N` rides on the observation immediately before the D op;
-                // the deleted positions themselves are `*` observations.
-                if let Some(last) = buf.last_mut()
-                    && last.base != 0
-                {
-                    last.del_len = Some(len);
+                // the deleted positions themselves are `*` observations
+                // carrying the quality of the base AFTER the D.
+                if let Some(last) = ar.runs.last_mut() {
+                    last.end_del_len = Some(len);
                 }
-                // Deleted and skipped entries carry the quality of the base
-                // AFTER the D/N — resolve_cigar2 advances the query position
-                // only on M/=/X, so it lands there — and 0 when the read has
-                // no following base; bam_plcmd.c applies `-Q` to them like
-                // every other entry.
-                let q = following_base_qual(quals, read_idx);
-                for _ in 0..len {
-                    buf.push(obs_with_strand(
-                        if q < min_baseq { 0 } else { b'*' },
-                        q,
-                        mapq,
-                        reverse,
-                        ref_idx == 0,
-                        ref_idx + 1 == ref_len,
-                        ObsKind::Deletion,
-                    ));
-                    ref_idx += 1;
-                }
+                let q = quals.get(read_idx).copied().unwrap_or(0);
+                ar.runs.push(Run {
+                    start: ref_idx,
+                    len,
+                    kind: RunKind::Del { qual: q },
+                    end_ins: None,
+                    end_del_len: None,
+                });
+                ref_idx += len;
             }
             Kind::Skip => {
-                // A reference skip (CIGAR N) is an observation like a
-                // deletion: it counts toward depth and renders `>`/`<` by
-                // strand — never a deletion `*`.
-                let q = following_base_qual(quals, read_idx);
-                let base = if reverse { b'<' } else { b'>' };
-                for _ in 0..len {
-                    buf.push(obs_with_strand(
-                        if q < min_baseq { 0 } else { base },
-                        q,
-                        mapq,
-                        reverse,
-                        ref_idx == 0,
-                        ref_idx + 1 == ref_len,
-                        ObsKind::RefSkip,
-                    ));
-                    ref_idx += 1;
-                }
+                let q = quals.get(read_idx).copied().unwrap_or(0);
+                ar.runs.push(Run {
+                    start: ref_idx,
+                    len,
+                    kind: RunKind::Skip { qual: q },
+                    end_ins: None,
+                    end_del_len: None,
+                });
+                ref_idx += len;
             }
             Kind::HardClip | Kind::Pad => {}
         }
     }
-    let end = start + ref_len.saturating_sub(1);
-    Ok(ActiveRead {
-        end,
-        bases: buf,
-        ref_start: start,
-    })
+
+    ar.mapq = mapq;
+    ar.reverse = reverse;
+    ar.ref_start = start;
+    ar.ref_len = ref_len;
+    ar.end = start + ref_len.saturating_sub(1);
+    Ok(())
 }
 
-/// Quality of the query base following a D/N — what htslib's pileup entries
-/// for deletions and reference skips carry (`resolve_cigar2` keeps `qpos`
-/// there; only M/=/X advance it). Zero when the read has no following base,
-/// which `-Q` then filters out like any other entry.
-fn following_base_qual(quals: &[u8], read_idx: usize) -> u8 {
-    quals.get(read_idx).copied().unwrap_or(0)
-}
-
-fn obs_with_strand(
-    base: u8,
-    qual: u8,
-    mapq: u8,
-    reverse: bool,
-    is_start: bool,
-    is_end: bool,
-    kind: ObsKind,
-) -> PileupObs {
-    PileupObs {
-        base,
-        qual,
-        mapq,
-        reverse,
-        is_start,
-        is_end,
-        kind,
-        ins: None,
-        del_len: None,
+/// The inserted SEQ bases at `read_idx..read_idx+len`, `N` filler for bases
+/// past the end of SEQ — shared as an `Arc` so column materialization clones
+/// the handle, not the bytes.
+fn ins_arc(seq: &[u8], read_idx: usize, len: usize) -> Arc<[u8]> {
+    let mut v = Vec::with_capacity(len);
+    for k in 0..len {
+        v.push(seq.get(read_idx + k).copied().unwrap_or(b'N'));
     }
+    Arc::from(v)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{BamReader, BamWriter};
+    use crate::io::{BamReader, BamWriter, RecordSource};
     use crate::types::OutputFormat;
     use noodles_core::Position;
     use noodles_sam::Header;
@@ -710,7 +774,7 @@ mod tests {
             .set_sequence(Sequence::from(b"A".to_vec()))
             .set_quality_scores(QualityScores::from(vec![40]))
             .build();
-        let cols = observed(&[r.clone()], 13);
+        let cols = observed(std::slice::from_ref(&r), 13);
         let del = cols
             .iter()
             .find(|&&(_, p, _)| p == 11)
@@ -918,5 +982,35 @@ mod tests {
             "only the supplementary read piles up: {cols:?}"
         );
         assert!(cols.iter().all(|&(_, _, d)| d == 1), "{cols:?}");
+    }
+
+    /// The decode-buffer free pool must not pin a huge read's buffers: a
+    /// buffer above the byte cap is dropped, a normal one is pooled for reuse.
+    #[test]
+    fn free_pool_drops_an_oversized_buffer() {
+        struct Empty;
+        impl RecordSource for Empty {
+            fn read_record_buf(&mut self, _out: &mut RecordBuf) -> Result<bool> {
+                Ok(false)
+            }
+        }
+        let mut it = PileupIter::new(Empty, 0, 0);
+
+        let big = ActiveRead {
+            seq: Vec::with_capacity(FREE_MAX_BUF_BYTES + 1),
+            ..Default::default()
+        };
+        recycle(&mut it.free, big);
+        assert!(
+            it.free.is_empty(),
+            "a buffer above the byte cap must be dropped, not pooled"
+        );
+
+        let small = ActiveRead {
+            seq: vec![b'A'; 4],
+            ..Default::default()
+        };
+        recycle(&mut it.free, small);
+        assert_eq!(it.free.len(), 1, "a normal buffer is pooled for reuse");
     }
 }

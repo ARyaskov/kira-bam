@@ -189,7 +189,7 @@ impl IndexedInput {
             self.plan_at += 1;
             let chunks = self
                 .index
-                .query(*tid, iv.clone())
+                .query(*tid, *iv)
                 .with_context(|| format!("query index of {}", self.path.display()))?;
             if !chunks.is_empty() {
                 self.chunks = chunks.into_iter();

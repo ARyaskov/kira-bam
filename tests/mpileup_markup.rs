@@ -53,9 +53,12 @@ fn json(s: &str) -> String {
 
 /// A resolved samtools oracle: command factory, path converter, resolved
 /// binary path and observed `--version` line.
+type RunFactory = Box<dyn Fn(&[&str]) -> Command>;
+type PathConverter = Box<dyn Fn(&Path) -> String>;
+
 struct Oracle {
-    run: Box<dyn Fn(&[&str]) -> Command>,
-    to_os: Box<dyn Fn(&Path) -> String>,
+    run: RunFactory,
+    to_os: PathConverter,
     path: String,
     version: String,
 }

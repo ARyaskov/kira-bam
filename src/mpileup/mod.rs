@@ -1361,7 +1361,7 @@ mod tests {
             );
         }
         let tiled: Vec<_> = (0..2)
-            .map(|tid| index.query(tid, whole_contig.clone()).unwrap())
+            .map(|tid| index.query(tid, whole_contig).unwrap())
             .collect();
         for (tid, chunks) in tiled.iter().enumerate() {
             assert!(
@@ -1435,7 +1435,7 @@ mod tests {
 
         let records = (0..N)
             .map(|i| {
-                let mut state = (i as u64 + 11).wrapping_mul(0x9E37_79B9_7F03_15);
+                let mut state = (i as u64 + 11).wrapping_mul(0x009E_3779_B97F_0315);
                 let mut next = move || {
                     state ^= state >> 12;
                     state ^= state << 25;

@@ -361,14 +361,8 @@ mod tests {
             )
             .build();
         let text = consensus_for(covered, &[read("r1", b"CCCCC")], 1);
-        assert_eq!(
-            text,
-            format!(
-                ">chr1\n{}\n{}\n",
-                format!("{}{}", "C".repeat(5), "N".repeat(55)),
-                "N".repeat(5),
-            ),
-        );
+        let covered_line = format!("{}{}", "C".repeat(5), "N".repeat(55));
+        assert_eq!(text, format!(">chr1\n{covered_line}\n{}\n", "N".repeat(5)));
     }
 
     #[test]

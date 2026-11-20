@@ -35,18 +35,46 @@ pub fn run(args: IdxstatsArgs) -> Result<()> {
         .map(|(name, sq)| (name.to_string(), usize::from(sq.length())))
         .collect();
 
-    let mut ref_iter = index.reference_sequences();
-    for (name, len) in &refs {
-        let (mapped, unmapped) = ref_iter
-            .next()
-            .and_then(|r| r.metadata())
-            .map(|m| (m.mapped_record_count(), m.unmapped_record_count()))
-            .unwrap_or((0, 0));
+    anyhow::ensure!(
+        index.reference_sequences().count() == refs.len(),
+        "index reference count does not match the BAM header"
+    );
+    let indexed_counts = index
+        .reference_sequences()
+        .map(|reference| {
+            reference
+                .metadata()
+                .map(|m| (m.mapped_record_count(), m.unmapped_record_count()))
+        })
+        .collect::<Option<Vec<_>>>();
+    let (counts, unplaced) = match (indexed_counts, index.unplaced_unmapped_record_count()) {
+        (Some(counts), Some(unplaced)) => (counts, unplaced),
+        _ => {
+            let mut counts = vec![(0, 0); refs.len()];
+            let mut unplaced = 0;
+            let mut record = bam::Record::default();
+            while reader.read_record(&mut record)? != 0 {
+                match record.reference_sequence_id().transpose()? {
+                    Some(id) => {
+                        let (mapped, unmapped) = counts
+                            .get_mut(id)
+                            .context("record reference ID out of range")?;
+                        if record.flags().is_unmapped() {
+                            *unmapped += 1;
+                        } else {
+                            *mapped += 1;
+                        }
+                    }
+                    None => unplaced += 1,
+                }
+            }
+            (counts, unplaced)
+        }
+    };
+    for ((name, len), (mapped, unmapped)) in refs.iter().zip(counts) {
         writeln!(out, "{name}\t{len}\t{mapped}\t{unmapped}")?;
     }
 
-    // Unplaced (samtools row: `*\t0\t0\tN`)
-    let unplaced = index.unplaced_unmapped_record_count().unwrap_or(0);
     writeln!(out, "*\t0\t0\t{unplaced}")?;
     out.flush()?;
     Ok(())

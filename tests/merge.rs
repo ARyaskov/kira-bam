@@ -50,3 +50,29 @@ fn merge_preserves_program_provenance_on_every_record() {
         assert_eq!(versions[id], Some(&record[1..2]), "{record}");
     }
 }
+
+#[test]
+fn coordinate_merge_rejects_actual_disorder_without_publishing_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = dir.path().join("unsorted.sam");
+    let other = dir.path().join("empty.sam");
+    let bam = dir.path().join("output.bam");
+    let header = "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:10\n";
+    std::fs::write(&other, header).unwrap();
+    std::fs::write(
+        &sam,
+        format!(
+            "{header}a\t0\tchr1\t5\t60\t1M\t*\t0\t0\tA\tI\nb\t0\tchr1\t1\t60\t1M\t*\t0\t0\tA\tI\n"
+        ),
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_kira-bam"))
+        .args(["merge", "-o"])
+        .arg(&bam)
+        .args([sam, other])
+        .output()
+        .unwrap();
+    assert!(!result.status.success(), "{result:?}");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("out of coordinate order"));
+    assert!(!bam.exists());
+}

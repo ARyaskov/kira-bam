@@ -136,9 +136,17 @@ pub fn run(args: MergeArgs) -> Result<()> {
     while let Some(item) = heap.pop() {
         writer.write_record_buf(&item.record)?;
         let src = item.src;
+        let previous_coordinate = coordinate(&item.record);
         let mut rec = item.record;
         if readers[src].read_record_buf(&mut rec)? {
             remap_ids(&mut rec, &tid_maps[src]);
+            if kind == SortKind::Coordinate {
+                anyhow::ensure!(
+                    coordinate(&rec) >= previous_coordinate,
+                    "{}: records are out of coordinate order",
+                    args.inputs[src].display()
+                );
+            }
             tag_renames[src].apply(&mut rec);
             heap.push(HeapItem {
                 key: build_key(&rec, kind),
@@ -149,6 +157,16 @@ pub fn run(args: MergeArgs) -> Result<()> {
     }
     writer.finish()?;
     Ok(())
+}
+
+fn coordinate(record: &RecordBuf) -> (usize, usize) {
+    (
+        record.reference_sequence_id().unwrap_or(usize::MAX),
+        record
+            .alignment_start()
+            .map(usize::from)
+            .unwrap_or(usize::MAX),
+    )
 }
 
 /// Per-input map from a read-group ID as stored in that input's records to the
@@ -281,9 +299,10 @@ pub(crate) fn merge_headers(
 
     // @HD carries the sort order, and it came in as a clone of the first
     // input's header — so a name merge used to advertise `SO:coordinate`.
-    let sort_order: &[u8] = match kind {
-        SortKind::Coordinate => b"coordinate",
-        SortKind::QueryName => b"queryname",
+    let sort_order: &[u8] = if kind == SortKind::Coordinate {
+        b"coordinate"
+    } else {
+        b"queryname"
     };
     set_header_order(&mut merged, sort_order, None);
 

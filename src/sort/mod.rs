@@ -12,8 +12,8 @@ use tempfile::TempDir;
 
 use crate::cli::SortArgs;
 use crate::io::{
-    BamReader, BamWriter, OpenOptions, PgInfo, WriteOptions, append_pg, install_thread_pool,
-    is_record_level_error, resolve_memory_hint,
+    BamReader, BamWriter, OpenOptions, PgInfo, WriteOptions, append_pg, is_record_level_error,
+    resolve_memory_hint,
 };
 use crate::markdup::{MarkdupOptions, mark_duplicates_in_memory};
 use crate::types::{OutputFormat, set_header_order};
@@ -342,8 +342,14 @@ pub(crate) fn build_key(rec: &RecordBuf, kind: SortKind) -> SortKey {
 }
 
 pub fn run(args: SortArgs) -> Result<()> {
-    install_thread_pool(args.threads);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build()
+        .context("create sort worker pool")?;
+    pool.install(|| run_in_pool(args))
+}
 
+fn run_in_pool(args: SortArgs) -> Result<()> {
     let kind = if args.name_sort {
         SortKind::QueryName
     } else {

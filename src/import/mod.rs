@@ -11,12 +11,10 @@ use noodles_sam::alignment::record_buf::data::field::Value;
 use noodles_sam::header::record::value::{Map, map::ReadGroup, map::read_group::tag as rg_tag};
 
 use crate::cli::ImportArgs;
-use crate::io::{BamWriter, PgInfo, append_pg, install_thread_pool};
+use crate::io::{BamWriter, PgInfo, append_pg};
 use crate::types::OutputFormat;
 
 pub fn run(args: ImportArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     let mut header = Header::default();
     let mut rg = Map::<ReadGroup>::builder();
     if let Some(s) = &args.sample {

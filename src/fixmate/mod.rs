@@ -5,10 +5,7 @@ use noodles_sam::alignment::record::data::field::Tag;
 use noodles_sam::alignment::record_buf::data::field::Value;
 
 use crate::cli::FixmateArgs;
-use crate::io::{
-    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, report_skipped,
-    write_record_tolerant,
-};
+use crate::io::{BamReader, BamWriter, PgInfo, append_pg, report_skipped, write_record_tolerant};
 use crate::types::OutputFormat;
 
 const FLAG_PAIRED: u16 = 0x1;
@@ -58,8 +55,6 @@ fn check_query_grouped(header: &noodles_sam::Header, force: bool) -> Result<()> 
 }
 
 pub fn run(args: FixmateArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let mut header = reader.header().clone();

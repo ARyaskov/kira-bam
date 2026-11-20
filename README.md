@@ -257,6 +257,11 @@ while reader.read_record_buf(&mut rec)? {
 writer.finish()?;
 ```
 
+File outputs from `BamWriter::create` become visible at their destination
+after `finish()`. For embedded sorting, the in-memory API can run inside a
+caller-owned Rayon pool via `ThreadPool::install`. The CLI creates a local
+sort pool from `-@`.
+
 ## Tests
 
 Unit tests (including a `proptest` that pins the AVX2 quality-sum to its scalar

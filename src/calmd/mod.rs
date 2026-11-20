@@ -6,15 +6,10 @@ use noodles_sam::alignment::record_buf::data::field::Value;
 
 use crate::cli::CalmdArgs;
 use crate::faidx::RefCache;
-use crate::io::{
-    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, report_skipped,
-    write_record_tolerant,
-};
+use crate::io::{BamReader, BamWriter, PgInfo, append_pg, report_skipped, write_record_tolerant};
 use crate::types::OutputFormat;
 
 pub fn run(args: CalmdArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     // One contig at a time via the `.fai`, not the whole genome in a map.
     let mut refs = RefCache::open(&args.reference)?;
 

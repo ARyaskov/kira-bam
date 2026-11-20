@@ -7,9 +7,7 @@ use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::FastqArgs;
 use crate::collate::NameBuckets;
-use crate::io::{
-    BamReader, BufferedOutput, ensure_distinct_output, install_thread_pool, output_key,
-};
+use crate::io::{BamReader, BufferedOutput, ensure_distinct_output, output_key};
 
 const FLAG_UNMAP: u16 = 0x4;
 const FLAG_REVERSE: u16 = 0x10;
@@ -66,8 +64,6 @@ impl Outputs {
 }
 
 pub fn run(args: FastqArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     let mut outputs = Outputs::open(&args)?;
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;

@@ -9,7 +9,7 @@ use noodles_sam::alignment::RecordBuf;
 use noodles_sam::header::record::value::map::program::tag as pg_tag;
 
 use crate::cli::MergeArgs;
-use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
+use crate::io::{BamReader, BamWriter, PgInfo, append_pg};
 // Reuse the sort module's samtools-compatible ordering so `merge` and `sort`
 // agree on tie-breaks (coordinate: tid/pos/reverse-strand; name: strnum qname +
 // READ1/READ2 bits), with equal-key records resolved by input/source order.
@@ -44,8 +44,6 @@ impl Ord for HeapItem {
 }
 
 pub fn run(args: MergeArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     if !args.force && args.output.exists() {
         anyhow::bail!(
             "output {} already exists; pass -f to overwrite",

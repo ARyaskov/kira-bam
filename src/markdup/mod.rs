@@ -7,7 +7,7 @@ use noodles_sam::alignment::record::data::field::Tag;
 use rustc_hash::FxHasher;
 
 use crate::cli::MarkdupArgs;
-use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
+use crate::io::{BamReader, BamWriter, PgInfo, append_pg};
 use crate::types::OutputFormat;
 
 const FLAG_PAIRED: u16 = 0x1;
@@ -199,8 +199,6 @@ pub fn run(args: MarkdupArgs) -> Result<()> {
         args.input != std::path::Path::new("-"),
         "markdup requires a file it can read more than once"
     );
-    install_thread_pool(args.threads);
-
     let optical_distance = args.optical_distance;
 
     // Pass 1: scan, build dedup decisions without holding records in RAM.

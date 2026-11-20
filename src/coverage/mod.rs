@@ -5,8 +5,8 @@ use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::CoverageArgs;
 use crate::depth::resolve_region;
+use crate::io::BamReader;
 use crate::io::BufferedOutput;
-use crate::io::{BamReader, install_thread_pool};
 
 const ALL_COLUMNS: [&str; 9] = [
     "rname",
@@ -69,8 +69,6 @@ struct RefStats {
 }
 
 pub fn run(args: CoverageArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let refs: Vec<_> = reader

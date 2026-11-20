@@ -5,8 +5,7 @@ use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::ViewArgs;
 use crate::io::{
-    BamReader, BamWriter, PgInfo, RecordSummary, WriteOptions, append_pg, install_thread_pool,
-    is_record_level_error,
+    BamReader, BamWriter, PgInfo, RecordSummary, WriteOptions, append_pg, is_record_level_error,
 };
 use crate::types::OutputFormat;
 
@@ -19,8 +18,6 @@ fn compression_workers(threads: usize) -> usize {
 }
 
 pub fn run(mut args: ViewArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     let fmt = resolve_fmt(&args);
     let opts = WriteOptions {
         compression_workers: compression_workers(args.threads),

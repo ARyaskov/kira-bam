@@ -8,8 +8,8 @@ use noodles_sam::alignment::RecordBuf;
 use rustc_hash::FxHasher;
 
 use crate::cli::StatsArgs;
+use crate::io::BamReader;
 use crate::io::BufferedOutput;
-use crate::io::{BamReader, install_thread_pool};
 
 #[derive(Debug, Clone)]
 struct BedIv {
@@ -95,8 +95,6 @@ struct Stats {
 }
 
 pub fn run(args: StatsArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     let bed = match &args.bed {
         Some(p) => Some(load_bed(p)?),
         None => None,

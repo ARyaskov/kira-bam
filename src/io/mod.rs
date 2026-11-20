@@ -1167,12 +1167,6 @@ pub fn default_index_path(bam: &Path, csi: bool) -> PathBuf {
     PathBuf::from(p)
 }
 
-pub fn install_thread_pool(threads: usize) {
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads.max(1))
-        .build_global();
-}
-
 pub use noodles_sam::alignment::RecordBuf as Record;
 
 #[cfg(test)]

@@ -17,8 +17,8 @@ use rustc_hash::FxHasher;
 
 use crate::cli::CollateArgs;
 use crate::io::{
-    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, report_skipped,
-    resolve_memory_hint, write_record_tolerant,
+    BamReader, BamWriter, PgInfo, append_pg, report_skipped, resolve_memory_hint,
+    write_record_tolerant,
 };
 use crate::sort::approx_heap_size;
 use crate::types::{OutputFormat, set_header_order};
@@ -31,8 +31,6 @@ const AUTO_MEMORY_DEN: u32 = 4;
 pub(crate) type Buckets = HashMap<Vec<u8>, Vec<RecordBuf>, BuildHasherDefault<FxHasher>>;
 
 pub fn run(args: CollateArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let mut header = reader.header().clone();

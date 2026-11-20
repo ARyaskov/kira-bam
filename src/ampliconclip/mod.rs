@@ -11,10 +11,7 @@ use noodles_sam::alignment::record_buf::Cigar;
 use rustc_hash::FxHasher;
 
 use crate::cli::AmpliconclipArgs;
-use crate::io::{
-    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, report_skipped,
-    write_record_tolerant,
-};
+use crate::io::{BamReader, BamWriter, PgInfo, append_pg, report_skipped, write_record_tolerant};
 use crate::types::OutputFormat;
 
 #[derive(Debug, Clone, Copy)]
@@ -24,8 +21,6 @@ struct Iv {
 }
 
 pub fn run(args: AmpliconclipArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     let intervals = read_bed(&args.bed)?;
 
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())

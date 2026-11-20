@@ -8,8 +8,8 @@ use noodles_sam::alignment::RecordBuf;
 use rustc_hash::FxHasher;
 
 use crate::cli::DepthArgs;
+use crate::io::BamReader;
 use crate::io::BufferedOutput;
-use crate::io::{BamReader, install_thread_pool};
 
 #[derive(Debug, Clone)]
 struct DepthIv {
@@ -189,8 +189,6 @@ impl Filters<'_> {
 }
 
 pub fn run(args: DepthArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     // samtools spells the two levels `-a` and `-aa`/`--aa`: the first fills in
     // the zero-coverage positions of contigs that have reads, the second also
     // emits contigs that have none.

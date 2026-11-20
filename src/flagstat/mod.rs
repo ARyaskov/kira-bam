@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::cli::FlagstatArgs;
-use crate::io::{BamReader, RecordSummary, install_thread_pool};
+use crate::io::{BamReader, RecordSummary};
 
 const FLAG_PAIRED: u16 = 0x1;
 const FLAG_PROPER_PAIR: u16 = 0x2;
@@ -109,7 +109,6 @@ fn update_counts(c: &mut Counts, flags: u16, mapq: u8, ref_id: i32, mate_ref_id:
 }
 
 pub fn run(args: FlagstatArgs) -> Result<()> {
-    install_thread_pool(args.threads);
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let mut totals = FlagstatTotals::default();

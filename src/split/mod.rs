@@ -9,14 +9,12 @@ use rustc_hash::FxHasher;
 
 use crate::cli::SplitArgs;
 use crate::io::{
-    BamReader, BamWriter, PgInfo, append_pg, ensure_distinct_output, install_thread_pool,
-    report_skipped, write_record_tolerant,
+    BamReader, BamWriter, PgInfo, append_pg, ensure_distinct_output, report_skipped,
+    write_record_tolerant,
 };
 use crate::types::OutputFormat;
 
 pub fn run(args: SplitArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     if args.tag.len() != 2 {
         anyhow::bail!("tag must be 2 chars");
     }

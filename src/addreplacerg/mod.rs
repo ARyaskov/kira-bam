@@ -6,15 +6,10 @@ use noodles_sam::alignment::record_buf::data::field::Value;
 use noodles_sam::header::record::value::{Map, map::ReadGroup, map::read_group::tag as rg_tag};
 
 use crate::cli::AddReplaceRgArgs;
-use crate::io::{
-    BamReader, BamWriter, PgInfo, append_pg, install_thread_pool, report_skipped,
-    write_record_tolerant,
-};
+use crate::io::{BamReader, BamWriter, PgInfo, append_pg, report_skipped, write_record_tolerant};
 use crate::types::OutputFormat;
 
 pub fn run(args: AddReplaceRgArgs) -> Result<()> {
-    install_thread_pool(args.threads);
-
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let mut header = reader.header().clone();

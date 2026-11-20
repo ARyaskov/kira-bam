@@ -47,3 +47,31 @@ fn faidx_guards_source_paths_and_validates_index_geometry() {
     assert!(!result.status.success(), "{result:?}");
     assert!(String::from_utf8_lossy(&result.stderr).contains("line 4"));
 }
+
+#[test]
+fn faidx_index_build_reports_write_failure_but_queries_can_use_in_memory_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let fasta = dir.path().join("reference.fa");
+    let index = dir.path().join("reference.fa.fai");
+    std::fs::write(&fasta, b">chr1\nACGT\n").unwrap();
+    std::fs::create_dir(&index).unwrap();
+    // Force a rebuild even on filesystems whose timestamps have coarse precision.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fasta)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
+    let cli = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kira-bam"));
+        command.arg("faidx").arg(&fasta);
+        command
+    };
+    let result = cli().output().unwrap();
+    assert!(!result.status.success(), "{result:?}");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("write"));
+    let result = cli().arg("chr1:1-2").output().unwrap();
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(result.stdout, b">chr1:1-2\nAC\n");
+    assert!(index.is_dir());
+}

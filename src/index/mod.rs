@@ -35,7 +35,8 @@ fn build_bai(args: &IndexArgs, out: &std::path::Path) -> Result<()> {
 }
 
 fn build_csi(args: &IndexArgs, out: &std::path::Path) -> Result<()> {
-    let mut indexer: Indexer<BinnedIndex> = Indexer::new(args.min_shift, args.depth);
+    let mut indexer: Indexer<BinnedIndex> =
+        Indexer::new(args.min_shift, args.depth).context("invalid CSI min shift or depth")?;
     let n_refs = index_records(args, &mut indexer)?;
     let index = indexer.build(n_refs);
 
@@ -102,30 +103,18 @@ where
 /// `Indexer` is generic over its index kind but `add_record` is defined per
 /// instantiation; this is just enough of a trait to share the loop above.
 trait RecordSink {
-    fn add(
-        &mut self,
-        ctx: Option<(usize, Position, Position, bool)>,
-        chunk: Chunk,
-    ) -> std::io::Result<()>;
+    fn add(&mut self, ctx: Option<(usize, Position, Position, bool)>, chunk: Chunk) -> Result<()>;
 }
 
 impl RecordSink for Indexer<LinearIndex> {
-    fn add(
-        &mut self,
-        ctx: Option<(usize, Position, Position, bool)>,
-        chunk: Chunk,
-    ) -> std::io::Result<()> {
-        self.add_record(ctx, chunk)
+    fn add(&mut self, ctx: Option<(usize, Position, Position, bool)>, chunk: Chunk) -> Result<()> {
+        self.add_record(ctx, chunk).context("add BAI record")
     }
 }
 
 impl RecordSink for Indexer<BinnedIndex> {
-    fn add(
-        &mut self,
-        ctx: Option<(usize, Position, Position, bool)>,
-        chunk: Chunk,
-    ) -> std::io::Result<()> {
-        self.add_record(ctx, chunk)
+    fn add(&mut self, ctx: Option<(usize, Position, Position, bool)>, chunk: Chunk) -> Result<()> {
+        self.add_record(ctx, chunk).context("add CSI record")
     }
 }
 

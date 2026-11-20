@@ -65,9 +65,12 @@ pub fn resolve_memory_hint(
 /// of cache is exactly the failure mode we're trying to avoid.
 pub fn auto_memory_bytes(min_bytes: usize, frac_num: u32, frac_den: u32) -> usize {
     use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let total = sys.total_memory() as usize; // bytes since sysinfo 0.30
+    let total = System::new()
+        .map(|mut sys| {
+            sys.refresh_memory();
+            sys.total_memory() as usize
+        })
+        .unwrap_or(0);
     if total == 0 {
         // sysinfo failed to detect; fall back to floor.
         return min_bytes;
@@ -767,7 +770,7 @@ enum WriterImpl {
     /// total sort wall in single-threaded compression).
     BamMt(bam::io::Writer<bgzf::io::MultithreadedWriter<BufWriter<Box<dyn Write + Send>>>>),
     Sam(sam::io::Writer<BufWriter<Box<dyn Write + Send>>>),
-    Cram(cram::io::Writer<BufWriter<Box<dyn Write + Send>>>),
+    Cram(Box<cram::io::Writer<BufWriter<Box<dyn Write + Send>>>>),
 }
 
 impl BamWriter {
@@ -892,7 +895,7 @@ impl BamWriter {
                     builder = builder.set_reference_sequence_repository(repo);
                 }
                 let writer = builder.build_from_writer(buf);
-                WriterImpl::Cram(writer)
+                WriterImpl::Cram(Box::new(writer))
             }
         };
         Ok(Self {
@@ -990,7 +993,7 @@ impl BamWriter {
                 w.into_inner().flush().context("flush SAM output")?;
             }
             WriterImpl::Cram(mut w) => {
-                AlignmentWrite::finish(&mut w, &header).context("write CRAM EOF container")?;
+                AlignmentWrite::finish(w.as_mut(), &header).context("write CRAM EOF container")?;
                 w.into_inner().flush().context("flush CRAM output")?;
             }
         }

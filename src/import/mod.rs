@@ -33,28 +33,35 @@ pub fn run(args: ImportArgs) -> Result<()> {
     } else {
         OutputFormat::Bam
     };
-    let mut writer = BamWriter::create(Some(&args.output), header, fmt)?;
-    writer.write_header()?;
-
     let mut r1 = FastqIter::open(&args.r1)?;
     let mut r2 = match &args.r2 {
         Some(p) => Some(FastqIter::open(p)?),
         None => None,
     };
+    let mut writer = BamWriter::create(Some(&args.output), header, fmt)?;
+    writer.write_header()?;
 
     let rg_id = args.rg_id.clone();
-    while let Some(rec1) = r1.next()? {
-        let flag_r1: u16 = if r2.is_some() {
-            0x1 | 0x40 | 0x4 | 0x8
-        } else {
-            0x4
-        };
-        emit(&mut writer, &rec1, flag_r1, &rg_id, args.casava, 1)?;
-        if let Some(r2) = r2.as_mut()
-            && let Some(rec2) = r2.next()?
-        {
-            let flag_r2 = 0x1 | 0x80 | 0x4 | 0x8;
-            emit(&mut writer, &rec2, flag_r2, &rg_id, args.casava, 2)?;
+    if let Some(r2) = &mut r2 {
+        for pair in 1u64.. {
+            match (r1.next()?, r2.next()?) {
+                (None, None) => break,
+                (Some(rec1), Some(rec2)) => {
+                    anyhow::ensure!(
+                        rec1.name == rec2.name,
+                        "FASTQ pair {pair}: mate names differ ({:?}, {:?})",
+                        String::from_utf8_lossy(&rec1.name),
+                        String::from_utf8_lossy(&rec2.name)
+                    );
+                    emit(&mut writer, &rec1, 0x4d, &rg_id, args.casava)?;
+                    emit(&mut writer, &rec2, 0x8d, &rg_id, args.casava)?;
+                }
+                _ => anyhow::bail!("FASTQ pair {pair}: mate files have different record counts"),
+            }
+        }
+    } else {
+        while let Some(rec) = r1.next()? {
+            emit(&mut writer, &rec, 0x4, &rg_id, args.casava)?;
         }
     }
     writer.finish()?;
@@ -70,42 +77,64 @@ struct FastqRec {
 
 struct FastqIter {
     reader: BufReader<File>,
+    path: std::path::PathBuf,
+    record: u64,
 }
 
 impl FastqIter {
     fn open(p: &std::path::Path) -> Result<Self> {
         Ok(Self {
-            reader: BufReader::with_capacity(1 << 20, File::open(p)?),
+            reader: BufReader::with_capacity(
+                1 << 20,
+                File::open(p).with_context(|| format!("open FASTQ {}", p.display()))?,
+            ),
+            path: p.to_owned(),
+            record: 0,
         })
     }
     fn next(&mut self) -> Result<Option<FastqRec>> {
+        self.record += 1;
+        let record = self.record;
+        self.read_record()
+            .with_context(|| format!("{}: FASTQ record {record}", self.path.display()))
+    }
+
+    fn read_record(&mut self) -> Result<Option<FastqRec>> {
         let mut header = String::new();
         if self.reader.read_line(&mut header)? == 0 {
             return Ok(None);
         }
         let mut seq = String::new();
-        if self.reader.read_line(&mut seq)? == 0 {
-            return Ok(None);
-        }
         let mut plus = String::new();
-        if self.reader.read_line(&mut plus)? == 0 {
-            return Ok(None);
-        }
         let mut qual = String::new();
-        if self.reader.read_line(&mut qual)? == 0 {
-            return Ok(None);
-        }
+        anyhow::ensure!(
+            self.reader.read_line(&mut seq)? != 0
+                && self.reader.read_line(&mut plus)? != 0
+                && self.reader.read_line(&mut qual)? != 0,
+            "truncated FASTQ record"
+        );
         let header = header.trim_end_matches(['\n', '\r']);
         let seq = seq.trim_end_matches(['\n', '\r']);
         let qual = qual.trim_end_matches(['\n', '\r']);
-        let stripped = header.strip_prefix('@').unwrap_or(header);
+        let stripped = header
+            .strip_prefix('@')
+            .context("missing @ header marker")?;
+        anyhow::ensure!(plus.starts_with('+'), "missing + separator");
+        anyhow::ensure!(
+            seq.len() == qual.len(),
+            "sequence and quality lengths differ"
+        );
+        anyhow::ensure!(
+            qual.bytes().all(|q| (33..=126).contains(&q)),
+            "invalid FASTQ quality"
+        );
         let mut parts = stripped.splitn(2, char::is_whitespace);
-        let name = parts.next().unwrap_or("").to_string();
-        // Strip /1 /2 suffix.
+        let name = parts.next().unwrap_or("");
         let name = name
-            .trim_end_matches("/1")
-            .trim_end_matches("/2")
-            .to_string();
+            .strip_suffix("/1")
+            .or_else(|| name.strip_suffix("/2"))
+            .unwrap_or(name);
+        anyhow::ensure!(!name.is_empty(), "missing read name");
         let rest = parts.next().unwrap_or("");
         // CASAVA: 1:N:0:BARCODE → pull BC.
         let mut barcode: Option<Vec<u8>> = None;
@@ -121,7 +150,7 @@ impl FastqIter {
             }
         }
         Ok(Some(FastqRec {
-            name: name.into_bytes(),
+            name: name.as_bytes().to_vec(),
             seq: seq.as_bytes().to_vec(),
             qual: qual.as_bytes().to_vec(),
             barcode,
@@ -135,7 +164,6 @@ fn emit(
     flag_bits: u16,
     rg_id: &str,
     casava: bool,
-    _mate_num: u8,
 ) -> Result<()> {
     let mut rb = RecordBuf::default();
     *rb.name_mut() = Some(BString::from(rec.name.clone()));

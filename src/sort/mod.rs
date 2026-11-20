@@ -3,12 +3,9 @@ use std::collections::BinaryHeap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bstr::BString;
 use noodles_bgzf as bgzf;
 use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
-use noodles_sam::header::record::value::Map;
-use noodles_sam::header::record::value::map::header::{Version, tag::SORT_ORDER};
 use rayon::prelude::*;
 use tempfile::TempDir;
 
@@ -18,7 +15,7 @@ use crate::io::{
     is_record_level_error, resolve_memory_hint,
 };
 use crate::markdup::{MarkdupOptions, mark_duplicates_in_memory};
-use crate::types::OutputFormat;
+use crate::types::{OutputFormat, set_header_order};
 
 /// Presizes the chunk vector only; spilling is decided by measured bytes.
 const ESTIMATED_BYTES_PER_RECORD: usize = 512;
@@ -521,15 +518,7 @@ fn set_header_sort_order(header: &mut Header, kind: SortKind) {
         SortKind::Coordinate => sort_order::COORDINATE,
         SortKind::QueryName => sort_order::QUERY_NAME,
     };
-    if let Some(hdr) = header.header_mut().as_mut() {
-        hdr.other_fields_mut()
-            .insert(SORT_ORDER, BString::from(so.to_vec()));
-    } else {
-        let mut m = Map::<noodles_sam::header::record::value::map::Header>::new(Version::new(1, 6));
-        m.other_fields_mut()
-            .insert(SORT_ORDER, BString::from(so.to_vec()));
-        *header.header_mut() = Some(m);
-    }
+    set_header_order(header, so, None);
 }
 
 fn spill_chunk(

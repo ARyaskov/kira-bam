@@ -21,7 +21,7 @@ use crate::io::{
     resolve_memory_hint, write_record_tolerant,
 };
 use crate::sort::approx_heap_size;
-use crate::types::OutputFormat;
+use crate::types::{OutputFormat, set_header_order};
 
 /// Floor for `-m auto`, matching the sort module's reasoning.
 const AUTO_MIN_MEMORY_BYTES: usize = 512 * 1024 * 1024;
@@ -36,6 +36,7 @@ pub fn run(args: CollateArgs) -> Result<()> {
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let mut header = reader.header().clone();
+    set_header_order(&mut header, b"unsorted", Some(b"query"));
     append_pg(&mut header, &PgInfo::new("collate", !args.no_pg))?;
 
     let budget = resolve_memory_hint(

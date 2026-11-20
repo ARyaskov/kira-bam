@@ -6,9 +6,7 @@ use anyhow::{Context, Result};
 use bstr::{BStr, BString};
 use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
-use noodles_sam::header::record::value::map::header::tag as hd_tag;
 use noodles_sam::header::record::value::map::program::tag as pg_tag;
-use noodles_sam::header::record::value::{Map, map};
 
 use crate::cli::MergeArgs;
 use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
@@ -16,7 +14,7 @@ use crate::io::{BamReader, BamWriter, PgInfo, append_pg, install_thread_pool};
 // agree on tie-breaks (coordinate: tid/pos/reverse-strand; name: strnum qname +
 // READ1/READ2 bits), with equal-key records resolved by input/source order.
 use crate::sort::{SortKey, SortKind, build_key};
-use crate::types::OutputFormat;
+use crate::types::{OutputFormat, set_header_order};
 
 struct HeapItem {
     key: SortKey,
@@ -271,18 +269,7 @@ pub(crate) fn merge_headers(
         SortKind::Coordinate => b"coordinate",
         SortKind::QueryName => b"queryname",
     };
-    match merged.header_mut() {
-        Some(hd) => {
-            hd.other_fields_mut()
-                .insert(hd_tag::SORT_ORDER, BString::from(sort_order));
-        }
-        None => {
-            let mut hd = Map::<map::Header>::default();
-            hd.other_fields_mut()
-                .insert(hd_tag::SORT_ORDER, BString::from(sort_order));
-            *merged.header_mut() = Some(hd);
-        }
-    }
+    set_header_order(&mut merged, sort_order, None);
 
     Ok((merged, rg_renames))
 }

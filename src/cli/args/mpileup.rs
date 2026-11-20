@@ -16,6 +16,14 @@ pub struct MpileupArgs {
     #[arg(short = 'f', long = "fasta-ref")]
     pub reference: Option<PathBuf>,
 
+    /// Apply BAQ using samtools from PATH or KIRA_BAM_SAMTOOLS.
+    #[arg(long, requires = "reference")]
+    pub baq: bool,
+
+    /// Disable quality adjustment for overlapping mates.
+    #[arg(short = 'x', long = "disable-overlap-removal")]
+    pub disable_overlap_removal: bool,
+
     /// Region(s) to scan.
     #[arg(short = 'r', long = "region")]
     pub regions: Vec<String>,

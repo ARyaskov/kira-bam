@@ -14,10 +14,9 @@ use crate::sort::SortKind;
 use noodles_sam::Header;
 
 pub fn run(args: MpileupArgs) -> Result<()> {
-    // shortcut: no BAQ, no paired/mate-overlap removal, no `--reverse-del`,
-    // and no `--ff`/`--rf`/`-A`/`-C`/`-B`/`-s`/`--output-*` options — the
-    // samtools flag surface beyond the shared engine's fixed 0x704 default is
-    // not implemented.
+    if args.baq {
+        return run_with_baq(&args);
+    }
     let inputs = &args.inputs;
     let readers = inputs
         .iter()
@@ -97,7 +96,10 @@ pub fn run(args: MpileupArgs) -> Result<()> {
             },
             None => Box::new(r),
         };
-        iters.push(PileupIter::new(source, args.min_mapq, args.min_baseq));
+        iters.push(
+            PileupIter::new(source, args.min_mapq, args.min_baseq)
+                .with_overlap_adjustment(!args.disable_overlap_removal),
+        );
     }
     // Column buffer per input, reused across positions.
     let mut cols: Vec<Vec<PileupObs>> = vec![Vec::new(); n];
@@ -219,6 +221,90 @@ pub fn run(args: MpileupArgs) -> Result<()> {
         )?;
     }
     out.finish()
+}
+
+fn run_with_baq(args: &MpileupArgs) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    let reference = args
+        .reference
+        .as_ref()
+        .context("BAQ requires a reference FASTA")?;
+    if let Some(output) = args
+        .output
+        .as_deref()
+        .filter(|path| *path != Path::new("-"))
+    {
+        for source in std::iter::once(reference).chain(&args.inputs) {
+            if source != Path::new("-") {
+                crate::io::ensure_distinct_output(source, output)?;
+            }
+        }
+    }
+    let program = std::env::var_os("KIRA_BAM_SAMTOOLS").unwrap_or_else(|| "samtools".into());
+    let mut command = Command::new(program);
+    command
+        .arg("mpileup")
+        .arg("-f")
+        .arg(reference)
+        .arg("-q")
+        .arg(args.min_mapq.to_string())
+        .arg("-Q")
+        .arg(args.min_baseq.to_string())
+        .arg("-d")
+        .arg(args.max_depth.to_string());
+    if args.all_positions {
+        command.arg("-a");
+    }
+    if args.disable_overlap_removal {
+        command.arg("-x");
+    }
+    let mut regions_file = None;
+    if !args.regions.is_empty() {
+        let mut bed = tempfile::NamedTempFile::new()?;
+        let mut refs = Vec::new();
+        for input in &args.inputs {
+            anyhow::ensure!(
+                input != Path::new("-"),
+                "BAQ with regions requires file inputs"
+            );
+            let reader = BamReader::open_with_reference(input, Some(reference))?;
+            refs.extend(
+                reader
+                    .header()
+                    .reference_sequences()
+                    .iter()
+                    .map(|(name, sq)| (name.to_string(), usize::from(sq.length()))),
+            );
+        }
+        for spec in &args.regions {
+            let (tid, start, end) = crate::depth::resolve_region(spec, &refs)?;
+            writeln!(bed, "{}\t{}\t{end}", refs[tid].0, start - 1)?;
+        }
+        bed.flush()?;
+        command.arg("-l").arg(bed.path());
+        regions_file = Some(bed);
+    }
+    let mut output = BufferedOutput::create(args.output.as_deref())?;
+    let mut child = command
+        .arg("--")
+        .args(&args.inputs)
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("start samtools mpileup for BAQ")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("samtools stdout is unavailable")?;
+    let copy = std::io::copy(&mut stdout, &mut output);
+    if copy.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().context("wait for samtools mpileup")?;
+    copy.context("copy samtools output")?;
+    anyhow::ensure!(status.success(), "samtools mpileup failed with {status}");
+    drop(regions_file);
+    output.finish()
 }
 
 /// The next column of one input, with its local tid translated into the union
@@ -500,6 +586,8 @@ mod tests {
             .collect();
         let out = dir.path().join("out.tsv");
         let res = run(MpileupArgs {
+            baq: false,
+            disable_overlap_removal: false,
             inputs,
             output: Some(out.clone()),
             reference: None,
@@ -1035,6 +1123,8 @@ mod tests {
         write_bam(&bam, header(), &[rec_del("r1", 10)]);
         let out = dir.path().join("out.tsv");
         run(MpileupArgs {
+            baq: false,
+            disable_overlap_removal: false,
             inputs: vec![bam],
             output: Some(out.clone()),
             reference: Some(fasta),
@@ -1102,6 +1192,8 @@ mod tests {
         write_bam(&path, header(), records);
         let out = dir.path().join("out.tsv");
         run(MpileupArgs {
+            baq: false,
+            disable_overlap_removal: false,
             inputs: vec![path],
             output: Some(out.clone()),
             reference: None,
@@ -1227,6 +1319,8 @@ mod tests {
         std::fs::write(dir.path().join("in.bam.bai"), b"not a bai file").unwrap();
 
         let err = run(MpileupArgs {
+            baq: false,
+            disable_overlap_removal: false,
             inputs: vec![bam_path],
             output: Some(dir.path().join("out.tsv")),
             reference: None,
@@ -1311,6 +1405,8 @@ mod tests {
         ];
         let rows_of = |out_path: &std::path::Path| -> Vec<Vec<String>> {
             run(MpileupArgs {
+                baq: false,
+                disable_overlap_removal: false,
                 inputs: vec![bam_path.clone()],
                 output: Some(out_path.to_path_buf()),
                 reference: None,
@@ -1472,6 +1568,8 @@ mod tests {
         let regions = vec!["chr1:4096001-4100196".to_string()];
         let rows_of = |out_path: &std::path::Path| -> Vec<Vec<String>> {
             run(MpileupArgs {
+                baq: false,
+                disable_overlap_removal: false,
                 inputs: vec![bam_path.clone()],
                 output: Some(out_path.to_path_buf()),
                 reference: None,

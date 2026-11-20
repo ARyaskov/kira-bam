@@ -128,6 +128,7 @@ pub struct ActiveRead {
     qual: Vec<u8>,
     /// Compact reference-consuming runs in order.
     runs: Vec<Run>,
+    overlap_name: Vec<u8>,
 }
 
 impl ActiveRead {
@@ -195,6 +196,7 @@ pub struct PileupIter {
     last: Option<(usize, usize)>,
     min_mapq: u8,
     min_baseq: u8,
+    adjust_overlaps: bool,
 }
 
 impl PileupIter {
@@ -212,7 +214,13 @@ impl PileupIter {
             last: None,
             min_mapq,
             min_baseq,
+            adjust_overlaps: false,
         }
+    }
+
+    pub(crate) fn with_overlap_adjustment(mut self, enabled: bool) -> Self {
+        self.adjust_overlaps = enabled;
+        self
     }
 
     /// Make the next record available in `self.cur`. `false` at EOF.
@@ -298,7 +306,32 @@ impl PileupIter {
                 }
                 let mut ar = self.free.pop().unwrap_or_default();
                 match decode_active(&self.cur, &mut ar) {
-                    Ok(()) => self.active.push(ar),
+                    Ok(()) => {
+                        ar.overlap_name.clear();
+                        if self.adjust_overlaps
+                            && flags & 0xa == 0x2
+                            && self
+                                .cur
+                                .mate_reference_sequence_id()
+                                .is_none_or(|id| id == tid)
+                            && let Some(name) = self.cur.name()
+                        {
+                            let name: &[u8] = name.as_ref();
+                            if let Some(mate) = self.active.iter_mut().rev().find(|mate| {
+                                mate.end >= start && mate.overlap_name.as_slice() == name
+                            }) {
+                                adjust_overlap(mate, &mut ar);
+                                mate.overlap_name.clear();
+                            } else if self
+                                .cur
+                                .mate_alignment_start()
+                                .is_none_or(|pos| (start..=ar.end).contains(&usize::from(pos)))
+                            {
+                                ar.overlap_name.extend_from_slice(name);
+                            }
+                        }
+                        self.active.push(ar);
+                    }
                     Err(()) => self.free.push(ar),
                 }
             }
@@ -365,6 +398,68 @@ impl PileupIter {
         }
         for dead in self.active.drain(keep..) {
             recycle(&mut self.free, dead);
+        }
+    }
+}
+
+fn adjust_overlap(left: &mut ActiveRead, right: &mut ActiveRead) {
+    let start = right.ref_start;
+    let end = left.end.min(right.end);
+    // Use the same deterministic name hash as htslib for equal-quality ties.
+    let hash = left.overlap_name.iter().fold(0u32, |hash, &byte| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(byte))
+    });
+    let hash = hash.wrapping_add(!(hash << 15));
+    let hash = hash ^ (hash >> 10);
+    let hash = hash.wrapping_add(hash << 3);
+    let hash = hash ^ (hash >> 6);
+    let hash = hash.wrapping_add(!(hash << 11));
+    let prefer_left = (hash ^ (hash >> 16)) & 1 != 0;
+
+    let left_origin = left.ref_start;
+    let mut left_runs = left
+        .runs
+        .iter()
+        .filter(|r| matches!(r.kind, RunKind::Match { .. }))
+        .peekable();
+    let mut right_runs = right
+        .runs
+        .iter()
+        .filter(|r| matches!(r.kind, RunKind::Match { .. }))
+        .peekable();
+    while let (Some(l), Some(r)) = (left_runs.peek(), right_runs.peek()) {
+        let (RunKind::Match { base_off: li }, RunKind::Match { base_off: ri }) = (&l.kind, &r.kind)
+        else {
+            unreachable!("only match runs are visited");
+        };
+        let ls = left_origin + l.start;
+        let rs = start + r.start;
+        let le = ls + l.len - 1;
+        let re = rs + r.len - 1;
+        for position in ls.max(rs).max(start)..=le.min(re).min(end) {
+            let a = li + position - ls;
+            let b = ri + position - rs;
+            let (Some(lq), Some(rq)) = (left.qual.get_mut(a), right.qual.get_mut(b)) else {
+                continue;
+            };
+            let same = left.seq[a].eq_ignore_ascii_case(&right.seq[b]);
+            let use_left = if same || *lq == *rq {
+                prefer_left
+            } else {
+                *lq > *rq
+            };
+            let quality = if same {
+                lq.saturating_add(*rq).min(200)
+            } else {
+                (u16::from((*lq).max(*rq)) * 4 / 5) as u8
+            };
+            (*lq, *rq) = if use_left { (quality, 0) } else { (0, quality) };
+        }
+        if le <= re {
+            left_runs.next();
+        }
+        if re <= le {
+            right_runs.next();
         }
     }
 }

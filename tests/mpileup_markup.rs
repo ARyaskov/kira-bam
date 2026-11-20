@@ -167,3 +167,85 @@ fn mpileup_markup_matches_samtools() {
         json(&oracle.version),
     );
 }
+
+#[test]
+fn mpileup_adjusts_matching_and_disagreeing_overlap_qualities() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = dir.path().join("pair.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@SQ\tSN:chr1\tLN:10\n",
+            "pair\t99\tchr1\t1\t60\t3M\t=\t2\t4\tAAC\t555\n",
+            "pair\t147\tchr1\t2\t60\t3M\t=\t1\t-4\tAGC\t???\n",
+        ),
+    )
+    .unwrap();
+    let pileup = |extra: &[&str]| {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_kira-bam"))
+            .arg("mpileup")
+            .args(extra)
+            .arg(&sam)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        String::from_utf8(result.stdout).unwrap()
+    };
+    let adjusted = pileup(&[]);
+    let rows: Vec<_> = adjusted
+        .lines()
+        .map(|row| row.split('\t').collect::<Vec<_>>())
+        .collect();
+    assert_eq!((rows[1][3], rows[1][5]), ("1", "S"));
+    assert_eq!((rows[2][3], rows[2][4], rows[2][5]), ("1", "g", "9"));
+
+    let unadjusted = pileup(&["-x"]);
+    assert_eq!(
+        unadjusted.lines().nth(1).unwrap().split('\t').nth(3),
+        Some("2")
+    );
+    if let Some(samtools) = std::env::var_os("KIRA_BAM_SAMTOOLS") {
+        let result = std::process::Command::new(samtools)
+            .arg("mpileup")
+            .arg(&sam)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert_eq!(result.stdout, adjusted.as_bytes());
+    }
+}
+
+#[test]
+fn mpileup_baq_mode_matches_samtools() {
+    let Some(samtools) = std::env::var_os("KIRA_BAM_SAMTOOLS") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fasta = dir.path().join("ref.fa");
+    let sam = dir.path().join("input.sam");
+    std::fs::write(&fasta, ">chr1\nACGTACGTACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@SQ\tSN:chr1\tLN:16\n",
+            "r\t0\tchr1\t2\t60\t2M1I3M\t*\t0\t0\tCGATAA\tIIIIII\n",
+        ),
+    )
+    .unwrap();
+    let expected = std::process::Command::new(&samtools)
+        .args(["mpileup", "-f"])
+        .arg(&fasta)
+        .arg(&sam)
+        .output()
+        .unwrap();
+    assert!(expected.status.success(), "{expected:?}");
+    assert!(!expected.stdout.is_empty());
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_kira-bam"))
+        .args(["mpileup", "--baq", "-f"])
+        .arg(&fasta)
+        .arg(&sam)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(result.stdout, expected.stdout);
+}

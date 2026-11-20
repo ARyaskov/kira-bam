@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -7,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli::MpileupArgs;
 use crate::depth::{CursorMap, parse_regions};
 use crate::faidx::RefCache;
+use crate::io::BufferedOutput;
 use crate::io::{BamReader, RecordSource, indexed::IndexedInput};
 use crate::merge::{RgRenames, build_tid_maps, is_sorted_compatible, merge_headers};
 use crate::pileup::{ObsKind, PileupIter, PileupObs};
@@ -79,10 +79,7 @@ pub fn run(args: MpileupArgs) -> Result<()> {
         Some(parse_regions(&args.regions, &ref_lens)?)
     };
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     let all = args.all_positions;
     let n = readers.len();
@@ -221,8 +218,7 @@ pub fn run(args: MpileupArgs) -> Result<()> {
             n,
         )?;
     }
-    out.flush()?;
-    Ok(())
+    out.finish()
 }
 
 /// The next column of one input, with its local tid translated into the union
@@ -258,7 +254,7 @@ fn next_col(
 /// column's observation count. `max_depth` caps the column; 0 removes the cap
 /// (`samtools mpileup -d 0`), 8000 by default otherwise.
 fn write_sample(
-    out: &mut Box<dyn Write>,
+    out: &mut dyn Write,
     ref_seq: Option<&[u8]>,
     pos: usize,
     col: &[PileupObs],
@@ -383,7 +379,7 @@ fn region_allows(regions: &mut Option<CursorMap>, name: &str, pos: u64) -> bool 
 /// positions. A `0 * *` triplet per input keeps the 3+3N-column mpileup shape,
 /// matching samtools' zero-coverage rows. Never emits already-emitted positions.
 fn zero_fill(
-    out: &mut Box<dyn Write>,
+    out: &mut dyn Write,
     refs: &mut Option<RefCache>,
     regions: &mut Option<CursorMap>,
     name: &str,

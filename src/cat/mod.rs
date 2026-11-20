@@ -4,7 +4,7 @@
 //! not end on a block boundary, are compressed; the rest is copied byte for byte.
 
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -13,10 +13,15 @@ use noodles_bgzf as bgzf;
 use noodles_sam::Header;
 
 use crate::cli::CatArgs;
-use crate::io::{BGZF_EOF, BamReader, PgInfo, append_pg};
+use crate::io::{BGZF_EOF, BamReader, BufferedOutput, PgInfo, append_pg, ensure_distinct_output};
 
 pub fn run(args: CatArgs) -> Result<()> {
     let header_src = args.header_from.as_ref().unwrap_or(&args.inputs[0]);
+    if args.output != Path::new("-") {
+        for input in args.inputs.iter().chain(args.header_from.iter()) {
+            ensure_distinct_output(input, &args.output)?;
+        }
+    }
     let reader = BamReader::open_with_reference(header_src, args.reference.as_deref())
         .context("open header source")?;
     let mut header = reader.header().clone();
@@ -30,8 +35,7 @@ pub fn run(args: CatArgs) -> Result<()> {
         check_same_references(&header, r.header(), input)?;
     }
 
-    let file = File::create(&args.output).context("create output")?;
-    let mut sink = BufWriter::with_capacity(1 << 20, file);
+    let mut sink = BufferedOutput::create(Some(&args.output))?;
 
     let level = compression_level(args.compression);
     write_header_block(&mut sink, &header, level).context("write output header")?;
@@ -42,8 +46,7 @@ pub fn run(args: CatArgs) -> Result<()> {
     }
 
     sink.write_all(&BGZF_EOF).context("write BGZF EOF block")?;
-    sink.flush().context("flush output")?;
-    Ok(())
+    sink.finish()
 }
 
 fn compression_level(level: i32) -> Option<bgzf::io::writer::CompressionLevel> {

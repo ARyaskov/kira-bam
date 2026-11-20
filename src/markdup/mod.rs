@@ -959,7 +959,7 @@ fn write_stats(
     optical_computed: bool,
 ) -> Result<()> {
     use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
+    let mut f = crate::io::BufferedOutput::create(Some(path))?;
     writeln!(f, "COMMAND: kira-bam markdup")?;
     writeln!(f, "READ {read_total}")?;
     writeln!(f, "WRITTEN {written}")?;
@@ -978,7 +978,7 @@ fn write_stats(
     } else {
         writeln!(f, "DUPLICATE OPTICAL NA (not computed; pass -d to enable)")?;
     }
-    Ok(())
+    f.finish()
 }
 
 #[cfg(test)]

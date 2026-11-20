@@ -1,22 +1,17 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
-
 use anyhow::{Context, Result};
 use noodles_sam::alignment::RecordBuf;
 use noodles_sam::alignment::io::Write as AlignmentWrite;
 
 use crate::cli::HeadArgs;
 use crate::io::BamReader;
+use crate::io::BufferedOutput;
 
 pub fn run(args: HeadArgs) -> Result<()> {
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let header = reader.header().clone();
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     // Emit header.
     {
@@ -25,7 +20,7 @@ pub fn run(args: HeadArgs) -> Result<()> {
     }
 
     if args.n == 0 {
-        return Ok(());
+        return out.finish();
     }
     let mut sam_writer = noodles_sam::io::Writer::new(&mut out);
     let mut rec = RecordBuf::default();
@@ -37,5 +32,5 @@ pub fn run(args: HeadArgs) -> Result<()> {
             break;
         }
     }
-    Ok(())
+    out.finish()
 }

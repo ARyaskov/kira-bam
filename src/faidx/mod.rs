@@ -1,9 +1,10 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
 use anyhow::{Context, Result};
 
 use crate::cli::FaidxArgs;
+use crate::io::BufferedOutput;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FaiEntry {
@@ -21,10 +22,7 @@ pub fn run(args: FaidxArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
     let mut fasta_f = File::open(&args.fasta)?;
     let width = args.line_width.max(1);
     let mut buf: Vec<u8> = Vec::new();
@@ -83,8 +81,7 @@ pub fn run(args: FaidxArgs) -> Result<()> {
             out.write_all(b"\n")?;
         }
     }
-    out.flush()?;
-    Ok(())
+    out.finish()
 }
 
 /// Read up to one FASTA line's worth of bases starting at `pos_in_seq`
@@ -209,7 +206,7 @@ fn build_fai(fasta: &std::path::Path) -> Result<Vec<FaiEntry>> {
 }
 
 fn write_fai(path: &std::path::Path, entries: &[FaiEntry]) -> Result<()> {
-    let mut f = BufWriter::new(File::create(path)?);
+    let mut f = BufferedOutput::create(Some(path))?;
     for e in entries {
         writeln!(
             f,
@@ -217,7 +214,7 @@ fn write_fai(path: &std::path::Path, entries: &[FaiEntry]) -> Result<()> {
             e.name, e.length, e.offset, e.line_blen, e.line_len
         )?;
     }
-    Ok(())
+    f.finish()
 }
 
 fn read_fai(path: &std::path::Path) -> Result<Vec<FaiEntry>> {

@@ -1,5 +1,5 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -7,7 +7,9 @@ use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::FastqArgs;
 use crate::collate::NameBuckets;
-use crate::io::{BamReader, install_thread_pool};
+use crate::io::{
+    BamReader, BufferedOutput, ensure_distinct_output, install_thread_pool, output_key,
+};
 
 const FLAG_UNMAP: u16 = 0x4;
 const FLAG_REVERSE: u16 = 0x10;
@@ -16,33 +18,57 @@ const FLAG_READ2: u16 = 0x80;
 const FLAG_SECONDARY: u16 = 0x100;
 const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
-struct Out {
-    w: Box<dyn Write>,
+struct Outputs {
+    writers: Vec<BufferedOutput>,
+    category: [usize; 3],
+    singleton: Option<usize>,
 }
 
-impl Out {
-    fn new(p: &Path) -> Result<Self> {
-        let f = File::create(p).with_context(|| format!("create {}", p.display()))?;
-        Ok(Out {
-            w: Box::new(BufWriter::with_capacity(1 << 20, f)),
+impl Outputs {
+    fn open(args: &FastqArgs) -> Result<Self> {
+        let mut writers = vec![BufferedOutput::create(None)?];
+        let mut files = HashMap::new();
+        let mut open = |path: Option<&Path>| -> Result<usize> {
+            let Some(path) = path.filter(|p| *p != Path::new("-")) else {
+                return Ok(0);
+            };
+            let key = if args.input == Path::new("-") {
+                output_key(path)?
+            } else {
+                ensure_distinct_output(&args.input, path)?
+            };
+            match files.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => Ok(*entry.get()),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let index = writers.len();
+                    writers.push(BufferedOutput::create(Some(path))?);
+                    entry.insert(index);
+                    Ok(index)
+                }
+            }
+        };
+        let category = [
+            open(args.orphans.as_deref())?,
+            open(args.read1.as_deref())?,
+            open(args.read2.as_deref())?,
+        ];
+        let singleton = args
+            .singletons
+            .as_deref()
+            .map(|path| open(Some(path)))
+            .transpose()?;
+        Ok(Self {
+            writers,
+            category,
+            singleton,
         })
-    }
-    fn stdout() -> Self {
-        Out {
-            w: Box::new(BufWriter::with_capacity(1 << 20, std::io::stdout())),
-        }
     }
 }
 
 pub fn run(args: FastqArgs) -> Result<()> {
     install_thread_pool(args.threads);
 
-    let mut r1 = args.read1.as_deref().map(Out::new).transpose()?;
-    let mut r2 = args.read2.as_deref().map(Out::new).transpose()?;
-    let mut singletons = args.singletons.as_deref().map(Out::new).transpose()?;
-    let mut orphans = args.orphans.as_deref().map(Out::new).transpose()?;
-    let mut stdout_sink = Out::stdout();
-
+    let mut outputs = Outputs::open(&args)?;
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
 
@@ -60,28 +86,12 @@ pub fn run(args: FastqArgs) -> Result<()> {
                 continue;
             }
             if group.first().is_some_and(|first| !same_qname(first, &rec)) {
-                emit_group(
-                    &group,
-                    &mut r1,
-                    &mut r2,
-                    &mut singletons,
-                    &mut orphans,
-                    &mut stdout_sink,
-                    &args,
-                )?;
+                emit_group(&group, &mut outputs, &args)?;
                 group.clear();
             }
             group.push(std::mem::take(&mut rec));
         }
-        emit_group(
-            &group,
-            &mut r1,
-            &mut r2,
-            &mut singletons,
-            &mut orphans,
-            &mut stdout_sink,
-            &args,
-        )?;
+        emit_group(&group, &mut outputs, &args)?;
     } else {
         // Group by name through the collate buckets rather than sorting the
         // whole file in memory, which needed the entire BAM resident (cloned,
@@ -96,25 +106,11 @@ pub fn run(args: FastqArgs) -> Result<()> {
             }
             groups.push(&rec)?;
         }
-        groups.for_each_group(|recs| {
-            emit_group(
-                recs,
-                &mut r1,
-                &mut r2,
-                &mut singletons,
-                &mut orphans,
-                &mut stdout_sink,
-                &args,
-            )
-        })?;
+        groups.for_each_group(|recs| emit_group(recs, &mut outputs, &args))?;
     }
 
-    for sink in [r1, r2, singletons, orphans, Some(stdout_sink)]
-        .into_iter()
-        .flatten()
-    {
-        let mut sink = sink;
-        sink.w.flush().context("flush FASTQ output")?;
+    for sink in outputs.writers {
+        sink.finish()?;
     }
     Ok(())
 }
@@ -153,15 +149,7 @@ fn same_qname(a: &RecordBuf, b: &RecordBuf) -> bool {
     an == bn
 }
 
-fn emit_group(
-    records: &[RecordBuf],
-    r1: &mut Option<Out>,
-    r2: &mut Option<Out>,
-    singletons: &mut Option<Out>,
-    orphans: &mut Option<Out>,
-    stdout_sink: &mut Out,
-    args: &FastqArgs,
-) -> Result<()> {
+fn emit_group(records: &[RecordBuf], outputs: &mut Outputs, args: &FastqArgs) -> Result<()> {
     let mut selected: [Option<&RecordBuf>; 3] = [None; 3];
     for record in records {
         let category = match u16::from(record.flags()) & (FLAG_READ1 | FLAG_READ2) {
@@ -178,22 +166,24 @@ fn emit_group(
     }
     let [other, first, second] = selected;
     let paired = first.is_some() && second.is_some();
-    for (category, record, output) in [(1, first, r1), (2, second, r2)] {
+    for (category, record) in [(1, first), (2, second), (0, other)] {
         if let Some(record) = record {
-            let sink = if paired { None } else { singletons.as_mut() };
-            let sink = sink.or(output.as_mut()).unwrap_or(stdout_sink);
-            emit_record(record, sink, args, Some(category))?;
+            let fallback = outputs.category[category];
+            let sink = if paired || category == 0 {
+                fallback
+            } else {
+                outputs.singleton.unwrap_or(fallback)
+            };
+            let mate_number = (category != 0).then_some(category as u8);
+            emit_record(record, &mut outputs.writers[sink], args, mate_number)?;
         }
-    }
-    if let Some(record) = other {
-        emit_record(record, orphans.as_mut().unwrap_or(stdout_sink), args, None)?;
     }
     Ok(())
 }
 
 fn emit_record(
     rec: &RecordBuf,
-    out: &mut Out,
+    out: &mut BufferedOutput,
     args: &FastqArgs,
     mate_num: Option<u8>,
 ) -> Result<()> {
@@ -256,7 +246,7 @@ fn phred33(rec: &RecordBuf, seq_len: usize) -> Vec<u8> {
 }
 
 fn write_seq(
-    out: &mut Out,
+    out: &mut BufferedOutput,
     name: &[u8],
     suffix: &str,
     seq: &[u8],
@@ -264,21 +254,21 @@ fn write_seq(
     fasta: bool,
 ) -> Result<()> {
     if fasta {
-        out.w.write_all(b">")?;
-        out.w.write_all(name)?;
-        out.w.write_all(suffix.as_bytes())?;
-        out.w.write_all(b"\n")?;
-        out.w.write_all(seq)?;
-        out.w.write_all(b"\n")?;
+        out.write_all(b">")?;
+        out.write_all(name)?;
+        out.write_all(suffix.as_bytes())?;
+        out.write_all(b"\n")?;
+        out.write_all(seq)?;
+        out.write_all(b"\n")?;
     } else {
-        out.w.write_all(b"@")?;
-        out.w.write_all(name)?;
-        out.w.write_all(suffix.as_bytes())?;
-        out.w.write_all(b"\n")?;
-        out.w.write_all(seq)?;
-        out.w.write_all(b"\n+\n")?;
-        out.w.write_all(qual)?;
-        out.w.write_all(b"\n")?;
+        out.write_all(b"@")?;
+        out.write_all(name)?;
+        out.write_all(suffix.as_bytes())?;
+        out.write_all(b"\n")?;
+        out.write_all(seq)?;
+        out.write_all(b"\n+\n")?;
+        out.write_all(qual)?;
+        out.write_all(b"\n")?;
     }
     Ok(())
 }

@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::BufWriter;
 
 use anyhow::{Context, Result};
 use noodles_bam as bam;
@@ -11,7 +10,7 @@ use noodles_csi::binning_index::index::reference_sequence::index::{BinnedIndex, 
 use noodles_sam::alignment::Record as _;
 
 use crate::cli::IndexArgs;
-use crate::io::default_index_path;
+use crate::io::{BufferedOutput, default_index_path, ensure_distinct_output};
 
 pub fn run(args: IndexArgs) -> Result<()> {
     let csi_format = args.csi;
@@ -19,6 +18,9 @@ pub fn run(args: IndexArgs) -> Result<()> {
         .output
         .clone()
         .unwrap_or_else(|| default_index_path(&args.input, csi_format));
+    if out != std::path::Path::new("-") {
+        ensure_distinct_output(&args.input, &out)?;
+    }
     if csi_format {
         build_csi(&args, &out)
     } else {
@@ -30,8 +32,9 @@ fn build_bai(args: &IndexArgs, out: &std::path::Path) -> Result<()> {
     let mut indexer: Indexer<LinearIndex> = Indexer::default();
     let n_refs = index_records(args, &mut indexer)?;
     let index = indexer.build(n_refs);
-    bam::bai::fs::write(out, &index).context("write BAI")?;
-    Ok(())
+    let mut writer = bam::bai::io::Writer::new(BufferedOutput::create(Some(out))?);
+    writer.write_index(&index).context("write BAI")?;
+    writer.into_inner().finish()
 }
 
 fn build_csi(args: &IndexArgs, out: &std::path::Path) -> Result<()> {
@@ -40,10 +43,13 @@ fn build_csi(args: &IndexArgs, out: &std::path::Path) -> Result<()> {
     let n_refs = index_records(args, &mut indexer)?;
     let index = indexer.build(n_refs);
 
-    let file = File::create(out).context("create .csi")?;
-    let mut writer = csi::io::Writer::new(BufWriter::with_capacity(1 << 20, file));
+    let mut writer = csi::io::Writer::new(BufferedOutput::create(Some(out))?);
     writer.write_index(&index).context("write CSI")?;
-    Ok(())
+    writer
+        .into_inner()
+        .finish()
+        .context("finish CSI BGZF stream")?
+        .finish()
 }
 
 /// Feed every record to `indexer`, returning the header's reference count.

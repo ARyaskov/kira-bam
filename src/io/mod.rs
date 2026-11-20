@@ -18,7 +18,7 @@ use crate::types::OutputFormat;
 
 mod output;
 use output::PendingOutput;
-pub(crate) use output::ensure_distinct_output;
+pub(crate) use output::{BufferedOutput, ensure_distinct_output, output_key};
 
 /// Resolve a memory hint into an absolute byte budget.
 ///
@@ -892,7 +892,7 @@ impl BamWriter {
             let (file, pending) = PendingOutput::create(path)?;
             let mut writer =
                 Self::from_writer_with_options(Box::new(file), header, fmt, reference, opts)?;
-            writer.pending = Some(pending);
+            writer.pending = pending;
             Ok(writer)
         } else {
             Self::from_writer_with_options(Box::new(io::stdout()), header, fmt, reference, opts)

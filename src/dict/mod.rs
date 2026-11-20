@@ -1,19 +1,17 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, Write};
 
 use anyhow::{Context, Result};
 use noodles_fasta as fasta;
 
 use crate::cli::DictArgs;
+use crate::io::BufferedOutput;
 
 pub fn run(args: DictArgs) -> Result<()> {
     let f = File::open(&args.fasta).with_context(|| format!("open {}", args.fasta.display()))?;
     let mut reader = fasta::io::Reader::new(BufReader::with_capacity(1 << 20, f));
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     writeln!(out, "@HD\tVN:1.6\tSO:unsorted")?;
     for result in reader.records() {
@@ -34,7 +32,7 @@ pub fn run(args: DictArgs) -> Result<()> {
         }
         writeln!(out)?;
     }
-    Ok(())
+    out.finish()
 }
 
 /// Minimal MD5 of the uppercased reference sequence. We hand-roll to avoid pulling

@@ -1,10 +1,10 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 
 use anyhow::{Context, Result};
 
 use crate::cli::ConsensusArgs;
 use crate::io::BamReader;
+use crate::io::BufferedOutput;
 use crate::pileup::{ObsKind, PileupIter, PileupObs};
 
 pub fn run(args: ConsensusArgs) -> Result<()> {
@@ -12,10 +12,7 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
         .context("open input")?;
     let header = reader.header().clone();
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     let mut pileup = PileupIter::new(reader, args.min_mapq, args.min_baseq);
 
@@ -111,10 +108,10 @@ pub fn run(args: ConsensusArgs) -> Result<()> {
             writeln!(out)?;
         }
     }
-    Ok(())
+    out.finish()
 }
 
-fn write_base(out: &mut Box<dyn Write>, b: u8, line_pos: &mut usize, width: usize) -> Result<()> {
+fn write_base(out: &mut dyn Write, b: u8, line_pos: &mut usize, width: usize) -> Result<()> {
     out.write_all(&[b])?;
     *line_pos += 1;
     if width > 0 && *line_pos >= width {

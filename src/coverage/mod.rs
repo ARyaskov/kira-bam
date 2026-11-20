@@ -1,11 +1,11 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::CoverageArgs;
 use crate::depth::resolve_region;
+use crate::io::BufferedOutput;
 use crate::io::{BamReader, install_thread_pool};
 
 const ALL_COLUMNS: [&str; 9] = [
@@ -183,10 +183,7 @@ fn accumulate(st: &mut RefStats, rec: &RecordBuf, start: usize, min_baseq: u8) {
 
 fn write_rows<'a>(args: &CoverageArgs, rows: impl Iterator<Item = &'a RefStats>) -> Result<()> {
     let columns = parse_columns(args.columns.as_deref())?;
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     if !args.no_header {
         let header_line = columns
@@ -232,8 +229,7 @@ fn write_rows<'a>(args: &CoverageArgs, rows: impl Iterator<Item = &'a RefStats>)
             .collect();
         writeln!(out, "{}", cells.join("\t"))?;
     }
-    out.flush()?;
-    Ok(())
+    out.finish()
 }
 
 fn parse_columns(spec: Option<&str>) -> Result<Vec<&'static str>> {

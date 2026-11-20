@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Write};
 
 use anyhow::{Context, Result};
 use noodles_bam as bam;
@@ -8,6 +8,7 @@ use noodles_core::Region;
 use noodles_sam::alignment::Record as _;
 
 use crate::cli::BedcovArgs;
+use crate::io::BufferedOutput;
 
 #[derive(Debug, Clone)]
 struct Interval {
@@ -18,10 +19,7 @@ struct Interval {
 
 pub fn run(args: BedcovArgs) -> Result<()> {
     let intervals = read_bed(&args.bed)?;
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     // Open each input once. Reopening per interval meant a file open, a header
     // parse and a full index load for every cell of the output — quadratic in
@@ -66,8 +64,7 @@ pub fn run(args: BedcovArgs) -> Result<()> {
         }
         writeln!(out)?;
     }
-    out.flush()?;
-    Ok(())
+    out.finish()
 }
 
 /// One input BAM, held open with its header and index for the whole run.

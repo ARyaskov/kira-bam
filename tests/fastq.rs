@@ -24,7 +24,22 @@ fn fastq_routes_paired_and_unpaired_read2_to_its_own_stream() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "@pair\nA\n+\nI\n");
     assert_eq!(
-        std::fs::read_to_string(reads).unwrap(),
+        std::fs::read_to_string(&reads).unwrap(),
         "@pair\nT\n+\nI\n@solo\nC\n+\nI\n"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_kira-bam"))
+        .arg("fastq")
+        .arg("-1")
+        .arg(&reads)
+        .arg("-2")
+        .arg(&reads)
+        .arg(&sam)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(reads).unwrap(),
+        "@pair\nA\n+\nI\n@pair\nT\n+\nI\n@solo\nC\n+\nI\n",
     );
 }

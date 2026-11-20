@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
 use anyhow::{Context, Result};
 use rustc_hash::FxHasher;
 
 use crate::cli::FqidxArgs;
+use crate::io::BufferedOutput;
 
 /// `.fqi` per-record: name \t length \t seq_offset \t qual_offset
 #[derive(Debug, Clone)]
@@ -33,10 +34,7 @@ pub fn run(args: FqidxArgs) -> Result<()> {
     let by_name: HashMap<String, &FqiEntry, std::hash::BuildHasherDefault<FxHasher>> =
         entries.iter().map(|e| (e.name.clone(), e)).collect();
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
     let mut f = File::open(&args.fastq)?;
 
     for name in &args.names {
@@ -61,7 +59,7 @@ pub fn run(args: FqidxArgs) -> Result<()> {
         out.write_all(&qual)?;
         out.write_all(b"\n")?;
     }
-    Ok(())
+    out.finish()
 }
 
 fn build_fqi_path(fq: &std::path::Path) -> std::path::PathBuf {
@@ -125,7 +123,7 @@ fn build_fqi(path: &std::path::Path) -> Result<Vec<FqiEntry>> {
 }
 
 fn write_fqi(path: &std::path::Path, entries: &[FqiEntry]) -> Result<()> {
-    let mut f = BufWriter::new(File::create(path)?);
+    let mut f = BufferedOutput::create(Some(path))?;
     for e in entries {
         writeln!(
             f,
@@ -133,7 +131,7 @@ fn write_fqi(path: &std::path::Path, entries: &[FqiEntry]) -> Result<()> {
             e.name, e.length, e.seq_offset, e.qual_offset
         )?;
     }
-    Ok(())
+    f.finish()
 }
 
 fn read_fqi(path: &std::path::Path) -> Result<Vec<FqiEntry>> {

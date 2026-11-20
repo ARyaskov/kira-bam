@@ -1,13 +1,14 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Write};
 
 use anyhow::{Context, Result};
 use noodles_sam::alignment::RecordBuf;
 use rustc_hash::FxHasher;
 
 use crate::cli::DepthArgs;
+use crate::io::BufferedOutput;
 use crate::io::{BamReader, install_thread_pool};
 
 #[derive(Debug, Clone)]
@@ -219,13 +220,7 @@ pub fn run(args: DepthArgs) -> Result<()> {
         Some(parse_regions(&args.regions, &refs)?)
     };
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::with_capacity(
-            1 << 20,
-            File::create(p).context("create output")?,
-        )),
-        None => Box::new(BufWriter::with_capacity(1 << 20, std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     let mut state = SweepState::default();
     let mut rec = RecordBuf::default();
@@ -355,8 +350,7 @@ pub fn run(args: DepthArgs) -> Result<()> {
             &mut out,
         )?;
     }
-    out.flush()?;
-    Ok(())
+    out.finish()
 }
 
 /// Flush the tail of `tid`'s sweep, if the restrictions admit that contig.
@@ -367,7 +361,7 @@ fn finish_contig(
     regions: &mut Option<CursorMap>,
     all_positions: bool,
     state: &mut SweepState,
-    out: &mut Box<dyn Write>,
+    out: &mut dyn Write,
 ) -> Result<()> {
     let (name, len) = ref_entry(refs, tid);
     if !contig_allowed(name, bed, regions) {
@@ -383,7 +377,7 @@ fn emit_empty_refs(
     refs: &[(String, usize)],
     bed: &mut Option<CursorMap>,
     regions: &mut Option<CursorMap>,
-    out: &mut Box<dyn Write>,
+    out: &mut dyn Write,
 ) -> Result<()> {
     for i in range {
         let Some((name, len)) = refs.get(i) else {
@@ -526,7 +520,7 @@ impl SweepState {
         ref_name: &str,
         all_positions: bool,
         filters: &mut Filters<'_>,
-        out: &mut Box<dyn Write>,
+        out: &mut dyn Write,
     ) -> Result<()> {
         if self.current_pos == 0 {
             self.current_pos = 1; // positions are 1-based
@@ -549,7 +543,7 @@ impl SweepState {
         ref_len: usize,
         all_positions: bool,
         filters: &mut Filters<'_>,
-        out: &mut Box<dyn Write>,
+        out: &mut dyn Write,
     ) -> Result<()> {
         let target = if all_positions {
             // A restricted sweep stops at the end of the restriction rather

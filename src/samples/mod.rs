@@ -1,18 +1,15 @@
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use noodles_sam::header::record::value::map::read_group::tag as rg_tag;
 
 use crate::cli::SamplesArgs;
 use crate::io::BamReader;
+use crate::io::BufferedOutput;
 
 pub fn run(args: SamplesArgs) -> Result<()> {
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for input in &args.inputs {
@@ -42,5 +39,5 @@ pub fn run(args: SamplesArgs) -> Result<()> {
             writeln!(out, "{s}")?;
         }
     }
-    Ok(())
+    out.finish()
 }

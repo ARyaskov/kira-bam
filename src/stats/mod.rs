@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -9,6 +8,7 @@ use noodles_sam::alignment::RecordBuf;
 use rustc_hash::FxHasher;
 
 use crate::cli::StatsArgs;
+use crate::io::BufferedOutput;
 use crate::io::{BamReader, install_thread_pool};
 
 #[derive(Debug, Clone)]
@@ -220,10 +220,7 @@ pub fn run(args: StatsArgs) -> Result<()> {
         }
     }
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     if let Some(s) = &args.sample_name {
         writeln!(out, "# sample {s}")?;
@@ -276,8 +273,7 @@ pub fn run(args: StatsArgs) -> Result<()> {
             writeln!(out, "MAPQ\t{mq}\t{n}")?;
         }
     }
-    out.flush()?;
-    Ok(())
+    out.finish()
 }
 
 #[cfg(test)]

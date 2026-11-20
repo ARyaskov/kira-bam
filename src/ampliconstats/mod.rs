@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Write};
 
 use anyhow::{Context, Result};
 use noodles_bam as bam;
@@ -7,6 +7,7 @@ use noodles_core::Region;
 use noodles_sam::Header;
 
 use crate::cli::AmpliconstatsArgs;
+use crate::io::BufferedOutput;
 
 #[derive(Debug, Clone)]
 struct Amp {
@@ -32,10 +33,7 @@ pub fn run(args: AmpliconstatsArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    let mut out = BufferedOutput::create(args.output.as_deref())?;
 
     writeln!(out, "# amplicon\tchrom\tstart\tend\tlength\treads...")?;
     for amp in &amps {
@@ -62,7 +60,7 @@ pub fn run(args: AmpliconstatsArgs) -> Result<()> {
         }
         writeln!(out)?;
     }
-    out.flush().context("flush amplicon statistics")
+    out.finish()
 }
 
 fn read_amplicons(path: &std::path::Path) -> Result<Vec<Amp>> {

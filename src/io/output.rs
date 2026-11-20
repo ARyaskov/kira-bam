@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -11,17 +11,34 @@ pub(super) struct PendingOutput {
 }
 
 impl PendingOutput {
-    pub(super) fn create(path: &Path) -> Result<(File, Self)> {
-        let directory = output_parent(path);
-        let (file, staging) = NamedTempFile::new_in(directory)
+    pub(super) fn create(path: &Path) -> Result<(File, Option<Self>)> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+        };
+        if metadata.as_ref().is_some_and(|m| !m.is_file()) {
+            let file = File::options()
+                .write(true)
+                .open(path)
+                .with_context(|| format!("open output stream {}", path.display()))?;
+            return Ok((file, None));
+        }
+        let destination = if fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
+            fs::canonicalize(path)
+                .with_context(|| format!("resolve output link {}", path.display()))?
+        } else {
+            path.to_owned()
+        };
+        let (file, staging) = NamedTempFile::new_in(output_parent(&destination))
             .with_context(|| format!("create temporary output for {}", path.display()))?
             .into_parts();
         Ok((
             file,
-            Self {
+            Some(Self {
                 staging,
-                destination: path.to_owned(),
-            },
+                destination,
+            }),
         ))
     }
 
@@ -29,6 +46,46 @@ impl PendingOutput {
         self.staging
             .persist(&self.destination)
             .with_context(|| format!("publish {}", self.destination.display()))
+    }
+}
+
+pub(crate) struct BufferedOutput {
+    writer: BufWriter<Box<dyn Write + Send>>,
+    pending: Option<PendingOutput>,
+}
+
+impl BufferedOutput {
+    pub(crate) fn create(path: Option<&Path>) -> Result<Self> {
+        let (sink, pending): (Box<dyn Write + Send>, _) =
+            if let Some(path) = path.filter(|p| *p != Path::new("-")) {
+                let (file, pending) = PendingOutput::create(path)?;
+                (Box::new(file), pending)
+            } else {
+                (Box::new(io::stdout()), None)
+            };
+        Ok(Self {
+            writer: BufWriter::with_capacity(1 << 16, sink),
+            pending,
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.writer.flush().context("flush output")?;
+        drop(self.writer);
+        if let Some(pending) = self.pending {
+            pending.publish()?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for BufferedOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 }
 

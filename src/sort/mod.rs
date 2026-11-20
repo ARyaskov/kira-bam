@@ -1,16 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::fs::File;
-use std::io::BufWriter;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use bstr::BString;
-use noodles_bam as bam;
 use noodles_bgzf as bgzf;
 use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
-use noodles_sam::alignment::io::Write as AlignmentWrite;
 use noodles_sam::header::record::value::Map;
 use noodles_sam::header::record::value::map::header::{Version, tag::SORT_ORDER};
 use rayon::prelude::*;
@@ -547,21 +543,28 @@ fn spill_chunk(
     // so the external sort preserves input order as samtools does.
     sort_records_by_kind(chunk, kind);
     let path = dir.join(format!("kira-bam-spill-{idx:06}.bam"));
-    let file = File::create(&path).context("create spill file")?;
-    let buf = BufWriter::with_capacity(1 << 20, file);
-    // FAST (level 1) instead of NONE — works around a level-0 / stored-block
-    // round-trip regression in noodles-bgzf 0.47 + libdeflate.
-    let bgz = bgzf::io::writer::Builder::default()
-        .set_compression_level(bgzf::io::writer::CompressionLevel::FAST)
-        .build_from_writer(buf);
-    let mut writer = bam::io::Writer::from(bgz);
-    writer.write_header(header).context("write spill header")?;
-    for r in chunk.drain(..) {
-        // Broken records would fail the final emit anyway; drop now to keep the run alive.
-        let _ = writer.write_alignment_record(header, &r);
-    }
-    AlignmentWrite::finish(&mut writer, header).context("finish spill")?;
+    let writer = BamWriter::create_with_options(
+        Some(&path),
+        header.clone(),
+        OutputFormat::Bam,
+        None::<&std::path::Path>,
+        WriteOptions {
+            compression_workers: 0,
+            compression_level: Some(bgzf::io::writer::CompressionLevel::FAST),
+        },
+    )
+    .with_context(|| format!("create spill {}", path.display()))?;
+    write_spill(&mut chunk.drain(..), writer)
+        .with_context(|| format!("write spill {}", path.display()))?;
     Ok(path)
+}
+
+fn write_spill(records: impl Iterator<Item = RecordBuf>, mut writer: BamWriter) -> Result<()> {
+    writer.write_header()?;
+    for record in records {
+        writer.write_record_buf(&record)?;
+    }
+    writer.finish()
 }
 
 struct HeapItem {
@@ -665,6 +668,27 @@ fn merge_spills(
 mod sort_order_tests {
     use super::*;
     use noodles_sam::alignment::record::Flags;
+
+    #[test]
+    fn spill_propagates_final_flush_failure() {
+        struct FailingFlush;
+
+        impl std::io::Write for FailingFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("spill flush failed"))
+            }
+        }
+
+        let writer =
+            BamWriter::from_writer(Box::new(FailingFlush), Header::default(), OutputFormat::Bam)
+                .unwrap();
+        let err = write_spill(std::iter::empty(), writer).unwrap_err();
+        assert!(format!("{err:#}").contains("spill flush failed"));
+    }
 
     fn rec(name: &str, tid: Option<usize>, pos: usize, flags: u16) -> RecordBuf {
         let mut r = RecordBuf::default();

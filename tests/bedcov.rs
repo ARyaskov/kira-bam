@@ -8,7 +8,7 @@ fn bedcov_rejects_invalid_rows_and_reports_zero_for_empty_intervals() {
     let bed = dir.path().join("regions.bed");
     std::fs::write(
         &sam,
-        "@SQ\tSN:chr1\tLN:10\nr\t0\tchr1\t1\t60\t2M\t*\t0\t0\tAA\tII\n",
+        "@SQ\tSN:chr1\tLN:10\nr\t0\tchr1\t1\t60\t2M\t*\t0\t0\tAA\tII\nduplicate\t1024\tchr1\t1\t60\t2M\t*\t0\t0\tAA\tII\n",
     )
     .unwrap();
     let cli = || Command::new(env!("CARGO_BIN_EXE_kira-bam"));
@@ -34,4 +34,17 @@ fn bedcov_rejects_invalid_rows_and_reports_zero_for_empty_intervals() {
     let result = bedcov();
     assert!(result.status.success(), "{result:?}");
     assert_eq!(result.stdout, b"chr1\t0\t2\t2\nchr1\t1\t1\t0\n");
+
+    std::fs::write(&bed, "chr1\t0\t2\nchr1\t0X\t2\n").unwrap();
+    for (tool, option) in [("depth", "-b"), ("stats", "-t"), ("ampliconclip", "-b")] {
+        let mut command = cli();
+        command.args([tool, option]).arg(&bed);
+        if tool == "ampliconclip" {
+            command.arg("-o").arg(dir.path().join("clipped.bam"));
+        }
+        let result = command.arg(&bam).output().unwrap();
+        assert!(!result.status.success(), "{tool}: {result:?}");
+        assert!(result.stdout.is_empty(), "{tool}: {result:?}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("regions.bed: line 2"));
+    }
 }

@@ -1,6 +1,7 @@
 pub mod addreplacerg;
 pub mod ampliconclip;
 pub mod ampliconstats;
+mod bed;
 pub mod bedcov;
 pub mod calmd;
 pub mod cat;

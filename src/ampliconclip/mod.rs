@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 
 use anyhow::{Context, Result};
 use noodles_sam::alignment::RecordBuf;
@@ -12,7 +10,7 @@ use rustc_hash::FxHasher;
 
 use crate::cli::AmpliconclipArgs;
 use crate::io::{BamReader, BamWriter, PgInfo, append_pg, report_skipped, write_record_tolerant};
-use crate::types::OutputFormat;
+use crate::types::{OutputFormat, set_header_order};
 
 #[derive(Debug, Clone, Copy)]
 struct Iv {
@@ -26,6 +24,7 @@ pub fn run(args: AmpliconclipArgs) -> Result<()> {
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let mut header = reader.header().clone();
+    set_header_order(&mut header, b"unsorted", None);
     append_pg(&mut header, &PgInfo::new("ampliconclip", !args.no_pg))?;
 
     let fmt = if args.uncompressed {
@@ -62,23 +61,15 @@ pub fn run(args: AmpliconclipArgs) -> Result<()> {
 fn read_bed(
     path: &std::path::Path,
 ) -> Result<HashMap<String, Vec<Iv>, std::hash::BuildHasherDefault<FxHasher>>> {
-    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut out: HashMap<String, Vec<Iv>, std::hash::BuildHasherDefault<FxHasher>> =
         HashMap::default();
-    for line in BufReader::new(f).lines() {
-        let line = line?;
-        if line.is_empty() || line.starts_with('#') {
+    for interval in crate::bed::read(path)? {
+        if interval.start == interval.end {
             continue;
         }
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let start: u64 = parts[1].parse().unwrap_or(0);
-        let end: u64 = parts[2].parse().unwrap_or(0);
-        out.entry(parts[0].to_string()).or_default().push(Iv {
-            start: start + 1,
-            end,
+        out.entry(interval.chrom).or_default().push(Iv {
+            start: interval.start + 1,
+            end: interval.end,
         });
     }
     Ok(out)
@@ -195,6 +186,15 @@ fn apply_clip(rec: &mut RecordBuf, left_ref: u64, right_ref: u64, hard: bool) {
     }
     push_op(&mut out, Kind::HardClip, right.hard_bases);
 
+    // Remove alignment-dependent tags even when clipping removes the entire alignment.
+    for tag in [
+        Tag::MISMATCHED_POSITIONS,
+        Tag::EDIT_DISTANCE,
+        Tag::MATE_CIGAR,
+    ] {
+        rec.data_mut().remove(&tag);
+    }
+
     let aligned = out
         .iter()
         .any(|o| o.kind().consumes_reference() && o.kind().consumes_read());
@@ -231,17 +231,6 @@ fn apply_clip(rec: &mut RecordBuf, left_ref: u64, right_ref: u64, hard: bool) {
         if let Ok(p) = noodles_core::Position::try_from(new_start as usize) {
             *rec.alignment_start_mut() = Some(p);
         }
-    }
-
-    // MD and NM describe the alignment we just shortened, and MC the mate's
-    // pre-clip CIGAR. Recomputing them is `calmd`'s job; leaving stale values
-    // behind is worse than dropping them.
-    for tag in [
-        Tag::MISMATCHED_POSITIONS,
-        Tag::EDIT_DISTANCE,
-        Tag::MATE_CIGAR,
-    ] {
-        rec.data_mut().remove(&tag);
     }
 }
 

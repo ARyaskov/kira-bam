@@ -1,7 +1,6 @@
 use std::io::Write;
 
 use std::collections::HashMap;
-use std::io::BufRead;
 
 use anyhow::{Context, Result};
 use noodles_sam::alignment::RecordBuf;
@@ -20,23 +19,15 @@ struct BedIv {
 fn load_bed(
     path: &std::path::Path,
 ) -> Result<HashMap<String, Vec<BedIv>, std::hash::BuildHasherDefault<FxHasher>>> {
-    let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut out: HashMap<String, Vec<BedIv>, std::hash::BuildHasherDefault<FxHasher>> =
         HashMap::default();
-    for line in std::io::BufReader::new(f).lines() {
-        let line = line?;
-        if line.is_empty() || line.starts_with('#') {
+    for interval in crate::bed::read(path)? {
+        if interval.start == interval.end {
             continue;
         }
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let start: u64 = parts[1].parse().unwrap_or(0);
-        let end: u64 = parts[2].parse().unwrap_or(0);
-        out.entry(parts[0].to_string()).or_default().push(BedIv {
-            start: start + 1,
-            end,
+        out.entry(interval.chrom).or_default().push(BedIv {
+            start: interval.start + 1,
+            end: interval.end,
         });
     }
     Ok(out)

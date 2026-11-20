@@ -1,7 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use noodles_sam::alignment::RecordBuf;
@@ -131,23 +130,15 @@ fn parse_range(s: &str) -> Option<(Option<u64>, Option<u64>)> {
 }
 
 fn load_bed(path: &std::path::Path) -> Result<CursorMap> {
-    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut raw: HashMap<String, Vec<DepthIv>, std::hash::BuildHasherDefault<FxHasher>> =
         HashMap::default();
-    for line in BufReader::new(f).lines() {
-        let line = line?;
-        if line.is_empty() || line.starts_with('#') {
+    for interval in crate::bed::read(path)? {
+        if interval.start == interval.end {
             continue;
         }
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let start: u64 = parts[1].parse().unwrap_or(0);
-        let end: u64 = parts[2].parse().unwrap_or(0);
-        raw.entry(parts[0].to_string()).or_default().push(DepthIv {
-            start: start + 1,
-            end,
+        raw.entry(interval.chrom).or_default().push(DepthIv {
+            start: interval.start + 1,
+            end: interval.end,
         });
     }
     Ok(raw

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rustc_hash::FxHasher;
 
 use crate::cli::FqidxArgs;
@@ -20,12 +20,14 @@ struct FqiEntry {
 
 pub fn run(args: FqidxArgs) -> Result<()> {
     let fqi_path = build_fqi_path(&args.fastq);
-    let entries: Vec<FqiEntry> = if !fqi_path.exists() {
+    let mut f =
+        File::open(&args.fastq).with_context(|| format!("open FASTQ {}", args.fastq.display()))?;
+    let entries = if !fqi_path.try_exists()? || crate::faidx::is_stale(&args.fastq, &fqi_path) {
         let e = build_fqi(&args.fastq).context("build .fqi")?;
         write_fqi(&fqi_path, &e).context("write .fqi")?;
         e
     } else {
-        read_fqi(&fqi_path).context("read .fqi")?
+        read_fqi(&fqi_path, f.metadata()?.len())?
     };
 
     if args.names.is_empty() {
@@ -36,7 +38,6 @@ pub fn run(args: FqidxArgs) -> Result<()> {
         entries.iter().map(|e| (e.name.clone(), e)).collect();
 
     let mut out = BufferedOutput::create(args.output.as_deref())?;
-    let mut f = File::open(&args.fastq)?;
 
     for name in &args.names {
         let entry = match by_name.get(name.as_str()) {
@@ -48,10 +49,11 @@ pub fn run(args: FqidxArgs) -> Result<()> {
         };
         // Seek + read sequence
         f.seek(SeekFrom::Start(entry.seq_offset))?;
-        let mut seq = vec![0u8; entry.length as usize];
+        let length = usize::try_from(entry.length).context("FASTQ read length exceeds usize")?;
+        let mut seq = vec![0u8; length];
         f.read_exact(&mut seq)?;
         f.seek(SeekFrom::Start(entry.qual_offset))?;
-        let mut qual = vec![0u8; entry.length as usize];
+        let mut qual = vec![0u8; length];
         f.read_exact(&mut qual)?;
 
         writeln!(out, "@{}", entry.name)?;
@@ -95,22 +97,41 @@ fn write_fqi(path: &std::path::Path, entries: &[FqiEntry]) -> Result<()> {
     f.finish()
 }
 
-fn read_fqi(path: &std::path::Path) -> Result<Vec<FqiEntry>> {
-    let f = File::open(path)?;
+fn read_fqi(path: &std::path::Path, fastq_len: u64) -> Result<Vec<FqiEntry>> {
+    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let r = BufReader::new(f);
     let mut out = Vec::new();
-    for line in r.lines() {
-        let line = line?;
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 4 {
-            continue;
-        }
-        out.push(FqiEntry {
-            name: parts[0].to_string(),
-            length: parts[1].parse().unwrap_or(0),
-            seq_offset: parts[2].parse().unwrap_or(0),
-            qual_offset: parts[3].parse().unwrap_or(0),
-        });
+    for (index, line) in r.lines().enumerate() {
+        let location = || format!("{}: line {}", path.display(), index + 1);
+        let line = line.with_context(location)?;
+        out.push(parse_entry(&line, fastq_len).with_context(location)?);
     }
     Ok(out)
+}
+
+fn parse_entry(line: &str, fastq_len: u64) -> Result<FqiEntry> {
+    let fields: Vec<_> = line.split('\t').collect();
+    let [name, length, seq_offset, qual_offset] = fields.as_slice() else {
+        anyhow::bail!("expected four .fqi fields");
+    };
+    ensure!(!name.is_empty(), "empty read name");
+    let length: u64 = length.parse().context("invalid read length")?;
+    let seq_offset: u64 = seq_offset.parse().context("invalid sequence offset")?;
+    let qual_offset: u64 = qual_offset.parse().context("invalid quality offset")?;
+    ensure!(
+        seq_offset > 0
+            && qual_offset
+                .checked_sub(seq_offset)
+                .is_some_and(|span| span > length)
+            && qual_offset
+                .checked_add(length)
+                .is_some_and(|end| end <= fastq_len),
+        "read offsets or length are inconsistent with the FASTQ file"
+    );
+    Ok(FqiEntry {
+        name: (*name).to_owned(),
+        length,
+        seq_offset,
+        qual_offset,
+    })
 }

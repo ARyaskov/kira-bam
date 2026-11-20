@@ -1,6 +1,51 @@
 use std::process::Command;
 
 #[test]
+fn fqidx_rebuilds_stale_offsets_and_rejects_malformed_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let fastq = dir.path().join("reads.fq");
+    let index = dir.path().join("reads.fq.fqi");
+    let cli = || {
+        Command::new(env!("CARGO_BIN_EXE_kira-bam"))
+            .arg("fqidx")
+            .arg(&fastq)
+            .arg("a")
+            .output()
+            .unwrap()
+    };
+    std::fs::write(&fastq, "@a\nAAA\n+\nIII\n@b\nCCC\n+\nJJJ\n").unwrap();
+    let result = cli();
+    assert!(result.status.success(), "{result:?}");
+
+    std::fs::write(&fastq, "@b\nCCC\n+\nJJJ\n@a\nAAA\n+\nIII\n").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&index)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH)
+        .unwrap();
+    let result = cli();
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(result.stdout, b"@a\nAAA\n+\nIII\n");
+
+    for (entry, message) in [
+        ("a\t3\tbad\t8\n", "invalid sequence offset"),
+        ("a\t3\t4\t9999\n", "inconsistent"),
+        ("a\t3\n", "expected four"),
+    ] {
+        std::fs::write(&index, entry).unwrap();
+        let result = cli();
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            error.contains("line 1") && error.contains(message),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn fqidx_preserves_crlf_offsets_and_rejects_an_incomplete_record() {
     let dir = tempfile::tempdir().unwrap();
     let fastq = dir.path().join("reads.fq");

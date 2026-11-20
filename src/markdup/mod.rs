@@ -149,7 +149,10 @@ fn estimate_key_count(args: &MarkdupArgs) -> Result<usize> {
     let mut paired: u64 = 0;
     let mut mates_share_keys = false;
 
-    while seen < SAMPLE as u64 && reader.read_record_buf(&mut rec)? {
+    while seen < SAMPLE as u64 {
+        if !reader.read_record_buf(&mut rec)? {
+            return Ok(examinable as usize);
+        }
         seen += 1;
         let flags = u16::from(rec.flags());
         if flags & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY | FLAG_UNMAP) != 0 {
@@ -165,10 +168,6 @@ fn estimate_key_count(args: &MarkdupArgs) -> Result<usize> {
                 mates_share_keys = true;
             }
         }
-    }
-
-    if seen == 0 {
-        return Ok(MIN_CAPACITY);
     }
 
     // Scale the sample up by how much of the compressed file it covered.

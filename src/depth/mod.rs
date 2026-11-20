@@ -67,31 +67,42 @@ pub(crate) fn parse_regions(specs: &[String], refs: &[(String, usize)]) -> Resul
     let mut raw: HashMap<String, Vec<DepthIv>, std::hash::BuildHasherDefault<FxHasher>> =
         HashMap::default();
     for spec in specs {
-        let (name, start, end) = match spec.rsplit_once(':') {
-            // A bare contig name may itself contain ':', so only treat the tail
-            // as a range when it parses as one.
-            Some((name, range)) => match parse_range(range) {
-                Some((s, e)) => (name.to_string(), s, e),
-                None => (spec.clone(), None, None),
-            },
-            None => (spec.clone(), None, None),
-        };
-        let len = refs
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, l)| *l as u64)
-            .with_context(|| format!("region {spec}: no @SQ named {name} in the header"))?;
-        let start = start.unwrap_or(1).max(1);
-        let end = end.unwrap_or(len).min(len);
-        if start > end {
-            anyhow::bail!("region {spec}: start {start} is past end {end}");
-        }
-        raw.entry(name).or_default().push(DepthIv { start, end });
+        let (tid, start, end) = resolve_region(spec, refs)?;
+        raw.entry(refs[tid].0.clone()).or_default().push(DepthIv {
+            start: start as u64,
+            end: end as u64,
+        });
     }
     Ok(raw
         .into_iter()
         .map(|(name, ivs)| (name, BedCursor::new(ivs)))
         .collect())
+}
+
+pub(crate) fn resolve_region(
+    spec: &str,
+    refs: &[(String, usize)],
+) -> Result<(usize, usize, usize)> {
+    let (name, start, end) = match spec.rsplit_once(':') {
+        // A bare contig name may itself contain ':', so only treat the tail
+        // as a range when it parses as one.
+        Some((name, range)) => match parse_range(range) {
+            Some((s, e)) => (name, s, e),
+            None => (spec, None, None),
+        },
+        None => (spec, None, None),
+    };
+    let (tid, (_, len)) = refs
+        .iter()
+        .enumerate()
+        .find(|(_, (n, _))| n == name)
+        .with_context(|| format!("region {spec}: no @SQ named {name} in the header"))?;
+    let start = start.unwrap_or(1).max(1);
+    let end = end.unwrap_or(*len as u64).min(*len as u64);
+    if start > end {
+        anyhow::bail!("region {spec}: start {start} is past end {end}");
+    }
+    Ok((tid, start as usize, end as usize))
 }
 
 /// `start`, `start-end` or `start-`, all 1-based inclusive.
@@ -225,15 +236,18 @@ pub fn run(args: DepthArgs) -> Result<()> {
     let mut next_ref = 0usize;
     // Does the current contig survive `-b`/`-r` at all?
     let mut cur_allowed = true;
+    let excluded = (0x704 & !args.remove_excl_flags) | args.excl_flags;
 
     while reader.read_record_buf(&mut rec)? {
         let flags = u16::from(rec.flags());
         // samtools excludes UNMAP|SECONDARY|QCFAIL|DUP by default; counting
         // those inflated every reported depth.
-        if flags & args.excl_flags != 0 {
+        if flags & excluded != 0 {
             continue;
         }
-        if args.incl_flags != 0 && (flags & args.incl_flags) != args.incl_flags {
+        if (args.incl_flags != 0 && (flags & args.incl_flags) == 0)
+            || (flags & args.require_flags) != args.require_flags
+        {
             continue;
         }
         if let Some(mapq) = rec.mapping_quality()
@@ -264,7 +278,7 @@ pub fn run(args: DepthArgs) -> Result<()> {
         last = Some((tid, start));
 
         // Reference positions this read actually *covers*: contiguous runs of
-        // M/=/X (optionally split where base quality < -Q). Deletions (D) and
+        // M/=/X (optionally split where base quality < -q). Deletions (D) and
         // reference skips (N, e.g. RNA-seq introns) consume reference but place
         // no base, so they are NOT covered — counting them, as the old
         // [start,end] span did, over-reported depth across indels and inflated

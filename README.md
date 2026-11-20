@@ -169,8 +169,11 @@ kira-bam ampliconstats [-q INT] [-o OUT] amplicons.bed in1.bam [in2.bam ...]
   error-rate sections are currently produced. `-t` restricts to a BED, `-q`
   sets a MAPQ floor, `--sample-name` annotates the output.
 - **`depth`** — per-base depth. `-a` also prints zero-coverage positions, `-b`
-  restricts to a BED, `-r` (repeatable) to regions, `-q`/`-Q` set MAPQ and base
-  quality floors.
+  restricts to a BED and `-r` (repeatable) to regions. Like samtools, `-q` sets
+  the base quality floor and `-Q` sets the MAPQ floor. The long options
+  `--min-baseq` and `--min-mapq` retain their meaning. Use `-g` to remove
+  flags from the default exclusion mask and `--require-flags` to require all
+  bits of a mask.
 - **`coverage`** — one summary row per reference (or per `-r` region). `-H`
   suppresses the header line; `--columns` takes a comma-separated subset of
   `rname,startpos,endpos,numreads,covbases,coverage,meandepth,meanbaseq,meanmapq`.

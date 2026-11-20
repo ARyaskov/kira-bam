@@ -32,21 +32,29 @@ pub struct DepthArgs {
     pub regions: Vec<String>,
 
     /// Minimum read MAPQ.
-    #[arg(short = 'q', long = "min-mapq", default_value_t = 0)]
+    #[arg(short = 'Q', long = "min-mapq", aliases = ["min-MQ", "min-mq"], default_value_t = 0)]
     pub min_mapq: u8,
 
     /// Filter out reads with any of these FLAGS (decimal or 0x-hex). The
     /// default is samtools' — UNMAP|SECONDARY|QCFAIL|DUP — without which
     /// duplicates and secondary alignments inflate every depth reported.
-    #[arg(short = 'G', long = "excl-flags", default_value = "0x704", value_parser = parse_flags)]
+    #[arg(short = 'G', long = "excl-flags", default_value_t = 0, value_parser = parse_flags)]
     pub excl_flags: u16,
 
-    /// Require all of these FLAGS to be present (decimal or 0x-hex).
-    #[arg(short = 'g', long = "incl-flags", default_value_t = 0, value_parser = parse_flags)]
+    /// Remove these FLAGS from the default exclusion mask.
+    #[arg(short = 'g', long = "remove-excluded-flags", default_value_t = 0, value_parser = parse_flags)]
+    pub remove_excl_flags: u16,
+
+    /// Require at least one of these FLAGS to be present.
+    #[arg(long = "incl-flags", default_value_t = 0, value_parser = parse_flags)]
     pub incl_flags: u16,
 
+    /// Require all of these FLAGS to be present.
+    #[arg(long = "require-flags", default_value_t = 0, value_parser = parse_flags)]
+    pub require_flags: u16,
+
     /// Minimum base quality.
-    #[arg(short = 'Q', long = "min-baseq", default_value_t = 0)]
+    #[arg(short = 'q', long = "min-baseq", aliases = ["min-BQ", "min-bq"], default_value_t = 0)]
     pub min_baseq: u8,
 
     /// Number of threads.

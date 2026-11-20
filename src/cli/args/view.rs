@@ -77,8 +77,12 @@ pub struct ViewArgs {
     #[arg(short = 'c', long = "count")]
     pub count: bool,
 
-    /// Drop all aux tags from output (samtools view -X).
-    #[arg(short = 'X', long = "drop-tags")]
+    /// Use the index path given after the input path and before the regions.
+    #[arg(short = 'X', long = "customized-index")]
+    pub customized_index: bool,
+
+    /// Drop all aux tags from output.
+    #[arg(long = "drop-tags")]
     pub drop_tags: bool,
 
     /// Do not append a @PG record to the output header.

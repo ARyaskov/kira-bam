@@ -18,7 +18,7 @@ fn compression_workers(threads: usize) -> usize {
     threads.saturating_sub(1).clamp(1, 8)
 }
 
-pub fn run(args: ViewArgs) -> Result<()> {
+pub fn run(mut args: ViewArgs) -> Result<()> {
     install_thread_pool(args.threads);
 
     let fmt = resolve_fmt(&args);
@@ -27,16 +27,25 @@ pub fn run(args: ViewArgs) -> Result<()> {
         compression_level: None,
     };
 
+    let index = if args.customized_index {
+        anyhow::ensure!(
+            args.regions.len() >= 2,
+            "-X requires an index path and at least one region"
+        );
+        Some(std::path::PathBuf::from(args.regions.remove(0)))
+    } else {
+        None
+    };
     if args.regions.is_empty() {
         return run_streaming(args, fmt, opts);
     }
-    run_regions(args, fmt, opts)
+    run_regions(args, fmt, opts, index.as_deref())
 }
 
 fn resolve_fmt(args: &ViewArgs) -> OutputFormat {
     if args.cram {
         OutputFormat::Cram
-    } else if args.bam && args.uncompressed {
+    } else if args.uncompressed {
         OutputFormat::UncompressedBam
     } else if args.bam {
         OutputFormat::Bam
@@ -117,12 +126,32 @@ fn report_skipped(skipped: u64) {
     }
 }
 
-fn run_regions(args: ViewArgs, fmt: OutputFormat, opts: WriteOptions) -> Result<()> {
+fn run_regions(
+    args: ViewArgs,
+    fmt: OutputFormat,
+    opts: WriteOptions,
+    index: Option<&std::path::Path>,
+) -> Result<()> {
     anyhow::ensure!(
         args.input != std::path::Path::new("-"),
         "region queries require a seekable indexed BAM"
     );
-    let mut idx_reader = bam::io::indexed_reader::Builder::default()
+    let builder = bam::io::indexed_reader::Builder::default();
+    let builder = match index {
+        Some(path) => match bam::bai::fs::read(path) {
+            Ok(index) => builder.set_index(index),
+            Err(bai_error) => {
+                builder.set_index(noodles_csi::fs::read(path).with_context(|| {
+                    format!(
+                        "read BAI or CSI index {} (BAI: {bai_error})",
+                        path.display()
+                    )
+                })?)
+            }
+        },
+        None => builder,
+    };
+    let mut idx_reader = builder
         .build_from_path(&args.input)
         .context("open indexed BAM (region query needs .bai or .csi)")?;
     let mut header = idx_reader.read_header().context("read indexed header")?;

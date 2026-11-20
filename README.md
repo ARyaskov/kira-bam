@@ -50,7 +50,7 @@ positional argument.
 ### Read, filter, write
 
 ```bash
-kira-bam view     [-b|-S|-C|-u] [-h|-H] [-f INT] [-F INT] [-q INT] [-c] [-X]
+kira-bam view     [-b|-S|-C|-u] [-h|-H] [-f INT] [-F INT] [-q INT] [-c] [--drop-tags]
                   [-v REGION]... [-T ref.fa] [-@ N] [-o OUT] [--no-PG] in.bam [region ...]
 kira-bam head     [-n INT] [-h INT] [-T ref.fa] [-o OUT] in.bam
 kira-bam cat      -o out.bam [-l INT] [-h HEADER] [-T ref.fa] [--no-PG] in1.bam in2.bam ...
@@ -62,9 +62,10 @@ kira-bam quickcheck [-v] [-u] in1.bam in2.bam ...
 
 - **`view`** — `-b`/`-S`/`-C`/`-u` select the output format (`-C` needs `-T`),
   `-h`/`-H` control the header, `-f`/`-F` take decimal or `0x`-hex flag masks,
-  `-q` filters on MAPQ, `-c` counts instead of printing, `-X` drops every aux
+  `-q` filters on MAPQ, `-c` counts instead of printing, `--drop-tags` drops every aux
   tag, and `-v/--exclude-region` (repeatable) subtracts regions from the output.
-  Positional regions need a `.bai`/`.csi` index alongside the input.
+  Positional regions need a `.bai`/`.csi` index alongside the input. Use
+  `view -X input.bam index.bai region` to specify a different index path.
 - **`head`** — first `-n` records (default 5); `-h` limits the header lines
   printed (0 = all).
 - **`cat`** — concatenates BAMs that share a header, without recompressing the

@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use noodles_bam as bam;
@@ -7,24 +8,38 @@ use noodles_bam as bam;
 use crate::cli::QuickcheckArgs;
 use crate::io::BGZF_EOF;
 
+#[derive(Debug)]
+pub struct CheckFailures {
+    pub files: Vec<(PathBuf, anyhow::Error)>,
+}
+
+impl std::fmt::Display for CheckFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "quickcheck failed for {} file(s)", self.files.len())
+    }
+}
+
+impl std::error::Error for CheckFailures {}
+
 pub fn run(args: QuickcheckArgs) -> Result<()> {
-    let mut bad_files: Vec<(std::path::PathBuf, String)> = Vec::new();
-    for p in &args.inputs {
-        match check_one(p, args.unrecognized_ok) {
-            Ok(()) => {}
-            Err(e) => bad_files.push((p.clone(), format!("{e:#}"))),
-        }
-    }
-    if args.verbose {
-        for (p, e) in &bad_files {
-            eprintln!("{}: {e}", p.display());
-        }
-    }
-    // samtools convention: exit non-zero if any bad files.
-    if !bad_files.is_empty() {
-        std::process::exit(1);
-    }
+    check(&args.inputs, args.unrecognized_ok)?;
     Ok(())
+}
+
+pub fn check(inputs: &[PathBuf], unrecognized_ok: bool) -> std::result::Result<(), CheckFailures> {
+    let files = inputs
+        .iter()
+        .filter_map(|path| {
+            check_one(path, unrecognized_ok)
+                .err()
+                .map(|err| (path.clone(), err))
+        })
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        Ok(())
+    } else {
+        Err(CheckFailures { files })
+    }
 }
 
 fn check_one(path: &std::path::Path, unrecognized_ok: bool) -> Result<()> {

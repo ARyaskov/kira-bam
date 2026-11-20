@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::process::ExitCode;
 
 use kira_bam::cli::{
     AddReplaceRgArgs, AmpliconclipArgs, AmpliconstatsArgs, BedcovArgs, CalmdArgs, CatArgs,
@@ -88,14 +89,16 @@ fn install_panic_hook() {
     }));
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     install_panic_hook();
     let cli = Cli::parse();
     let result = dispatch(cli.command);
     // A closed downstream pipe is a normal end of work.
     match result {
-        Err(e) if kira_bam::io::is_broken_pipe(&e) => Ok(()),
-        other => other,
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(e) if kira_bam::io::is_broken_pipe(&e) => Ok(ExitCode::SUCCESS),
+        Err(e) if e.is::<kira_bam::quickcheck::CheckFailures>() => Ok(ExitCode::FAILURE),
+        Err(e) => Err(e),
     }
 }
 

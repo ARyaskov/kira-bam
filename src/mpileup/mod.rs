@@ -8,7 +8,7 @@ use crate::depth::{CursorMap, parse_regions};
 use crate::faidx::RefCache;
 use crate::io::BufferedOutput;
 use crate::io::{BamReader, RecordSource, indexed::IndexedInput};
-use crate::merge::{RgRenames, build_tid_maps, is_sorted_compatible, merge_headers};
+use crate::merge::{build_tid_maps, is_sorted_compatible, merge_headers};
 use crate::pileup::{ObsKind, PileupIter, PileupObs};
 use crate::sort::SortKind;
 use noodles_sam::Header;
@@ -32,7 +32,7 @@ pub fn run(args: MpileupArgs) -> Result<()> {
     // (length conflicts error), so every column is keyed by a common tid. The
     // pileup only needs that dictionary, not the read-group/program merging the
     // helper also does.
-    let (union_header, _): (Header, Vec<RgRenames>) = merge_headers(
+    let (union_header, _) = merge_headers(
         input_headers.iter().collect::<Vec<_>>(),
         SortKind::Coordinate,
     )?;

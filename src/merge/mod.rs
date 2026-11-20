@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use bstr::{BStr, BString};
 use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
+use noodles_sam::alignment::record::data::field::Tag;
+use noodles_sam::alignment::record_buf::data::field::Value;
 use noodles_sam::header::record::value::map::program::tag as pg_tag;
 
 use crate::cli::MergeArgs;
@@ -70,7 +72,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
     // and compute per-input tid remaps, but the readers are borrowed mutably for
     // the streaming merge below.
     let input_headers: Vec<Header> = readers.iter().map(|r| r.header().clone()).collect();
-    let (mut merged_header, rg_renames) =
+    let (mut merged_header, tag_renames) =
         merge_headers(input_headers.iter().collect::<Vec<_>>(), kind)?;
     append_pg(&mut merged_header, &PgInfo::new("merge", !args.no_pg))?;
     // Per-input map: local reference id → merged reference id (matched by @SQ name).
@@ -101,7 +103,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
         let mut rec = RecordBuf::default();
         if r.read_record_buf(&mut rec)? {
             remap_ids(&mut rec, &tid_maps[idx]);
-            remap_read_group(&mut rec, &rg_renames[idx]);
+            tag_renames[idx].apply(&mut rec);
             heap.push(HeapItem {
                 key: build_key(&rec, kind),
                 record: rec,
@@ -137,7 +139,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
         let mut rec = item.record;
         if readers[src].read_record_buf(&mut rec)? {
             remap_ids(&mut rec, &tid_maps[src]);
-            remap_read_group(&mut rec, &rg_renames[src]);
+            tag_renames[src].apply(&mut rec);
             heap.push(HeapItem {
                 key: build_key(&rec, kind),
                 record: rec,
@@ -151,13 +153,26 @@ pub fn run(args: MergeArgs) -> Result<()> {
 
 /// Per-input map from a read-group ID as stored in that input's records to the
 /// one it was given in the merged header.
-pub(crate) type RgRenames = HashMap<BString, BString>;
+type IdRenames = HashMap<BString, BString>;
+
+#[derive(Clone, Default)]
+pub(crate) struct TagRenames {
+    read_groups: IdRenames,
+    programs: IdRenames,
+}
+
+impl TagRenames {
+    fn apply(&self, record: &mut RecordBuf) {
+        remap_tag(record, Tag::READ_GROUP, &self.read_groups);
+        remap_tag(record, Tag::PROGRAM, &self.programs);
+    }
+}
 
 /// Build the merged header, plus the read-group renames it forced.
 pub(crate) fn merge_headers(
     headers: Vec<&Header>,
     kind: SortKind,
-) -> Result<(Header, Vec<RgRenames>)> {
+) -> Result<(Header, Vec<TagRenames>)> {
     use bstr::ByteSlice;
 
     let mut merged = headers
@@ -165,7 +180,7 @@ pub(crate) fn merge_headers(
         .copied()
         .cloned()
         .context("no input headers")?;
-    let mut rg_renames: Vec<RgRenames> = vec![RgRenames::default(); headers.len()];
+    let mut tag_renames = vec![TagRenames::default(); headers.len()];
     for (i, h) in headers.iter().enumerate().skip(1) {
         // @SQ: build the UNION across inputs, preserving first-seen order. A name
         // shared by several inputs must agree on length (hard error); names unique
@@ -213,7 +228,9 @@ pub(crate) fn merge_headers(
                 suffix += 1;
             }
             if final_id != *rg_id {
-                rg_renames[i].insert(rg_id.clone(), final_id.clone());
+                tag_renames[i]
+                    .read_groups
+                    .insert(rg_id.clone(), final_id.clone());
             }
             merged.read_groups_mut().insert(final_id, rg_map.clone());
         }
@@ -227,7 +244,7 @@ pub(crate) fn merge_headers(
         // rather than re-rooted. Renaming a colliding ID has to carry through
         // to the `PP` links that pointed at it, or the chain ends up naming
         // the *first* input's program of that name — or nothing at all.
-        let pg_renames: HashMap<BString, BString> = {
+        let pg_renames = {
             let mut taken: HashSet<BString> = merged.programs().as_ref().keys().cloned().collect();
             let mut renames = HashMap::new();
             for pg_id in h.programs().as_ref().keys() {
@@ -259,6 +276,7 @@ pub(crate) fn merge_headers(
             }
             merged.programs_mut().as_mut().insert(final_id, pg_map);
         }
+        tag_renames[i].programs = pg_renames;
     }
 
     // @HD carries the sort order, and it came in as a clone of the first
@@ -269,7 +287,7 @@ pub(crate) fn merge_headers(
     };
     set_header_order(&mut merged, sort_order, None);
 
-    Ok((merged, rg_renames))
+    Ok((merged, tag_renames))
 }
 
 /// For each input header, map its local reference id (the integer tid stored in
@@ -331,20 +349,16 @@ fn remap_ids(rec: &mut RecordBuf, map: &[Option<usize>]) {
     }
 }
 
-/// Point the record's `RG` tag at this input's read group under its merged name.
-fn remap_read_group(rec: &mut RecordBuf, renames: &RgRenames) {
-    use noodles_sam::alignment::record::data::field::Tag;
-    use noodles_sam::alignment::record_buf::data::field::Value;
-
+fn remap_tag(rec: &mut RecordBuf, tag: Tag, renames: &IdRenames) {
     if renames.is_empty() {
         return;
     }
-    let new = match rec.data().get(&Tag::READ_GROUP) {
+    let new = match rec.data().get(&tag) {
         Some(Value::String(id)) => match renames.get(id.as_ref() as &BStr) {
             Some(new) => new.clone(),
             None => return,
         },
         _ => return,
     };
-    rec.data_mut().insert(Tag::READ_GROUP, Value::String(new));
+    rec.data_mut().insert(tag, Value::String(new));
 }

@@ -52,39 +52,36 @@ pub fn run(args: FastqArgs) -> Result<()> {
         // so say so rather than let an empty R1/R2 look like a successful run.
         warn_if_not_name_grouped(reader.header());
 
-        let mut prev: Option<RecordBuf> = None;
+        let mut group = Vec::new();
         let mut rec = RecordBuf::default();
         while reader.read_record_buf(&mut rec)? {
             let f = u16::from(rec.flags());
             if (f & (FLAG_SECONDARY | FLAG_SUPPLEMENTARY)) != 0 {
                 continue;
             }
-            // The reader refills `rec` each round, so it can be moved out
-            // instead of cloned.
-            let cur = std::mem::take(&mut rec);
-            match prev.take() {
-                Some(p) => {
-                    if same_qname(&p, &cur) {
-                        emit_pair(
-                            &p,
-                            &cur,
-                            &mut r1,
-                            &mut r2,
-                            &mut orphans,
-                            &mut stdout_sink,
-                            &args,
-                        )?;
-                    } else {
-                        emit_single(&p, &mut singletons, &mut r1, &mut stdout_sink, &args)?;
-                        prev = Some(cur);
-                    }
-                }
-                None => prev = Some(cur),
+            if group.first().is_some_and(|first| !same_qname(first, &rec)) {
+                emit_group(
+                    &group,
+                    &mut r1,
+                    &mut r2,
+                    &mut singletons,
+                    &mut orphans,
+                    &mut stdout_sink,
+                    &args,
+                )?;
+                group.clear();
             }
+            group.push(std::mem::take(&mut rec));
         }
-        if let Some(p) = prev.take() {
-            emit_single(&p, &mut singletons, &mut r1, &mut stdout_sink, &args)?;
-        }
+        emit_group(
+            &group,
+            &mut r1,
+            &mut r2,
+            &mut singletons,
+            &mut orphans,
+            &mut stdout_sink,
+            &args,
+        )?;
     } else {
         // Group by name through the collate buckets rather than sorting the
         // whole file in memory, which needed the entire BAM resident (cloned,
@@ -100,25 +97,25 @@ pub fn run(args: FastqArgs) -> Result<()> {
             groups.push(&rec)?;
         }
         groups.for_each_group(|recs| {
-            if recs.len() == 2 {
-                emit_pair(
-                    &recs[0],
-                    &recs[1],
-                    &mut r1,
-                    &mut r2,
-                    &mut orphans,
-                    &mut stdout_sink,
-                    &args,
-                )
-            } else {
-                for rec in recs {
-                    emit_single(rec, &mut singletons, &mut r1, &mut stdout_sink, &args)?;
-                }
-                Ok(())
-            }
+            emit_group(
+                recs,
+                &mut r1,
+                &mut r2,
+                &mut singletons,
+                &mut orphans,
+                &mut stdout_sink,
+                &args,
+            )
         })?;
     }
 
+    for sink in [r1, r2, singletons, orphans, Some(stdout_sink)]
+        .into_iter()
+        .flatten()
+    {
+        let mut sink = sink;
+        sink.w.flush().context("flush FASTQ output")?;
+    }
     Ok(())
 }
 
@@ -156,59 +153,42 @@ fn same_qname(a: &RecordBuf, b: &RecordBuf) -> bool {
     an == bn
 }
 
-fn emit_pair(
-    a: &RecordBuf,
-    b: &RecordBuf,
+fn emit_group(
+    records: &[RecordBuf],
     r1: &mut Option<Out>,
     r2: &mut Option<Out>,
+    singletons: &mut Option<Out>,
     orphans: &mut Option<Out>,
     stdout_sink: &mut Out,
     args: &FastqArgs,
 ) -> Result<()> {
-    let a_f = u16::from(a.flags());
-    let b_f = u16::from(b.flags());
-    let (first, second) = if (a_f & FLAG_READ1) != 0 {
-        (a, b)
-    } else if (b_f & FLAG_READ1) != 0 {
-        (b, a)
-    } else {
-        // Unflagged pair → orphans or stdout.
-        let sink = orphans.as_mut().unwrap_or(stdout_sink);
-        emit_record(a, sink, args, None)?;
-        emit_record(b, sink, args, None)?;
-        return Ok(());
-    };
-    match (r1.as_mut(), r2.as_mut()) {
-        (Some(out1), Some(out2)) => {
-            emit_record(first, out1, args, Some(1))?;
-            emit_record(second, out2, args, Some(2))?;
-        }
-        _ => {
-            let sink = orphans.as_mut().unwrap_or(stdout_sink);
-            emit_record(first, sink, args, Some(1))?;
-            emit_record(second, sink, args, Some(2))?;
+    let mut selected: [Option<&RecordBuf>; 3] = [None; 3];
+    for record in records {
+        let category = match u16::from(record.flags()) & (FLAG_READ1 | FLAG_READ2) {
+            FLAG_READ1 => 1,
+            FLAG_READ2 => 2,
+            _ => 0,
+        };
+        let previous = &mut selected[category];
+        if previous.is_none_or(|r| r.quality_scores().as_ref().is_empty())
+            && (previous.is_none() || !record.quality_scores().as_ref().is_empty())
+        {
+            *previous = Some(record);
         }
     }
+    let [other, first, second] = selected;
+    let paired = first.is_some() && second.is_some();
+    for (category, record, output) in [(1, first, r1), (2, second, r2)] {
+        if let Some(record) = record {
+            let sink = if paired { None } else { singletons.as_mut() };
+            let sink = sink.or(output.as_mut()).unwrap_or(stdout_sink);
+            emit_record(record, sink, args, Some(category))?;
+        }
+    }
+    if let Some(record) = other {
+        emit_record(record, orphans.as_mut().unwrap_or(stdout_sink), args, None)?;
+    }
     Ok(())
-}
-
-fn emit_single(
-    rec: &RecordBuf,
-    singletons: &mut Option<Out>,
-    r1: &mut Option<Out>,
-    stdout_sink: &mut Out,
-    args: &FastqArgs,
-) -> Result<()> {
-    let f = u16::from(rec.flags());
-    let mate_num = if (f & FLAG_READ1) != 0 {
-        Some(1)
-    } else if (f & FLAG_READ2) != 0 {
-        Some(2)
-    } else {
-        None
-    };
-    let sink = singletons.as_mut().or(r1.as_mut()).unwrap_or(stdout_sink);
-    emit_record(rec, sink, args, mate_num)
 }
 
 fn emit_record(

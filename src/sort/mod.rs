@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use noodles_bgzf as bgzf;
 use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
+use noodles_sam::alignment::record_buf::data::field::value::{Array, Value};
 use rayon::prelude::*;
 use tempfile::TempDir;
 
@@ -19,6 +20,8 @@ use crate::types::{OutputFormat, set_header_order};
 
 /// Presizes the chunk vector only; spilling is decided by measured bytes.
 const ESTIMATED_BYTES_PER_RECORD: usize = 512;
+const MAX_MERGE_FAN_IN: usize = 32;
+const MAX_ENCODE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// Approximate live heap bytes of one decoded record. Budgeting in records
 /// instead would overshoot by two orders of magnitude on long reads, where a
@@ -26,15 +29,34 @@ const ESTIMATED_BYTES_PER_RECORD: usize = 512;
 pub(crate) fn approx_heap_size(rec: &RecordBuf) -> usize {
     /// Struct, `Vec` headers and allocator round-up.
     const FIXED: usize = 160;
-    /// Undercounts long tag values.
-    const PER_TAG: usize = 24;
+    let aux_bytes: usize = rec
+        .data()
+        .iter()
+        .map(|(_, value)| {
+            let payload = match value {
+                Value::String(s) | Value::Hex(s) => s.len(),
+                Value::Array(array) => match array {
+                    Array::Int8(a) => a.capacity(),
+                    Array::UInt8(a) => a.capacity(),
+                    Array::Int16(a) => a.capacity() * 2,
+                    Array::UInt16(a) => a.capacity() * 2,
+                    Array::Int32(a) => a.capacity() * 4,
+                    Array::UInt32(a) => a.capacity() * 4,
+                    Array::Float(a) => a.capacity() * 4,
+                },
+                _ => 0,
+            };
+            std::mem::size_of::<(noodles_sam::alignment::record::data::field::Tag, Value)>()
+                + payload
+        })
+        .sum();
 
     FIXED
         + rec.name().map(|n| n.len()).unwrap_or(0)
         + rec.sequence().len()
         + rec.quality_scores().as_ref().len()
-        + rec.cigar().as_ref().len() * 4
-        + rec.data().len() * PER_TAG
+        + std::mem::size_of_val(rec.cigar().as_ref())
+        + aux_bytes
 }
 
 /// Minimum sort buffer when `-m auto` resolves below this. Picked so the
@@ -384,6 +406,7 @@ pub fn run(args: SortArgs) -> Result<()> {
         }
     }
 
+    drop(reader);
     if spilled.is_empty() {
         // Sort by key. We pre-extract keys once so par_sort doesn't allocate
         // a fresh qname Vec for every comparison (rayon's sort comparator
@@ -428,20 +451,8 @@ pub fn run(args: SortArgs) -> Result<()> {
         )?;
         writer.write_header()?;
         if matches!(fmt, OutputFormat::Bam | OutputFormat::UncompressedBam) {
-            // Encode records to raw BAM bytes in parallel chunks, then stream through BGZF.
-            let n_chunks = rayon::current_num_threads().max(1);
-            let chunk_len = current_chunk.len().div_ceil(n_chunks).max(1);
-            let encoded: Vec<(Vec<u8>, u64)> = {
-                let hdr = writer.header();
-                current_chunk
-                    .par_chunks(chunk_len)
-                    .map(|recs| crate::io::encode_records_into(hdr, recs))
-                    .collect()
-            };
-            let skipped: u64 = encoded.iter().map(|(_, n)| n).sum();
-            for (buf, _) in &encoded {
-                writer.write_preencoded(buf)?;
-            }
+            let batch_budget = (mem_budget / 8).min(MAX_ENCODE_BATCH_BYTES);
+            let skipped = write_encoded_batches(&mut writer, &current_chunk, batch_budget)?;
             report_skipped(skipped);
         } else {
             let mut skipped: u64 = 0;
@@ -484,8 +495,39 @@ pub fn run(args: SortArgs) -> Result<()> {
         )?);
     }
 
-    merge_spills(spilled, header, &args, kind)?;
+    merge_spills(spilled, header, &args, kind, tmpdir.path())?;
     Ok(())
+}
+
+fn write_encoded_batches(
+    writer: &mut BamWriter,
+    records: &[RecordBuf],
+    budget: usize,
+) -> Result<u64> {
+    let mut skipped = 0;
+    let mut start = 0;
+    let workers = rayon::current_num_threads();
+    let budget = budget.max(1);
+    while start < records.len() {
+        let mut bytes = 0usize;
+        let mut end = start;
+        while end < records.len() && bytes < budget {
+            bytes = bytes.saturating_add(approx_heap_size(&records[end]));
+            end += 1;
+        }
+        let record_count = end - start;
+        let header = writer.header();
+        let encoded: Vec<_> = records[start..end]
+            .par_chunks(record_count.div_ceil(workers))
+            .map(|chunk| crate::io::encode_records_into(header, chunk))
+            .collect();
+        for (raw, omitted) in encoded {
+            writer.write_preencoded(&raw)?;
+            skipped += omitted;
+        }
+        start = end;
+    }
+    Ok(skipped)
 }
 
 fn report_skipped(skipped: u64) {
@@ -532,8 +574,15 @@ fn spill_chunk(
     // so the external sort preserves input order as samtools does.
     sort_records_by_kind(chunk, kind);
     let path = dir.join(format!("kira-bam-spill-{idx:06}.bam"));
-    let writer = BamWriter::create_with_options(
-        Some(&path),
+    let writer = open_spill_writer(&path, header)?;
+    write_spill(chunk.drain(..), writer)
+        .with_context(|| format!("write spill {}", path.display()))?;
+    Ok(path)
+}
+
+fn open_spill_writer(path: &std::path::Path, header: &Header) -> Result<BamWriter> {
+    BamWriter::create_with_options(
+        Some(path),
         header.clone(),
         OutputFormat::Bam,
         None::<&std::path::Path>,
@@ -542,10 +591,7 @@ fn spill_chunk(
             compression_level: Some(bgzf::io::writer::CompressionLevel::FAST),
         },
     )
-    .with_context(|| format!("create spill {}", path.display()))?;
-    write_spill(&mut chunk.drain(..), writer)
-        .with_context(|| format!("write spill {}", path.display()))?;
-    Ok(path)
+    .with_context(|| format!("create spill {}", path.display()))
 }
 
 fn write_spill(records: impl Iterator<Item = RecordBuf>, mut writer: BamWriter) -> Result<()> {
@@ -586,11 +632,51 @@ impl Ord for HeapItem {
 }
 
 fn merge_spills(
-    spilled: Vec<PathBuf>,
+    mut spilled: Vec<PathBuf>,
     header: Header,
     args: &SortArgs,
     kind: SortKind,
+    dir: &std::path::Path,
 ) -> Result<()> {
+    let mut pass = 0;
+    let mut skipped = 0;
+    while spilled.len() > MAX_MERGE_FAN_IN {
+        let mut next = Vec::with_capacity(spilled.len().div_ceil(MAX_MERGE_FAN_IN));
+        for (i, runs) in spilled.chunks(MAX_MERGE_FAN_IN).enumerate() {
+            let path = dir.join(format!("merge-{pass}-{i}.bam"));
+            let mut writer = open_spill_writer(&path, &header)?;
+            skipped += merge_runs(runs, &mut writer, kind)?;
+            writer.finish()?;
+            for run in runs {
+                std::fs::remove_file(run)
+                    .with_context(|| format!("remove merged spill {}", run.display()))?;
+            }
+            next.push(path);
+        }
+        spilled = next;
+        pass += 1;
+    }
+
+    let write_opts = WriteOptions {
+        compression_workers: args.threads.saturating_sub(1).clamp(1, 8),
+        compression_level: args
+            .compression_level
+            .and_then(bgzf::io::writer::CompressionLevel::new),
+    };
+    let mut writer = BamWriter::create_with_options(
+        args.output.as_deref(),
+        header,
+        pick_fmt(args),
+        args.reference.as_deref(),
+        write_opts,
+    )?;
+    skipped += merge_runs(&spilled, &mut writer, kind)?;
+    writer.finish()?;
+    report_skipped(skipped);
+    Ok(())
+}
+
+fn merge_runs(spilled: &[PathBuf], writer: &mut BamWriter, kind: SortKind) -> Result<u64> {
     let mut readers: Vec<BamReader> = spilled
         .iter()
         .map(|p| BamReader::open(p).context("reopen spill"))
@@ -609,21 +695,6 @@ fn merge_spills(
         }
     }
 
-    let fmt = pick_fmt(args);
-    // Same multi-threaded BGZF compression the single-chunk path uses.
-    let write_opts = WriteOptions {
-        compression_workers: args.threads.saturating_sub(1).clamp(1, 8),
-        compression_level: args
-            .compression_level
-            .and_then(bgzf::io::writer::CompressionLevel::new),
-    };
-    let mut writer = BamWriter::create_with_options(
-        args.output.as_deref(),
-        header,
-        fmt,
-        args.reference.as_deref(),
-        write_opts,
-    )?;
     writer.write_header()?;
 
     let mut skipped: u64 = 0;
@@ -648,15 +719,63 @@ fn merge_spills(
             });
         }
     }
-    report_skipped(skipped);
-    writer.finish()?;
-    Ok(())
+    Ok(skipped)
 }
 
 #[cfg(test)]
 mod sort_order_tests {
     use super::*;
     use noodles_sam::alignment::record::Flags;
+
+    #[test]
+    fn bounded_merge_preserves_ties_across_batches() {
+        use clap::Parser as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.bam");
+        let header = Header::default();
+        let names: Vec<_> = (0..MAX_MERGE_FAN_IN * 2 + 1)
+            .map(|i| format!("r{i}"))
+            .collect();
+        let paths = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let path = dir.path().join(format!("run-{i}.bam"));
+                let writer = open_spill_writer(&path, &header).unwrap();
+                let record = rec(name, None, 0, 4);
+                write_spill(std::iter::once(record), writer).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let args =
+            SortArgs::try_parse_from(["sort", "unused", "-o", out.to_str().unwrap()]).unwrap();
+        merge_spills(paths, header, &args, SortKind::Coordinate, dir.path()).unwrap();
+        let mut reader = BamReader::open(out).unwrap();
+        let mut record = RecordBuf::default();
+        for name in names {
+            assert!(reader.read_record_buf(&mut record).unwrap());
+            let record_name: &[u8] = record.name().unwrap().as_ref();
+            assert_eq!(record_name, name.as_bytes());
+        }
+        assert!(!reader.read_record_buf(&mut record).unwrap());
+    }
+
+    #[test]
+    fn estimated_record_size_includes_variable_length_tags() {
+        use noodles_sam::alignment::record::data::field::Tag;
+
+        let mut record = RecordBuf::default();
+        let plain = approx_heap_size(&record);
+        record
+            .data_mut()
+            .insert(Tag::new(b'Z', b'Z'), Value::from("A".repeat(1024)));
+        record.data_mut().insert(
+            Tag::new(b'Z', b'Y'),
+            Value::Array(Array::Int32(vec![0; 1024])),
+        );
+        assert!(approx_heap_size(&record) >= plain + 1024 + 4096);
+    }
 
     #[test]
     fn spill_propagates_final_flush_failure() {

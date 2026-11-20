@@ -12,6 +12,7 @@ pub mod depth;
 pub mod dict;
 pub mod faidx;
 pub mod fastq;
+mod fastq_input;
 pub mod fixmate;
 pub mod flagstat;
 pub mod fqidx;

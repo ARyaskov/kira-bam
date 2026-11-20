@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use rustc_hash::FxHasher;
 
 use crate::cli::FqidxArgs;
+use crate::fastq_input::FastqInput;
 use crate::io::BufferedOutput;
 
 /// `.fqi` per-record: name \t length \t seq_offset \t qual_offset
@@ -69,57 +70,17 @@ fn build_fqi_path(fq: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn build_fqi(path: &std::path::Path) -> Result<Vec<FqiEntry>> {
-    let f = File::open(path).context("open FASTQ")?;
-    let mut r = BufReader::with_capacity(1 << 20, f);
-
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut pos: u64 = 0;
-    loop {
-        buf.clear();
-        let n = r.read_line(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        if !buf.starts_with('@') {
-            // Resilient skip — sometimes blank lines or stray content.
-            pos += n as u64;
-            continue;
-        }
-        let name = buf
-            .trim_end_matches(['\n', '\r'])
-            .strip_prefix('@')
-            .unwrap_or("")
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string();
-        pos += n as u64;
-
-        let seq_offset = pos;
-        buf.clear();
-        let n2 = r.read_line(&mut buf)?;
-        let seq_len = buf.trim_end_matches(['\n', '\r']).len() as u64;
-        pos += n2 as u64;
-
-        // `+` line
-        buf.clear();
-        let n3 = r.read_line(&mut buf)?;
-        pos += n3 as u64;
-
-        let qual_offset = pos;
-        buf.clear();
-        let n4 = r.read_line(&mut buf)?;
-        pos += n4 as u64;
-
-        out.push(FqiEntry {
-            name,
-            length: seq_len,
-            seq_offset,
-            qual_offset,
+    let mut reader = FastqInput::open(path)?;
+    let mut entries = Vec::new();
+    while let Some(record) = reader.next()? {
+        entries.push(FqiEntry {
+            name: record.name.to_owned(),
+            length: record.sequence.len() as u64,
+            seq_offset: record.sequence_offset,
+            qual_offset: record.quality_offset,
         });
     }
-    Ok(out)
+    Ok(entries)
 }
 
 fn write_fqi(path: &std::path::Path, entries: &[FqiEntry]) -> Result<()> {

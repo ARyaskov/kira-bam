@@ -423,15 +423,19 @@ enum ReaderImpl {
     /// SAM text inside a BGZF stream (`bgzip file.sam`). mmap buys nothing here
     /// — the cost is decompression, not the read syscalls.
     SamBgzf(sam::io::Reader<BufReader<bgzf::io::Reader<File>>>),
+    StreamBam(bam::io::Reader<StreamReader>),
+    StreamSam(sam::io::Reader<StreamReader>, InputFormat),
     Cram(CramSource),
 }
+
+type StreamReader = BufReader<Box<dyn Read + Send>>;
 
 /// Container-at-a-time CRAM decoding. The smallest readable unit is a container
 /// of thousands of records, and `Reader::records()` buffers one internally — so
 /// the iterator must outlive each record. It borrows the reader, which a struct
 /// cannot also hold, so this drives `read_container` directly.
 struct CramSource {
-    reader: cram::io::Reader<BufReader<File>>,
+    reader: cram::io::Reader<StreamReader>,
     container: cram::io::reader::Container,
     /// Empty by default, which only decodes CRAMs storing bases verbatim.
     repository: fasta::Repository,
@@ -440,6 +444,25 @@ struct CramSource {
 }
 
 impl CramSource {
+    fn open(reader: StreamReader, reference: Option<&Path>) -> Result<(ReaderImpl, Header)> {
+        let repository = reference
+            .map(build_fasta_repo)
+            .transpose()?
+            .unwrap_or_default();
+        let mut reader = cram::io::reader::Builder::default()
+            .set_reference_sequence_repository(repository.clone())
+            .build_from_reader(reader);
+        let header = reader.read_header().context("read CRAM header")?;
+        let source = Self {
+            reader,
+            container: cram::io::reader::Container::default(),
+            repository,
+            decoded: Vec::new(),
+            cursor: 0,
+        };
+        Ok((ReaderImpl::Cram(source), header))
+    }
+
     fn read_record_buf(&mut self, header: &Header, out: &mut RecordBuf) -> Result<bool> {
         while self.cursor >= self.decoded.len() {
             if !self.fill(header)? {
@@ -559,6 +582,9 @@ impl BamReader {
         R: AsRef<Path>,
     {
         let path = path.as_ref();
+        if path == Path::new("-") {
+            return Self::from_reader(io::stdin(), reference.as_ref().map(AsRef::as_ref));
+        }
         let fmt = detect_format(path).context("detect input format")?;
         match fmt {
             InputFormat::Bam => {
@@ -622,30 +648,65 @@ impl BamReader {
             }
             InputFormat::Cram => {
                 let file = File::open(path).context("open CRAM")?;
-                let buf_file = BufReader::with_capacity(1 << 20, file);
-                let mut builder = cram::io::reader::Builder::default();
-                let repository = match reference {
-                    Some(refpath) => build_fasta_repo(refpath.as_ref())?,
-                    None => fasta::Repository::default(),
-                };
-                builder = builder.set_reference_sequence_repository(repository.clone());
-                let mut reader = builder.build_from_reader(buf_file);
-                // CRAM read_header() validates the magic, parses the file
-                // definition, and returns the SAM header in one go.
-                let header = reader.read_header().context("read CRAM header")?;
-                Ok(Self {
-                    inner: ReaderImpl::Cram(CramSource {
-                        reader,
-                        container: cram::io::reader::Container::default(),
-                        repository,
-                        decoded: Vec::new(),
-                        cursor: 0,
-                    }),
-                    header,
-                    raw: bam::Record::default(),
-                    summary_fallback: RecordBuf::default(),
-                })
+                let (inner, header) = CramSource::open(
+                    BufReader::with_capacity(1 << 20, Box::new(file)),
+                    reference.as_ref().map(AsRef::as_ref),
+                )?;
+                Ok(Self::with_header(inner, header))
             }
+        }
+    }
+
+    /// Decode a non-seekable SAM, BGZF SAM, BAM, or CRAM stream.
+    pub fn from_reader(
+        mut reader: impl Read + Send + 'static,
+        reference: Option<&Path>,
+    ) -> Result<Self> {
+        let mut prefix = Vec::with_capacity(4);
+        (&mut reader)
+            .take(4)
+            .read_to_end(&mut prefix)
+            .context("read alignment stream signature")?;
+        let cram = prefix.as_slice() == CRAM_MAGIC;
+        let compressed = prefix.starts_with(&BGZF_MAGIC);
+        let mut source: Box<dyn Read + Send> = Box::new(Cursor::new(prefix).chain(reader));
+        let mut bam = false;
+        if compressed {
+            let mut decoded = bgzf::io::Reader::new(source);
+            let mut prefix = Vec::with_capacity(4);
+            (&mut decoded)
+                .take(4)
+                .read_to_end(&mut prefix)
+                .context("read BGZF stream signature")?;
+            bam = prefix.as_slice() == BAM_MAGIC;
+            source = Box::new(Cursor::new(prefix).chain(decoded));
+        }
+        let reader = BufReader::with_capacity(1 << 20, source);
+        let (inner, header) = if cram {
+            CramSource::open(reader, reference)?
+        } else if bam {
+            let mut reader = bam::io::Reader::from(reader);
+            let header = reader.read_header().context("read streaming BAM header")?;
+            (ReaderImpl::StreamBam(reader), header)
+        } else {
+            let mut reader = sam::io::Reader::new(reader);
+            let header = reader.read_header().context("read streaming SAM header")?;
+            let format = if compressed {
+                InputFormat::BgzfSam
+            } else {
+                InputFormat::Sam
+            };
+            (ReaderImpl::StreamSam(reader, format), header)
+        };
+        Ok(Self::with_header(inner, header))
+    }
+
+    fn with_header(inner: ReaderImpl, header: Header) -> Self {
+        Self {
+            inner,
+            header,
+            raw: bam::Record::default(),
+            summary_fallback: RecordBuf::default(),
         }
     }
 
@@ -686,6 +747,14 @@ impl BamReader {
                 Ok(n > 0)
             }
             ReaderImpl::Cram(r) => r.read_record_buf(&self.header, buf),
+            ReaderImpl::StreamBam(r) => Ok(r
+                .read_record_buf(&self.header, buf)
+                .context("read streaming BAM record")?
+                != 0),
+            ReaderImpl::StreamSam(r, _) => Ok(r
+                .read_record_buf(&self.header, buf)
+                .context("read streaming SAM record")?
+                != 0),
         }
     }
 
@@ -742,10 +811,13 @@ impl BamReader {
 
     pub fn input_format(&self) -> InputFormat {
         match self.inner {
-            ReaderImpl::Bam(_) | ReaderImpl::BamMmap(_) => InputFormat::Bam,
+            ReaderImpl::Bam(_) | ReaderImpl::BamMmap(_) | ReaderImpl::StreamBam(_) => {
+                InputFormat::Bam
+            }
             ReaderImpl::Sam(_) | ReaderImpl::SamMmap(_) => InputFormat::Sam,
             ReaderImpl::SamBgzf(_) => InputFormat::BgzfSam,
             ReaderImpl::Cram(_) => InputFormat::Cram,
+            ReaderImpl::StreamSam(_, format) => format,
         }
     }
 }

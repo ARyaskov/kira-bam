@@ -58,6 +58,9 @@ impl IndexedInput {
     /// `regions` is the `-r` cursor map `mpileup` already parsed against the
     /// union header; only its contig names drive eligibility here.
     pub(crate) fn open(path: &Path, regions: &CursorMap) -> Result<Option<Self>> {
+        if path == Path::new("-") {
+            return Ok(None);
+        }
         if detect_format(path).with_context(|| format!("detect format {}", path.display()))?
             != InputFormat::Bam
         {

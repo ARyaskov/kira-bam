@@ -118,6 +118,10 @@ fn report_skipped(skipped: u64) {
 }
 
 fn run_regions(args: ViewArgs, fmt: OutputFormat, opts: WriteOptions) -> Result<()> {
+    anyhow::ensure!(
+        args.input != std::path::Path::new("-"),
+        "region queries require a seekable indexed BAM"
+    );
     let mut idx_reader = bam::io::indexed_reader::Builder::default()
         .build_from_path(&args.input)
         .context("open indexed BAM (region query needs .bai or .csi)")?;

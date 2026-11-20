@@ -195,6 +195,10 @@ fn estimate_key_count(args: &MarkdupArgs) -> Result<usize> {
 }
 
 pub fn run(args: MarkdupArgs) -> Result<()> {
+    anyhow::ensure!(
+        args.input != std::path::Path::new("-"),
+        "markdup requires a file it can read more than once"
+    );
     install_thread_pool(args.threads);
 
     let optical_distance = args.optical_distance;

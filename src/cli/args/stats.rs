@@ -30,7 +30,7 @@ pub struct StatsArgs {
     #[arg(short = 'q', long = "min-mapq", default_value_t = 0)]
     pub min_mapq: u8,
 
-    /// Threads.
+    /// Accepted for CLI compatibility. This command runs single-threaded.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 }

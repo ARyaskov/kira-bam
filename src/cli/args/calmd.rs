@@ -29,7 +29,7 @@ pub struct CalmdArgs {
     #[arg(short = 'e', long = "extended-baq")]
     pub extended_baq: bool,
 
-    /// Number of threads.
+    /// Accepted for CLI compatibility. This command runs single-threaded.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 

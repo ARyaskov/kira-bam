@@ -8,7 +8,7 @@ pub struct FlagstatArgs {
     #[arg(value_name = "IN")]
     pub input: PathBuf,
 
-    /// Number of threads (BGZF decompression).
+    /// Accepted for CLI compatibility. This command runs single-threaded.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 

@@ -28,7 +28,7 @@ pub struct IndexArgs {
     #[arg(long = "depth", default_value_t = 5)]
     pub depth: u8,
 
-    /// Number of threads for BGZF decompression during scan.
+    /// Accepted for CLI compatibility. This command runs single-threaded.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 }

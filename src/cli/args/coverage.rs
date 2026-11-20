@@ -33,7 +33,7 @@ pub struct CoverageArgs {
     #[arg(long = "columns")]
     pub columns: Option<String>,
 
-    /// Number of threads.
+    /// Accepted for CLI compatibility. This command runs single-threaded.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 

@@ -57,7 +57,7 @@ pub struct DepthArgs {
     #[arg(short = 'q', long = "min-baseq", aliases = ["min-BQ", "min-bq"], default_value_t = 0)]
     pub min_baseq: u8,
 
-    /// Number of threads.
+    /// Accepted for CLI compatibility. This command runs single-threaded.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 

@@ -25,7 +25,7 @@ pub struct ImportArgs {
     #[arg(short = 'g', long = "rg-id", default_value = "1")]
     pub rg_id: String,
 
-    /// Threads.
+    /// Accepted for CLI compatibility. This command runs single-threaded.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 

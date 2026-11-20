@@ -24,7 +24,7 @@ pub struct SplitArgs {
     #[arg(long = "no-PG")]
     pub no_pg: bool,
 
-    /// Threads.
+    /// Accepted for CLI compatibility. This command runs single-threaded.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 

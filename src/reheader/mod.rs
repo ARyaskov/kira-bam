@@ -5,10 +5,17 @@ use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::ReheaderArgs;
-use crate::io::{BamReader, BamWriter, PgInfo, append_pg, report_skipped, write_record_tolerant};
+use crate::io::{
+    BamReader, BamWriter, PgInfo, append_pg, ensure_distinct_output, report_skipped,
+    write_record_tolerant,
+};
 use crate::types::OutputFormat;
 
 pub fn run(args: ReheaderArgs) -> Result<()> {
+    if args.output != std::path::Path::new("-") {
+        ensure_distinct_output(&args.input, &args.output)?;
+        ensure_distinct_output(&args.header, &args.output)?;
+    }
     let mut hdr_file = File::open(&args.header).context("open new header file")?;
     let mut sam_reader = noodles_sam::io::Reader::new(std::io::BufReader::new(&mut hdr_file));
     let mut new_header: Header = sam_reader.read_header().context("parse SAM header")?;

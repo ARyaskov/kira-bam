@@ -35,6 +35,7 @@ clap = { version = "4.6.9", features = ["derive"] }
 rayon = "1.12.0"
 rustc-hash = "2.1.3"
 tempfile = "3.27.0"
+same-file = "1.0.6"
 bstr = "1.14.0"
 # Total-RAM detection for `--memory auto` (dynamic sort buffer sized to a
 # fraction of available memory). Lightweight; just the system module is

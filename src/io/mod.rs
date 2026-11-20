@@ -16,6 +16,10 @@ use noodles_sam::header::record::value::{Map, map::Program, map::program::tag as
 
 use crate::types::OutputFormat;
 
+mod output;
+use output::PendingOutput;
+pub(crate) use output::ensure_distinct_output;
+
 /// Resolve a memory hint into an absolute byte budget.
 ///
 /// Accepts:
@@ -759,6 +763,7 @@ pub struct BamWriter {
     inner: WriterImpl,
     header: Header,
     header_written: bool,
+    pending: Option<PendingOutput>,
 }
 
 enum WriterImpl {
@@ -792,11 +797,7 @@ impl BamWriter {
         P: AsRef<Path>,
         R: AsRef<Path>,
     {
-        let sink: Box<dyn Write + Send> = match path {
-            Some(p) => Box::new(File::create(p.as_ref()).context("create output")?),
-            None => Box::new(io::stdout()),
-        };
-        Self::from_writer_with_reference(sink, header, fmt, reference)
+        Self::create_with_options(path, header, fmt, reference, WriteOptions::default())
     }
 
     /// Like `create_with_reference` but with full write-side option control.
@@ -811,11 +812,19 @@ impl BamWriter {
         P: AsRef<Path>,
         R: AsRef<Path>,
     {
-        let sink: Box<dyn Write + Send> = match path {
-            Some(p) => Box::new(File::create(p.as_ref()).context("create output")?),
-            None => Box::new(io::stdout()),
-        };
-        Self::from_writer_with_options(sink, header, fmt, reference, opts)
+        if let Some(path) = path
+            .as_ref()
+            .map(AsRef::as_ref)
+            .filter(|p| *p != Path::new("-"))
+        {
+            let (file, pending) = PendingOutput::create(path)?;
+            let mut writer =
+                Self::from_writer_with_options(Box::new(file), header, fmt, reference, opts)?;
+            writer.pending = Some(pending);
+            Ok(writer)
+        } else {
+            Self::from_writer_with_options(Box::new(io::stdout()), header, fmt, reference, opts)
+        }
     }
 
     pub fn from_writer(
@@ -902,6 +911,7 @@ impl BamWriter {
             inner,
             header,
             header_written: false,
+            pending: None,
         })
     }
 
@@ -975,7 +985,12 @@ impl BamWriter {
     /// block and the flushes otherwise happen in `Drop`, which discards their
     /// errors and turns a full disk into a truncated file with exit status 0.
     pub fn finish(self) -> Result<()> {
-        let Self { inner, header, .. } = self;
+        let Self {
+            inner,
+            header,
+            pending,
+            ..
+        } = self;
         match inner {
             WriterImpl::Bam(w) => {
                 let mut sink = w
@@ -996,6 +1011,9 @@ impl BamWriter {
                 AlignmentWrite::finish(w.as_mut(), &header).context("write CRAM EOF container")?;
                 w.into_inner().flush().context("flush CRAM output")?;
             }
+        }
+        if let Some(pending) = pending {
+            pending.publish()?;
         }
         Ok(())
     }

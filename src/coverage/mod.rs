@@ -2,12 +2,10 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use anyhow::{Context, Result};
-use noodles_sam::Header;
 use noodles_sam::alignment::RecordBuf;
-use rustc_hash::FxHasher;
-use std::collections::HashMap;
 
 use crate::cli::CoverageArgs;
+use crate::depth::resolve_region;
 use crate::io::{BamReader, install_thread_pool};
 
 const ALL_COLUMNS: [&str; 9] = [
@@ -59,7 +57,8 @@ impl CoveredBits {
 #[derive(Default)]
 struct RefStats {
     name: String,
-    length: usize,
+    start: usize,
+    end: usize,
     numreads: u64,
     covered: CoveredBits,
     sum_depth: u64,
@@ -74,35 +73,42 @@ pub fn run(args: CoverageArgs) -> Result<()> {
 
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
-    let header = reader.header().clone();
-
-    let mut stats: HashMap<usize, RefStats, std::hash::BuildHasherDefault<FxHasher>> =
-        HashMap::default();
+    let refs: Vec<_> = reader
+        .header()
+        .reference_sequences()
+        .iter()
+        .map(|(name, sq)| (name.to_string(), usize::from(sq.length())))
+        .collect();
+    let mut stats: Vec<Vec<RefStats>> = (0..refs.len()).map(|_| Vec::new()).collect();
 
     // Pre-populate so refs with zero reads still get a row — but only the ones
     // `-r` asks for. Allocating a bitmap for every contig regardless meant a
     // single-region run still paid for the whole genome.
-    for (i, (name, sq)) in header.reference_sequences().iter().enumerate() {
-        let name = name.to_string();
-        if !args.regions.is_empty() && !args.regions.contains(&name) {
-            continue;
-        }
-        let len = usize::from(sq.length());
-        stats.insert(
-            i,
-            RefStats {
-                name,
-                length: len,
-                covered: CoveredBits::with_len(len),
-                ..Default::default()
-            },
-        );
+    let spans: Vec<_> = if args.regions.is_empty() {
+        refs.iter()
+            .enumerate()
+            .map(|(tid, (_, len))| (tid, 1, *len))
+            .collect()
+    } else {
+        args.regions
+            .iter()
+            .map(|spec| resolve_region(spec, &refs))
+            .collect::<Result<_>>()?
+    };
+    for (tid, start, end) in spans {
+        stats[tid].push(RefStats {
+            name: refs[tid].0.clone(),
+            start,
+            end,
+            covered: CoveredBits::with_len(end - start + 1),
+            ..Default::default()
+        });
     }
 
     let mut rec = RecordBuf::default();
     while reader.read_record_buf(&mut rec)? {
         let flags = u16::from(rec.flags());
-        if (flags & 0x4) != 0 {
+        if flags & 0x704 != 0 {
             continue;
         }
         if let Some(mapq) = rec.mapping_quality()
@@ -119,51 +125,63 @@ pub fn run(args: CoverageArgs) -> Result<()> {
             None => continue,
         };
         // Absent when `-r` excluded this contig.
-        let Some(st) = stats.get_mut(&tid) else {
+        let Some(regions) = stats.get_mut(tid) else {
             continue;
         };
-        st.numreads += 1;
-        let mapq = rec.mapping_quality().map(u8::from).unwrap_or(0) as u64;
-        st.sum_mapq += mapq;
-        st.sum_mapq_n += 1;
-
-        // CIGAR-aware per-base accounting. Only M/=/X positions are covered, and
-        // each read base's quality is matched to the reference position it
-        // actually aligns to. The previous code iterated the [start,end] span and
-        // pulled qualities positionally, which (a) counted deletions and N-skips
-        // (introns) as covered and (b) mis-assigned base qualities across any
-        // indel. -Q now excludes low-quality bases from depth too, matching
-        // samtools coverage semantics.
-        let quals = rec.quality_scores().as_ref();
-        let mut ref_pos = start;
-        let mut read_idx = 0usize;
-        for op in rec.cigar().as_ref().iter() {
-            let kind = op.kind();
-            let len = op.len();
-            let cons_ref = kind.consumes_reference();
-            let cons_read = kind.consumes_read();
-            if cons_ref && cons_read {
-                for _ in 0..len {
-                    if ref_pos >= 1 && ref_pos <= st.length {
-                        let q = quals.get(read_idx).copied().unwrap_or(0);
-                        if q >= args.min_baseq {
-                            st.covered.set(ref_pos - 1);
-                            st.sum_depth += 1;
-                            st.sum_baseq += q as u64;
-                            st.sum_baseq_n += 1;
-                        }
-                    }
-                    ref_pos += 1;
-                    read_idx += 1;
-                }
-            } else if cons_ref {
-                ref_pos += len;
-            } else if cons_read {
-                read_idx += len;
-            }
+        let end = rec.alignment_end().map(usize::from).unwrap_or(start);
+        for st in regions
+            .iter_mut()
+            .filter(|st| start <= st.end && end >= st.start)
+        {
+            accumulate(st, &rec, start, args.min_baseq);
         }
     }
 
+    write_rows(&args, stats.iter().flatten())
+}
+
+fn accumulate(st: &mut RefStats, rec: &RecordBuf, start: usize, min_baseq: u8) {
+    st.numreads += 1;
+    let mapq = rec.mapping_quality().map(u8::from).unwrap_or(0) as u64;
+    st.sum_mapq += mapq;
+    st.sum_mapq_n += 1;
+
+    // CIGAR-aware per-base accounting. Only M/=/X positions are covered, and
+    // each read base's quality is matched to the reference position it
+    // actually aligns to. The previous code iterated the [start,end] span and
+    // pulled qualities positionally, which (a) counted deletions and N-skips
+    // (introns) as covered and (b) mis-assigned base qualities across any
+    // indel. -Q now excludes low-quality bases from depth too, matching
+    // samtools coverage semantics.
+    let quals = rec.quality_scores().as_ref();
+    let mut ref_pos = start;
+    let mut read_idx = 0usize;
+    for op in rec.cigar().as_ref().iter() {
+        let kind = op.kind();
+        let len = op.len();
+        let cons_ref = kind.consumes_reference();
+        let cons_read = kind.consumes_read();
+        if cons_ref && cons_read {
+            for pos in ref_pos.max(st.start)..=(ref_pos + len - 1).min(st.end) {
+                let q = quals.get(read_idx + pos - ref_pos).copied().unwrap_or(0);
+                if q >= min_baseq {
+                    st.covered.set(pos - st.start);
+                    st.sum_depth += 1;
+                    st.sum_baseq += q as u64;
+                    st.sum_baseq_n += 1;
+                }
+            }
+        }
+        if cons_ref {
+            ref_pos += len;
+        }
+        if cons_read {
+            read_idx += len;
+        }
+    }
+}
+
+fn write_rows<'a>(args: &CoverageArgs, rows: impl Iterator<Item = &'a RefStats>) -> Result<()> {
     let columns = parse_columns(args.columns.as_deref())?;
     let mut out: Box<dyn Write> = match &args.output {
         Some(p) => Box::new(BufWriter::new(File::create(p)?)),
@@ -179,23 +197,13 @@ pub fn run(args: CoverageArgs) -> Result<()> {
         writeln!(out, "{header_line}")?;
     }
 
-    let mut rows: Vec<&RefStats> = stats.values().collect();
-    rows.sort_by_key(|r| header_index(&header, &r.name));
-
     for st in rows {
         // Maintained as bases are marked, rather than an O(contig length) scan
         // per row at the end.
         let covbases: u64 = st.covered.popcount;
-        let coverage_pct = if st.length > 0 {
-            100.0 * covbases as f64 / st.length as f64
-        } else {
-            0.0
-        };
-        let meandepth = if st.length > 0 {
-            st.sum_depth as f64 / st.length as f64
-        } else {
-            0.0
-        };
+        let length = (st.end - st.start + 1) as f64;
+        let coverage_pct = 100.0 * covbases as f64 / length;
+        let meandepth = st.sum_depth as f64 / length;
         let meanbaseq = if st.sum_baseq_n > 0 {
             st.sum_baseq as f64 / st.sum_baseq_n as f64
         } else {
@@ -211,8 +219,8 @@ pub fn run(args: CoverageArgs) -> Result<()> {
             .iter()
             .map(|c| match *c {
                 "rname" => st.name.clone(),
-                "startpos" => "1".to_string(),
-                "endpos" => st.length.to_string(),
+                "startpos" => st.start.to_string(),
+                "endpos" => st.end.to_string(),
                 "numreads" => st.numreads.to_string(),
                 "covbases" => covbases.to_string(),
                 "coverage" => format!("{coverage_pct:.4}"),
@@ -244,11 +252,4 @@ fn parse_columns(spec: Option<&str>) -> Result<Vec<&'static str>> {
             Ok(out)
         }
     }
-}
-
-fn header_index(h: &Header, name: &str) -> usize {
-    h.reference_sequences()
-        .iter()
-        .position(|(n, _)| n == name)
-        .unwrap_or(usize::MAX)
 }

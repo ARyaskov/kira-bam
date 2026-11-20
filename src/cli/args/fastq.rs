@@ -33,7 +33,7 @@ pub struct FastqArgs {
     #[arg(short = 'N', long = "casava")]
     pub casava: bool,
 
-    /// Number of threads.
+    /// Accepted for CLI compatibility. It does not change the thread count.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 
@@ -54,4 +54,8 @@ pub struct FastqArgs {
     /// files means less memory per file, at the cost of open descriptors.
     #[arg(long = "buckets", default_value_t = 64)]
     pub buckets: usize,
+
+    /// Approximate memory budget when grouping with --collate.
+    #[arg(short = 'm', long = "memory", default_value = "768M")]
+    pub memory: String,
 }

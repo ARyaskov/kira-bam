@@ -73,6 +73,7 @@ const AUTO_MEMORY_DEN: u32 = 4;
 pub(crate) enum SortKind {
     Coordinate,
     QueryName,
+    QueryGroup,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -224,7 +225,7 @@ fn sort_records_by_kind(records: &mut Vec<RecordBuf>, kind: SortKind) {
             let order: Vec<u32> = keys.iter().map(|k| k.3).collect();
             apply_permutation(records, order);
         }
-        SortKind::QueryName => {
+        SortKind::QueryName | SortKind::QueryGroup => {
             // One arena, so a key is a slice range rather than an allocation.
             let mut arena: Vec<u8> = Vec::with_capacity(records.len() * 32);
             let mut keys: Vec<NameKey> = Vec::with_capacity(records.len());
@@ -235,7 +236,7 @@ fn sort_records_by_kind(records: &mut Vec<RecordBuf>, kind: SortKind) {
                 keys.push(NameKey {
                     start,
                     len: name.len() as u32,
-                    read12: (u16::from(r.flags()) & 0xc0) as u8,
+                    read12: name_segment(r, kind),
                     index: i as u32,
                 });
             }
@@ -333,28 +334,67 @@ pub(crate) fn build_key(rec: &RecordBuf, kind: SortKind) -> SortKey {
             let rev = ((u16::from(rec.flags()) >> 4) & 1) as u8;
             SortKey::Coord { tid, pos, rev }
         }
-        SortKind::QueryName => {
+        SortKind::QueryName | SortKind::QueryGroup => {
             let qname = rec.name().map(|n| n.to_vec()).unwrap_or_default();
-            let read12 = (u16::from(rec.flags()) & 0xc0) as u8;
+            let read12 = name_segment(rec, kind);
             SortKey::Name { qname, read12 }
         }
     }
 }
 
-pub fn run(args: SortArgs) -> Result<()> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
-        .build()
-        .context("create sort worker pool")?;
-    pool.install(|| run_in_pool(args))
+fn name_segment(record: &RecordBuf, kind: SortKind) -> u8 {
+    if kind == SortKind::QueryGroup {
+        0
+    } else {
+        (u16::from(record.flags()) & 0xc0) as u8
+    }
 }
 
-fn run_in_pool(args: SortArgs) -> Result<()> {
+pub fn run(args: SortArgs) -> Result<()> {
     let kind = if args.name_sort {
         SortKind::QueryName
     } else {
         SortKind::Coordinate
     };
+    run_with_order(args, kind)
+}
+
+pub(crate) fn group_file(
+    input: PathBuf,
+    output: &std::path::Path,
+    tmpdir: &std::path::Path,
+    budget: usize,
+) -> Result<()> {
+    let args = SortArgs {
+        input,
+        output: Some(output.to_owned()),
+        name_sort: true,
+        threads: 1,
+        memory: budget.to_string(),
+        tmpdir: Some(tmpdir.to_owned()),
+        uncompressed: true,
+        compression_level: None,
+        reference: None,
+        require_flags: 0,
+        filter_flags: 0,
+        no_pg: true,
+        markdup: false,
+        markdup_barcode_tag: None,
+        markdup_mode_ancient: false,
+        markdup_supplementary: false,
+    };
+    run_with_order(args, SortKind::QueryGroup)
+}
+
+fn run_with_order(args: SortArgs, kind: SortKind) -> Result<()> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build()
+        .context("create sort worker pool")?;
+    pool.install(|| run_in_pool(args, kind))
+}
+
+fn run_in_pool(args: SortArgs, kind: SortKind) -> Result<()> {
     // `-m` is the budget for the whole sort, not per thread as in samtools.
     let mem_budget = resolve_memory_hint(
         &args.memory,
@@ -564,7 +604,7 @@ fn set_header_sort_order(header: &mut Header, kind: SortKind) {
     use noodles_sam::header::record::value::map::header::sort_order;
     let so: &[u8] = match kind {
         SortKind::Coordinate => sort_order::COORDINATE,
-        SortKind::QueryName => sort_order::QUERY_NAME,
+        SortKind::QueryName | SortKind::QueryGroup => sort_order::QUERY_NAME,
     };
     set_header_order(header, so, None);
 }

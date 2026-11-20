@@ -17,7 +17,7 @@ pub struct CollateArgs {
     #[arg(short = 'f', long = "fast")]
     pub fast: bool,
 
-    /// Threads.
+    /// Accepted for CLI compatibility. It does not change the thread count.
     #[arg(short = '@', long = "threads", default_value_t = 4)]
     pub threads: usize,
 

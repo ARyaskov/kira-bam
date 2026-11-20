@@ -4,8 +4,8 @@
 //! passes the memory budget, the run switches to samtools' approach: hash every
 //! read name into one of `--buckets` temporary files, so all records of a name
 //! land together, then group each bucket on its own. Peak memory becomes the
-//! largest bucket rather than the whole BAM — the previous version kept every
-//! record, cloned, and OOM'd on anything WGS-sized.
+//! memory budget plus merge buffers. Oversized buckets are stably sorted by
+//! name in bounded runs and streamed one record at a time.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault};
@@ -20,7 +20,7 @@ use crate::io::{
     BamReader, BamWriter, PgInfo, append_pg, report_skipped, resolve_memory_hint,
     write_record_tolerant,
 };
-use crate::sort::approx_heap_size;
+use crate::sort::{approx_heap_size, group_file};
 use crate::types::{OutputFormat, set_header_order};
 
 /// Floor for `-m auto`, matching the sort module's reasoning.
@@ -99,11 +99,8 @@ pub fn run(args: CollateArgs) -> Result<()> {
                 }
             }
         }
-        Some(s) => s.for_each_group(|recs| {
-            for r in recs {
-                write_record_tolerant(&mut writer, r, "collate", &mut skipped)?;
-            }
-            Ok(())
+        Some(s) => s.for_each_record(budget, |record, _| {
+            write_record_tolerant(&mut writer, &record, "collate", &mut skipped)
         })?,
     }
 
@@ -170,11 +167,11 @@ impl NameBuckets {
         self.writers[i].write_record_buf(rec)
     }
 
-    /// Read the buckets back one at a time, handing `f` each group of records
-    /// that share a name. Only one bucket is resident at a time.
-    pub(crate) fn for_each_group<F>(self, mut f: F) -> Result<()>
+    /// Large buckets use the bounded external sort. The callback receives a
+    /// boundary flag so a single arbitrarily large name group can be streamed.
+    pub(crate) fn for_each_record<F>(self, budget: usize, mut emit: F) -> Result<()>
     where
-        F: FnMut(&[RecordBuf]) -> Result<()>,
+        F: FnMut(RecordBuf, bool) -> Result<()>,
     {
         let Self {
             dir,
@@ -182,23 +179,46 @@ impl NameBuckets {
             paths,
             ..
         } = self;
-        for w in writers {
-            w.finish()?;
+        for writer in writers {
+            writer.finish()?;
         }
-        for path in &paths {
-            let mut reader = BamReader::open(path)
-                .with_context(|| format!("reopen collate bucket {}", path.display()))?;
-            let mut buckets: Buckets = HashMap::default();
-            let mut rec = RecordBuf::default();
-            while reader.read_record_buf(&mut rec)? {
-                push_grouped(&mut buckets, std::mem::take(&mut rec));
+        for path in paths {
+            let mut reader = BamReader::open(&path)?;
+            let mut buffered: Buckets = HashMap::default();
+            let mut record = RecordBuf::default();
+            let mut bytes = 0usize;
+            while reader.read_record_buf(&mut record)? {
+                bytes = bytes.saturating_add(approx_heap_size(&record));
+                if bytes > budget {
+                    break;
+                }
+                push_grouped(&mut buffered, std::mem::take(&mut record));
             }
-            for (_, recs) in buckets.drain() {
-                f(&recs)?;
+            drop(reader);
+            if bytes <= budget {
+                for records in buffered.into_values() {
+                    for (index, record) in records.into_iter().enumerate() {
+                        emit(record, index == 0)?;
+                    }
+                }
+                continue;
             }
+            drop(buffered);
+            let sorted = dir.path().join("grouped.bam");
+            group_file(path, &sorted, dir.path(), budget)?;
+            let mut reader = BamReader::open(&sorted)?;
+            let mut previous = None;
+            while reader.read_record_buf(&mut record)? {
+                let name: &[u8] = record.name().map(AsRef::as_ref).unwrap_or_default();
+                let boundary = previous.as_deref() != Some(name);
+                if boundary {
+                    previous = Some(name.to_vec());
+                }
+                emit(std::mem::take(&mut record), boundary)?;
+            }
+            drop(reader);
+            std::fs::remove_file(sorted)?;
         }
-        // Held until every bucket has been read back; dropping it removes them.
-        drop(dir);
         Ok(())
     }
 }

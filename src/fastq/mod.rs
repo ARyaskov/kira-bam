@@ -102,7 +102,20 @@ pub fn run(args: FastqArgs) -> Result<()> {
             }
             groups.push(&rec)?;
         }
-        groups.for_each_group(|recs| emit_group(recs, &mut outputs, &args))?;
+        let budget = crate::io::resolve_memory_hint(&args.memory, 512 << 20, 3, 4)?;
+        let mut selected = [None, None, None];
+        groups.for_each_record(budget, |record, boundary| {
+            if boundary {
+                emit_selected(selected.each_ref().map(Option::as_ref), &mut outputs, &args)?;
+                selected = [None, None, None];
+            }
+            let previous = &mut selected[category(&record)];
+            if prefer(previous.as_ref(), &record) {
+                *previous = Some(record);
+            }
+            Ok(())
+        })?;
+        emit_selected(selected.each_ref().map(Option::as_ref), &mut outputs, &args)?;
     }
 
     for sink in outputs.writers {
@@ -148,18 +161,33 @@ fn same_qname(a: &RecordBuf, b: &RecordBuf) -> bool {
 fn emit_group(records: &[RecordBuf], outputs: &mut Outputs, args: &FastqArgs) -> Result<()> {
     let mut selected: [Option<&RecordBuf>; 3] = [None; 3];
     for record in records {
-        let category = match u16::from(record.flags()) & (FLAG_READ1 | FLAG_READ2) {
-            FLAG_READ1 => 1,
-            FLAG_READ2 => 2,
-            _ => 0,
-        };
-        let previous = &mut selected[category];
-        if previous.is_none_or(|r| r.quality_scores().as_ref().is_empty())
-            && (previous.is_none() || !record.quality_scores().as_ref().is_empty())
-        {
+        let previous = &mut selected[category(record)];
+        if prefer(*previous, record) {
             *previous = Some(record);
         }
     }
+    emit_selected(selected, outputs, args)
+}
+
+fn category(record: &RecordBuf) -> usize {
+    match u16::from(record.flags()) & (FLAG_READ1 | FLAG_READ2) {
+        FLAG_READ1 => 1,
+        FLAG_READ2 => 2,
+        _ => 0,
+    }
+}
+
+fn prefer(previous: Option<&RecordBuf>, record: &RecordBuf) -> bool {
+    previous.is_none_or(|r| {
+        r.quality_scores().as_ref().is_empty() && !record.quality_scores().as_ref().is_empty()
+    })
+}
+
+fn emit_selected(
+    selected: [Option<&RecordBuf>; 3],
+    outputs: &mut Outputs,
+    args: &FastqArgs,
+) -> Result<()> {
     let [other, first, second] = selected;
     let paired = first.is_some() && second.is_some();
     for (category, record) in [(1, first), (2, second), (0, other)] {

@@ -1,10 +1,10 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::cli::FaidxArgs;
-use crate::io::BufferedOutput;
+use crate::io::{BufferedOutput, ensure_distinct_output};
 
 #[derive(Debug, Clone)]
 pub(crate) struct FaiEntry {
@@ -16,7 +16,17 @@ pub(crate) struct FaiEntry {
 }
 
 pub fn run(args: FaidxArgs) -> Result<()> {
-    let fai = load_or_build_fai(&args.fasta)?;
+    let index = build_fai_path(&args.fasta);
+    ensure_distinct_output(&args.fasta, &index)?;
+    if let Some(out) = args
+        .output
+        .as_deref()
+        .filter(|path| *path != std::path::Path::new("-"))
+    {
+        ensure_distinct_output(&args.fasta, out)?;
+        ensure_distinct_output(&index, out)?;
+    }
+    let fai = load_or_build_fai(&args.fasta, args.regions.is_empty())?;
 
     if args.regions.is_empty() {
         return Ok(());
@@ -113,11 +123,11 @@ fn read_at(
 /// Load the `.fai`, building it when absent — or when it predates the FASTA.
 /// A stale index still parses, so its wrong offsets would otherwise be used
 /// silently and return the wrong bases.
-pub(crate) fn load_or_build_fai(fasta: &std::path::Path) -> Result<Vec<FaiEntry>> {
+fn load_or_build_fai(fasta: &std::path::Path, require_index: bool) -> Result<Vec<FaiEntry>> {
     let fai_path = build_fai_path(fasta);
     if fai_path.exists() {
         if !is_stale(fasta, &fai_path) {
-            return read_fai(&fai_path).context("read .fai");
+            return read_fai(&fai_path, std::fs::metadata(fasta)?.len());
         }
         eprintln!(
             "[kira-bam faidx] {} is older than {} — rebuilding",
@@ -127,6 +137,9 @@ pub(crate) fn load_or_build_fai(fasta: &std::path::Path) -> Result<Vec<FaiEntry>
     }
     let entries = build_fai(fasta).context("build .fai")?;
     if let Err(e) = write_fai(&fai_path, &entries) {
+        if require_index {
+            return Err(e).with_context(|| format!("write {}", fai_path.display()));
+        }
         // An unwritable directory is no reason to fail the query itself.
         eprintln!(
             "[kira-bam faidx] could not write {}: {e:#}",
@@ -160,6 +173,8 @@ fn build_fai(fasta: &std::path::Path) -> Result<Vec<FaiEntry>> {
     let mut current: Option<FaiEntry> = None;
     let mut file_pos: u64 = 0;
     let mut buf = String::new();
+    let mut previous_line = None;
+    let mut line_number = 0;
 
     loop {
         buf.clear();
@@ -167,6 +182,7 @@ fn build_fai(fasta: &std::path::Path) -> Result<Vec<FaiEntry>> {
         if n == 0 {
             break;
         }
+        line_number += 1;
         let trimmed_no_newline = buf.trim_end_matches('\n').trim_end_matches('\r');
         let line_bytes = n as u64;
         let line_blen = trimmed_no_newline.len() as u64;
@@ -181,6 +197,7 @@ fn build_fai(fasta: &std::path::Path) -> Result<Vec<FaiEntry>> {
                 .unwrap_or("")
                 .to_string();
             file_pos += line_bytes;
+            previous_line = None;
             current = Some(FaiEntry {
                 name,
                 length: 0,
@@ -189,11 +206,20 @@ fn build_fai(fasta: &std::path::Path) -> Result<Vec<FaiEntry>> {
                 line_len: 0,
             });
         } else if let Some(c) = current.as_mut() {
+            ensure!(
+                line_blen > 0
+                    && (c.length == 0 || line_blen <= c.line_blen)
+                    && previous_line.is_none_or(|geometry| geometry == (c.line_blen, c.line_len)),
+                "{}: line {line_number}: inconsistent FASTA line width for {}",
+                fasta.display(),
+                c.name
+            );
             if c.line_blen == 0 {
                 c.line_blen = line_blen;
                 c.line_len = line_bytes;
             }
             c.length += line_blen;
+            previous_line = Some((line_blen, line_bytes));
             file_pos += line_bytes;
         } else {
             file_pos += line_bytes;
@@ -217,24 +243,49 @@ fn write_fai(path: &std::path::Path, entries: &[FaiEntry]) -> Result<()> {
     f.finish()
 }
 
-fn read_fai(path: &std::path::Path) -> Result<Vec<FaiEntry>> {
+fn read_fai(path: &std::path::Path, fasta_len: u64) -> Result<Vec<FaiEntry>> {
     let f = File::open(path)?;
     let mut entries = Vec::new();
-    for line in BufReader::new(f).lines() {
-        let line = line?;
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 5 {
-            continue;
-        }
-        entries.push(FaiEntry {
-            name: parts[0].to_string(),
-            length: parts[1].parse().unwrap_or(0),
-            offset: parts[2].parse().unwrap_or(0),
-            line_blen: parts[3].parse().unwrap_or(0),
-            line_len: parts[4].parse().unwrap_or(0),
-        });
+    for (index, line) in BufReader::new(f).lines().enumerate() {
+        let location = || format!("{}: line {}", path.display(), index + 1);
+        let line = line.with_context(location)?;
+        entries.push(parse_fai_entry(&line, fasta_len).with_context(location)?);
     }
     Ok(entries)
+}
+
+fn parse_fai_entry(line: &str, fasta_len: u64) -> Result<FaiEntry> {
+    let fields: Vec<_> = line.split('\t').collect();
+    let [name, length, offset, line_blen, line_len] = fields.as_slice() else {
+        anyhow::bail!("expected five .fai fields");
+    };
+    let entry = FaiEntry {
+        name: (*name).to_owned(),
+        length: length.parse().context("invalid sequence length")?,
+        offset: offset.parse().context("invalid sequence offset")?,
+        line_blen: line_blen.parse().context("invalid bases per line")?,
+        line_len: line_len.parse().context("invalid bytes per line")?,
+    };
+    ensure!(
+        !name.is_empty() && entry.offset <= fasta_len,
+        "invalid reference name or offset"
+    );
+    if entry.length > 0 {
+        ensure!(
+            entry.line_blen > 0 && entry.line_len >= entry.line_blen,
+            "invalid line geometry"
+        );
+        let last = entry.length - 1;
+        let last_offset = (last / entry.line_blen)
+            .checked_mul(entry.line_len)
+            .and_then(|span| entry.offset.checked_add(span))
+            .and_then(|offset| offset.checked_add(last % entry.line_blen));
+        ensure!(
+            last_offset.is_some_and(|offset| offset < fasta_len),
+            ".fai range exceeds FASTA file"
+        );
+    }
+    Ok(entry)
 }
 
 fn parse_region(s: &str) -> (String, Option<u64>, Option<u64>) {
@@ -273,35 +324,40 @@ fn parse_region(s: &str) -> (String, Option<u64>, Option<u64>) {
 pub struct RefCache {
     file: File,
     entries: Vec<FaiEntry>,
+    names: std::collections::HashMap<String, usize>,
     /// Index into `entries` of the contig currently in `seq`.
     cached: Option<usize>,
     /// Uppercased bases of the cached contig, newlines stripped.
     seq: Vec<u8>,
-    /// Raw file bytes, reused across loads.
-    raw: Vec<u8>,
 }
 
 impl RefCache {
     pub fn open(fasta: &std::path::Path) -> Result<Self> {
-        let entries = load_or_build_fai(fasta)?;
+        ensure_distinct_output(fasta, &build_fai_path(fasta))?;
+        let entries = load_or_build_fai(fasta, false)?;
+        let mut names = std::collections::HashMap::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            names.entry(entry.name.clone()).or_insert(index);
+        }
         let file =
             File::open(fasta).with_context(|| format!("open reference {}", fasta.display()))?;
         Ok(Self {
             file,
             entries,
+            names,
             cached: None,
             seq: Vec::new(),
-            raw: Vec::new(),
         })
     }
 
     /// The full sequence of `name`, loading it if another contig is cached.
     /// `None` when the FASTA has no such record.
     pub fn sequence(&mut self, name: &str) -> Result<Option<&[u8]>> {
-        let Some(idx) = self.entries.iter().position(|e| e.name == name) else {
+        let Some(&idx) = self.names.get(name) else {
             return Ok(None);
         };
         if self.cached != Some(idx) {
+            self.cached = None;
             self.load(idx)?;
             self.cached = Some(idx);
         }
@@ -327,33 +383,21 @@ impl RefCache {
         }
         // One contiguous read of the record's byte span beats a seek per line;
         // the line terminators come out in the copy below.
-        let full_lines = length / line_blen;
-        let remainder = length % line_blen;
-        let mut span = full_lines * line_len + remainder;
-        if remainder == 0 {
-            // The final line's terminator is not part of the sequence.
-            span -= line_len - line_blen;
-        }
-
-        let mut raw = std::mem::take(&mut self.raw);
-        raw.resize(span as usize, 0);
-        let read = self
-            .file
+        let last = length - 1;
+        let span = (last / line_blen) * line_len + last % line_blen + 1;
+        self.seq.resize(usize::try_from(span)?, 0);
+        self.file
             .seek(SeekFrom::Start(offset))
-            .and_then(|_| self.file.read_exact(&mut raw));
-        if let Err(e) = read {
-            self.raw = raw;
-            return Err(anyhow::Error::new(e))
-                .with_context(|| format!("read {name} from the reference"));
-        }
-
-        self.seq.reserve(length as usize);
-        self.seq.extend(
-            raw.iter()
-                .filter(|b| !matches!(b, b'\n' | b'\r'))
-                .map(|b| b.to_ascii_uppercase()),
+            .and_then(|_| self.file.read_exact(&mut self.seq))
+            .with_context(|| format!("read {name} from the reference"))?;
+        self.seq.retain_mut(|b| {
+            b.make_ascii_uppercase();
+            !matches!(b, b'\n' | b'\r')
+        });
+        ensure!(
+            self.seq.len() as u64 == length,
+            "{name}: sequence length differs from .fai"
         );
-        self.raw = raw;
         Ok(())
     }
 }

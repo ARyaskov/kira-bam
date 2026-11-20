@@ -67,3 +67,25 @@ fn fqidx_preserves_crlf_offsets_and_rejects_an_incomplete_record() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("truncated FASTQ record"));
     assert!(!dir.path().join("truncated.fq.fqi").exists());
 }
+
+#[test]
+fn fqidx_rejects_output_aliases_before_creating_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let fastq = dir.path().join("input.fq");
+    let index = dir.path().join("input.fq.fqi");
+    let reads = b"@read\nAC\n+\nII\n";
+    std::fs::write(&fastq, reads).unwrap();
+    for destination in [&fastq, &index] {
+        let result = Command::new(env!("CARGO_BIN_EXE_kira-bam"))
+            .arg("fqidx")
+            .arg(&fastq)
+            .arg("read")
+            .arg("-o")
+            .arg(destination)
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{result:?}");
+        assert_eq!(std::fs::read(&fastq).unwrap(), reads);
+        assert!(!index.exists());
+    }
+}

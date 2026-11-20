@@ -7,7 +7,7 @@ use rustc_hash::FxHasher;
 
 use crate::cli::FqidxArgs;
 use crate::fastq_input::FastqInput;
-use crate::io::BufferedOutput;
+use crate::io::{BufferedOutput, ensure_distinct_output};
 
 /// `.fqi` per-record: name \t length \t seq_offset \t qual_offset
 #[derive(Debug, Clone)]
@@ -20,6 +20,15 @@ struct FqiEntry {
 
 pub fn run(args: FqidxArgs) -> Result<()> {
     let fqi_path = build_fqi_path(&args.fastq);
+    ensure_distinct_output(&args.fastq, &fqi_path)?;
+    if let Some(out) = args
+        .output
+        .as_deref()
+        .filter(|path| *path != std::path::Path::new("-"))
+    {
+        ensure_distinct_output(&args.fastq, out)?;
+        ensure_distinct_output(&fqi_path, out)?;
+    }
     let mut f =
         File::open(&args.fastq).with_context(|| format!("open FASTQ {}", args.fastq.display()))?;
     let entries = if !fqi_path.try_exists()? || crate::faidx::is_stale(&args.fastq, &fqi_path) {

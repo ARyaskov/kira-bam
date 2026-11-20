@@ -5,8 +5,8 @@ use noodles_sam::alignment::RecordBuf;
 
 use crate::cli::CoverageArgs;
 use crate::depth::resolve_region;
-use crate::io::BamReader;
 use crate::io::BufferedOutput;
+use crate::io::{BamReader, RecordSource, indexed::IndexedInput};
 
 const ALL_COLUMNS: [&str; 9] = [
     "rname",
@@ -69,7 +69,7 @@ struct RefStats {
 }
 
 pub fn run(args: CoverageArgs) -> Result<()> {
-    let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
+    let reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
     let refs: Vec<_> = reader
         .header()
@@ -93,6 +93,15 @@ pub fn run(args: CoverageArgs) -> Result<()> {
             .map(|spec| resolve_region(spec, &refs))
             .collect::<Result<_>>()?
     };
+    let indexed = if args.regions.is_empty() {
+        None
+    } else {
+        IndexedInput::open_spans(&args.input, &spans)?
+    };
+    let mut source: Box<dyn RecordSource> = match indexed {
+        Some(source) => Box::new(source),
+        None => Box::new(reader),
+    };
     for (tid, start, end) in spans {
         stats[tid].push(RefStats {
             name: refs[tid].0.clone(),
@@ -103,8 +112,24 @@ pub fn run(args: CoverageArgs) -> Result<()> {
         });
     }
 
+    let region_order: Vec<Vec<_>> = stats
+        .iter()
+        .map(|regions| {
+            let mut indices: Vec<_> = (0..regions.len()).collect();
+            indices.sort_unstable_by_key(|&i| regions[i].start);
+            let mut max_end = 0;
+            indices
+                .into_iter()
+                .map(|i| {
+                    max_end = max_end.max(regions[i].end);
+                    (i, max_end)
+                })
+                .collect()
+        })
+        .collect();
+
     let mut rec = RecordBuf::default();
-    while reader.read_record_buf(&mut rec)? {
+    while source.read_record_buf(&mut rec)? {
         let flags = u16::from(rec.flags());
         if flags & 0x704 != 0 {
             continue;
@@ -127,11 +152,16 @@ pub fn run(args: CoverageArgs) -> Result<()> {
             continue;
         };
         let end = rec.alignment_end().map(usize::from).unwrap_or(start);
-        for st in regions
-            .iter_mut()
-            .filter(|st| start <= st.end && end >= st.start)
-        {
-            accumulate(st, &rec, start, args.min_baseq);
+        let order = &region_order[tid];
+        let first = order.partition_point(|&(_, max_end)| max_end < start);
+        for &(index, _) in &order[first..] {
+            let st = &mut regions[index];
+            if st.start > end {
+                break;
+            }
+            if start <= st.end {
+                accumulate(st, &rec, start, args.min_baseq);
+            }
         }
     }
 

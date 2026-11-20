@@ -49,6 +49,38 @@ pub(crate) struct IndexedInput {
 }
 
 impl IndexedInput {
+    /// Query the union of the requested spans. Merge chunks across all spans so
+    /// a record that intersects several regions is decoded only once.
+    pub(crate) fn open_spans(path: &Path, spans: &[(usize, usize, usize)]) -> Result<Option<Self>> {
+        if !path.is_file() || detect_format(path)? != InputFormat::Bam {
+            return Ok(None);
+        }
+        let Some(index) = read_associated_index(path)? else {
+            return Ok(None);
+        };
+        let mut reader = bam::io::Reader::new(File::open(path)?);
+        let header = reader.read_header().context("read BAM header")?;
+        anyhow::ensure!(
+            index.reference_sequences().count() == header.reference_sequences().len(),
+            "index reference count does not match the BAM header"
+        );
+        let mut chunks = Vec::new();
+        for &(tid, start, end) in spans {
+            chunks.extend(index.query(tid, interval(start as u64, end as u64)?)?);
+        }
+        let chunks = csi::binning_index::merge_chunks(&chunks).into_iter();
+        Ok(Some(Self {
+            reader,
+            index,
+            header,
+            plan: Vec::new(),
+            plan_at: 0,
+            chunks,
+            chunk_end: None,
+            path: path.to_owned(),
+        }))
+    }
+
     /// Open `path` as a random-access source restricted to the contigs
     /// `regions` names, or `Ok(None)` when the input is not region-queryable
     /// (no index, or not a BGZF BAM) — such inputs keep the streaming reader.

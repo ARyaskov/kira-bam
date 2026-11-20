@@ -23,13 +23,22 @@ pub fn run(args: ReheaderArgs) -> Result<()> {
 
     let mut reader = BamReader::open_with_reference(&args.input, args.reference.as_deref())
         .context("open input")?;
-    // Validate @SQ compatibility before replacing.
-    let old_header = reader.header().clone();
-    if old_header.reference_sequences().len() != new_header.reference_sequences().len() {
+    let old_references = reader.header().reference_sequences();
+    let new_references = new_header.reference_sequences();
+    for (old_id, name) in old_references.keys().enumerate() {
+        if let Some(new_id) = new_references.get_index_of(name)
+            && old_id != new_id
+        {
+            anyhow::bail!(
+                "@SQ {name} moved from index {old_id} to {new_id}; reheader requires retained references to stay in place"
+            );
+        }
+    }
+    if old_references.len() != new_references.len() {
         eprintln!(
             "[kira-bam reheader] warning: @SQ count differs (old {}, new {}). Records still reference old IDs.",
-            old_header.reference_sequences().len(),
-            new_header.reference_sequences().len()
+            old_references.len(),
+            new_references.len()
         );
     }
 

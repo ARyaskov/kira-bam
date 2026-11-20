@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// Split a BAM by @RG (or any tag value).
+/// Split a BAM by @RG or another scalar tag.
 #[derive(Parser, Debug)]
 pub struct SplitArgs {
     /// Input BAM file.
@@ -10,10 +10,13 @@ pub struct SplitArgs {
     pub input: PathBuf,
 
     /// Output file format pattern; `%!` expands to the tag value (default `%*_%!.bam`).
+    ///
+    /// Missing tags use `unknown`; the literal string `unknown` uses `%75nknown`.
+    /// Integers use the `%i` prefix, floats use `%f_` followed by hex bits, and hex strings use `%h`.
     #[arg(short = 'f', long = "format", default_value = "%*_%!.bam")]
     pub format: String,
 
-    /// Tag to split on (default `RG`).
+    /// Scalar tag to split on (default `RG`).
     #[arg(short = 'd', long = "tag", default_value = "RG")]
     pub tag: String,
 
